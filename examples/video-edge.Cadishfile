@@ -1,0 +1,39 @@
+# Recipe: HLS / video edge
+# Cache the HLS playlists and media long, let the player load the segments
+# directly (they're already signed/short-lived), keep large objects on NVMe, and
+# allow cross-origin players.
+
+video.example.com {
+    tls {
+        acme ops@example.com
+    }
+
+    cache {
+        ram 8GiB # playlists + small hot objects
+        disk /var/cache/cadish 2TiB # the big media files
+    }
+
+    upstream media {
+        to https://media-origin.example.net
+    }
+
+    # HLS segments are fetched directly by the player with their own short-lived
+    # URLs — don't cache them at the edge (every viewer's URL differs).
+    @segments path *.ts *.m4s
+    pass @segments
+
+    # Playlists change as the live edge advances → short ttl + grace (stale-while-
+    # revalidate keeps players fed during a refresh).
+    @manifest path_regex \.m3u8$
+    cache_ttl @manifest ttl 2s grace 30s
+
+    # VOD media (mp4/webm) is immutable → cache hard. Large files naturally live on
+    # the NVMe tier and are served with sendfile.
+    @vod path_regex \.(mp4|webm)$
+    cache_ttl @vod ttl 7d grace 30d
+    storage @vod -> disk
+    cache_ttl default ttl 1m
+
+    cors * # <video>/MSE players are cross-origin
+    header +cache_status X-Cache
+}

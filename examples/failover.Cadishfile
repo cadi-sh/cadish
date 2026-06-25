@@ -1,0 +1,32 @@
+# Recipe: Multi-origin failover
+# Serve from a primary origin; on a miss/4xx/5xx/connection error, fall through to
+# a backup — pure config composition, no custom code. (For the S3→CloudFront
+# re-signing variant, see examples/s3-cdn.Cadishfile.)
+
+cdn.example.com {
+    tls {
+        acme ops@example.com
+    }
+
+    cache {
+        ram 4GiB
+        disk /var/cache/cadish 500GiB
+    }
+
+    upstream primary {
+        to https://origin-a.example.net
+        health GET /healthz expect 200 interval 5s window 3 threshold 2
+    }
+    upstream backup {
+        to https://origin-b.example.net
+    }
+
+    # Try primary; fall through to backup on miss / 404 / 5xx / unreachable.
+    # The chain is itself an origin, so caching/TTL behave exactly as with one.
+    origin chain primary -> backup
+
+    cache_ttl status 404 410 ttl 30s grace 1h # don't hammer both on a deletion
+    cache_ttl default ttl 5m grace 24h
+
+    header +cache_status X-Cache
+}

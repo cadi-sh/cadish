@@ -1,0 +1,46 @@
+{
+  "name": "01-storefront",
+  "cadishfile": "example.com, *.example.com {\n    @ajax     header X-Requested-With XMLHttpRequest\n    @nocache  path /panel/*\n    @listings path_regex ^/catalog/\n\n    respond /health-check 200 \"OK\"\n\n    pass   @ajax\n    pass   method POST\n    pass   @nocache\n\n    cache_key   url host\n\n    cache_ttl   status 404 410   ttl 60s grace 1h\n    cache_ttl   status not 200   hit_for_miss 5s\n    cache_ttl   @listings        ttl 2s  grace 24h\n    cache_ttl   default          ttl 2s  grace 24h\n\n    storage   @listings -> disk\n    storage   default -> ram\n\n    strip_cookies   path_regex \\.(css|js|png)$\n\n    header  -Server\n    header  +cache_status   X-Cache\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/catalog/shoes", "query": { "color": ["red"], "utm_source": ["x"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "HIT"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/panel/settings" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "POST", "host": "example.com", "path": "/cart" },
+      "origin": { "status": 200 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/api", "header": { "X-Requested-With": ["XMLHttpRequest"] } },
+      "origin": { "status": 200 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/health-check" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/missing" },
+      "origin": { "status": 404, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/flaky" },
+      "origin": { "status": 503 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/assets/app.css" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/css"], "Set-Cookie": ["sid=abc; Path=/"] } },
+      "cacheStatus": "HIT-STALE"
+    }
+  ]
+}

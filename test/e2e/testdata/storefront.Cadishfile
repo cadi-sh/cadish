@@ -1,0 +1,72 @@
+# e2e test config: the storefront migration fixture's directives, with the
+# upstream targets pointed at httptest origins (injected via env) and TLS off so
+# the test drives the plain-HTTP server.Handler. Behavior must match
+# test/migration/storefront/golden_cases.md.
+
+example.com, *.example.com {
+
+    tls off
+
+    upstream web {
+        to       {$TEST_WEB_ORIGIN}
+        sticky   by cookie PHPSESSID else client_ip
+    }
+    upstream images {
+        to       {$TEST_IMAGES_ORIGIN}
+    }
+
+    cache {
+        ram 64MiB
+    }
+
+    # The origin stamps `Set-Cookie: sess=abc` on every response. A Set-Cookie response is
+    # NEVER cached by default (a shared cache must not hand one user's freshly-minted cookie
+    # to everyone — RFC 9111 / CDN behavior). The faithful Varnish equivalent of this
+    # storefront's `unset beresp.http.Set-Cookie` is `strip_cookies @cacheable` (below): on
+    # the CACHEABLE classes the cookie is controlled (dropped before store + deliver), so
+    # those pages cache safely with no cookie; on the PASS classes (account/panel/checkout,
+    # AJAX, POST) the cookie is left intact and the request bypasses the cache. No
+    # `cache_unsafe` is needed — and could not force a Set-Cookie into the cache anyway.
+
+    respond /health-check 200 "OK"
+
+    purge   when header X-Purge-Token {$PURGE_TOKEN}   regex {http.X-Purge-Regex}
+
+    @ajax      header X-Requested-With XMLHttpRequest
+    @static    host_regex ^static
+    @images    upstream images
+    @longcache content_type text/css image/svg+xml
+    import     nocache.cadish
+
+    # @cacheable = everything that is NOT passed (not @nocache, not an AJAX call, not a
+    # POST). strip_cookies @cacheable drops the origin's Set-Cookie only on these cached
+    # classes — the pass classes keep their cookie. (forward refs to @nocache/@ajax are fine.)
+    @dynamic   method POST
+    @cacheable all !@nocache !@ajax !@dynamic
+
+    route @static -> images
+
+    pass   @ajax
+    pass   method POST
+    pass   @nocache
+
+    cache_key   url host
+
+    cache_ttl   status 404 410   ttl 60s grace 1h
+    cache_ttl   status not 200   hit_for_miss 5s
+    cache_ttl   @images          ttl 24h grace 365d
+    cache_ttl   @listings        ttl 2s  grace 24h
+    cache_ttl   default          ttl 2s  grace 24h
+
+    storage   @images -> disk
+    storage   default -> ram
+
+    strip_cookies   @cacheable
+
+    header  -Server -X-Powered-By -Via -X-Varnish
+    header  Access-Control-Allow-Origin   *
+    header  Access-Control-Allow-Methods  "GET, OPTIONS, POST"
+    header  X-Frame-Options               SAMEORIGIN
+    header  +cache_status                 X-Cache
+    header  @longcache  Cache-Control "public, max-age=31536000"   # gap #4: matches the response Content-Type, not the path
+}

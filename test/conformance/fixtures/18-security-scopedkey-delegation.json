@@ -1,0 +1,16 @@
+{
+  "name": "18-security-scopedkey-delegation",
+  "cadishfile": "deleg.example.com {\n    @admin path /admin/*\n    @ssr header X-IS-SSR-URL true\n    deny @admin\n    cache_key @ssr     host path\n    cache_key default  host url\n    cache_ttl default ttl 1m\n    header +cache_status X-Cache\n    header +cache_key X-Cache-Key\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "deleg.example.com", "path": "/list", "query": { "page": ["2"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "deleg.example.com", "path": "/list", "query": { "page": ["2"] }, "header": { "X-IS-SSR-URL": ["true"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

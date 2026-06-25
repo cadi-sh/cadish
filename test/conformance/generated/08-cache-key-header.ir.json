@@ -1,0 +1,124 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "ck.example.com"
+    ],
+    "redirectHosts": [
+      "ck.example.com"
+    ],
+    "canonicalHost": "ck.example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "debug": {
+      "kind": "header",
+      "name": "X-Debug",
+      "values": [
+        "1"
+      ]
+    }
+  },
+  "recv": {
+    "respond": [
+      {
+        "path": "/health",
+        "status": 200,
+        "body": "OK"
+      }
+    ]
+  },
+  "key": {
+    "tokens": [
+      {
+        "kind": "method"
+      },
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      },
+      {
+        "kind": "query"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "method"
+          },
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          },
+          {
+            "kind": "query"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s",
+        "grace": "1h0m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      },
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_key",
+            "name": "X-Cache-Key"
+          }
+        ]
+      },
+      {
+        "scope": {
+          "names": [
+            "debug"
+          ]
+        },
+        "ops": [
+          {
+            "op": "cache_key",
+            "name": "X-Cache-Key",
+            "value": "raw"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache",
+    "cacheKeyHeader": "X-Cache-Key",
+    "cacheKeyRaw": true
+  },
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

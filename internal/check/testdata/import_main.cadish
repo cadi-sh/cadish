@@ -1,0 +1,8 @@
+# Imports a fragment that defines @frag, then uses it.
+example.com {
+    @local path /local/*
+    import import_frag.cadish
+    pass @frag
+    pass @local
+    upstream origin { to http://127.0.0.1:8080 }
+}

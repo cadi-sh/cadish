@@ -1,0 +1,48 @@
+# Build artifacts
+/cadish
+/build/
+/dist/
+*.test
+*.out
+coverage.*
+
+# Edge runtime JS test toolchain (vitest + miniflare) — installed on demand
+/edge/runtime/node_modules/
+/edge/runtime/package-lock.json
+# Stray edge build outputs (cwd writes when -o/-bundle omit a path)
+/*.edgeir.json
+/*.worker.js
+
+# Local config & secrets
+/config.local.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+id_rsa*
+.env
+.env.*
+
+# Cache data dirs used in local testing
+/var/
+/tmp-cache/
+
+# Claude Code session/worktree scratch (never part of the project)
+/.claude/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Go fuzzing generated corpus (seed corpus lives in the FuzzParse seeds)
+**/testdata/fuzz/
+
+# Stray built binaries (main packages built without -o land at repo root)
+/origin
+/test-origin
+/cmd/cadish/cadish
+
+# stray sed -i backups
+*.cadish.x

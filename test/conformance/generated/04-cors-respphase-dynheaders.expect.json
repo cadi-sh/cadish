@@ -1,0 +1,134 @@
+[
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "/page?a=1\u0026b=2",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 600000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "Access-Control-Allow-Origin",
+          "value": "https://app.example.com"
+        },
+        {
+          "op": "set",
+          "name": "X-Client",
+          "value": "203.0.113.1"
+        },
+        {
+          "op": "set",
+          "name": "X-Geo",
+          "value": "US"
+        },
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "HIT"
+        }
+      ],
+      "stripCookies": false,
+      "cors": {
+        "allowAllOrigins": false,
+        "origins": [
+          "https://app.example.com"
+        ],
+        "methods": [
+          "GET",
+          "POST",
+          "OPTIONS"
+        ],
+        "headers": [
+          "Content-Type",
+          "X-Token"
+        ]
+      },
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "/data",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 10000000000,
+      "graceNs": 0,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "Access-Control-Allow-Origin",
+          "value": "https://evil.example.com"
+        },
+        {
+          "op": "set",
+          "name": "X-Client",
+          "value": "198.51.100.2"
+        },
+        {
+          "op": "set",
+          "name": "X-Geo",
+          "value": "ES"
+        },
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": true,
+      "cors": {
+        "allowAllOrigins": false,
+        "origins": [
+          "https://app.example.com"
+        ],
+        "methods": [
+          "GET",
+          "POST",
+          "OPTIONS"
+        ],
+        "headers": [
+          "Content-Type",
+          "X-Token"
+        ]
+      },
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  }
+]

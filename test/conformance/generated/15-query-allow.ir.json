@@ -1,0 +1,113 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "qa.example.com"
+    ],
+    "redirectHosts": [
+      "qa.example.com"
+    ],
+    "canonicalHost": "qa.example.com"
+  },
+  "upstream": {},
+  "matchers": {},
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "method"
+      },
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      },
+      {
+        "kind": "query_allow",
+        "allow": [
+          "age",
+          "ff-*",
+          "genre"
+        ]
+      },
+      {
+        "kind": "header",
+        "arg": "X-Variant"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "method"
+          },
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          },
+          {
+            "kind": "query_allow",
+            "allow": [
+              "age",
+              "ff-*",
+              "genre"
+            ]
+          },
+          {
+            "kind": "header",
+            "arg": "X-Variant"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      },
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_key",
+            "name": "X-Cache-Key"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache",
+    "cacheKeyHeader": "X-Cache-Key"
+  },
+  "keyHeaderNames": [
+    "x-variant"
+  ],
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

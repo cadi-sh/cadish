@@ -1,0 +1,11 @@
+{
+  "name": "39-host-port-normalize",
+  "cadishfile": "example.com {\n    cache_key host path\n\n    cache_ttl default ttl 60s\n\n    header +cache_key X-Key raw\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com:zzz", "path": "/p" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

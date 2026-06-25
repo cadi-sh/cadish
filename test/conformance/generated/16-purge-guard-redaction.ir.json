@@ -1,0 +1,89 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "purge.example.com"
+    ],
+    "redirectHosts": [
+      "purge.example.com"
+    ],
+    "canonicalHost": "purge.example.com"
+  },
+  "upstream": {},
+  "matchers": {},
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "method"
+      },
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "method"
+          },
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache"
+  },
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  },
+  "delegate": [
+    {
+      "directive": "purge",
+      "reason": "purge auth guards compare a SECRET token (the purge token, D12) that must never ship to a public edge worker; delegated to the Cadish server behind, which holds the secret and does the constant-time compare",
+      "scope": {
+        "inline": [
+          {
+            "kind": "header",
+            "name": "X-Purge-Token",
+            "redacted": true
+          }
+        ]
+      }
+    }
+  ]
+}

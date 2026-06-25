@@ -1,0 +1,100 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "regex.example.com"
+    ],
+    "redirectHosts": [
+      "regex.example.com"
+    ],
+    "canonicalHost": "regex.example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "static": {
+      "kind": "host_regex",
+      "regex": "^static\\."
+    }
+  },
+  "recv": {
+    "route": [
+      {
+        "scope": {
+          "names": [
+            "static"
+          ]
+        },
+        "upstream": "static"
+      }
+    ]
+  },
+  "key": {
+    "tokens": [
+      {
+        "kind": "method"
+      },
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "method"
+          },
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      }
+    ],
+    "onError": [
+      {
+        "scope": {
+          "always": true
+        },
+        "status": 503,
+        "body": "origin down",
+        "contentType": "text/html; charset=utf-8"
+      }
+    ]
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache"
+  },
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

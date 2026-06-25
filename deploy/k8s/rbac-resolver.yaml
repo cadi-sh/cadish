@@ -1,0 +1,34 @@
+# Read-only RBAC for cadish k8s:// EndpointSlice resolution (Layer 1).
+#
+# cadish resolves `k8s://service.namespace:port` upstream targets to the live set
+# of ready pod IP:port endpoints by watching EndpointSlices via the Kubernetes API.
+# Named ports are mapped from the EndpointSlices' own port list, so no Service watch
+# is needed. The only verbs it ever needs are get/list/watch on endpointslices —
+# never write, never secrets, never pods, never services.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cadish-resolver
+  namespace: cadish
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cadish-resolver
+rules:
+- apiGroups: ["discovery.k8s.io"]
+  resources: ["endpointslices"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cadish-resolver
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cadish-resolver
+subjects:
+- kind: ServiceAccount
+  name: cadish-resolver
+  namespace: cadish

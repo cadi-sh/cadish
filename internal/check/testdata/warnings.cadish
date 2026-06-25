@@ -1,0 +1,15 @@
+# Crafted config exercising unknown-name, arity, dup/unused matcher warnings.
+example.com {
+
+    @good   path /a/*
+    @good   path /b/*           # duplicate matcher definition
+    @lonely host_regex ^cdn     # defined but never referenced
+    @weird  frobnicate x        # unknown matcher type
+
+    frobnicate now              # unknown directive
+    cache_key                   # cache-key-empty: no tokens
+    respond /health             # arity: missing CODE
+
+    pass @good
+    pass @missing               # references an undefined matcher
+}

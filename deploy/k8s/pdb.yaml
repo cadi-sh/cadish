@@ -1,0 +1,17 @@
+# PodDisruptionBudget — apply this ONLY when running multiple replicas (it is
+# intentionally NOT in kustomization.yaml, whose default is a single replica: a
+# PDB with minAvailable:1 and one pod would block node drains).
+#
+#   kubectl apply -f deploy/k8s/pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cadish
+  namespace: cadish
+  labels:
+    app.kubernetes.io/name: cadish
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cadish

@@ -1,0 +1,66 @@
+{
+  "name": "10-cache-unsafe",
+  "cadishfile": "example.com {\n    cache_unsafe\n\n    cache_ttl default ttl 5s grace 1m\n\n    storage default -> ram\n\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": {
+        "method": "GET",
+        "host": "example.com",
+        "path": "/api/data"
+      },
+      "origin": {
+        "status": 200,
+        "header": {
+          "Content-Type": ["application/json"],
+          "Set-Cookie": ["session=abc; Path=/; HttpOnly"]
+        }
+      },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": {
+        "method": "GET",
+        "host": "example.com",
+        "path": "/page"
+      },
+      "origin": {
+        "status": 200,
+        "header": {
+          "Content-Type": ["text/html"],
+          "Cache-Control": ["private, max-age=0"]
+        }
+      },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": {
+        "method": "GET",
+        "host": "example.com",
+        "path": "/vary-star"
+      },
+      "origin": {
+        "status": 200,
+        "header": {
+          "Content-Type": ["text/html"],
+          "Vary": ["*"]
+        }
+      },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": {
+        "method": "GET",
+        "host": "example.com",
+        "path": "/no-store"
+      },
+      "origin": {
+        "status": 200,
+        "header": {
+          "Content-Type": ["text/html"],
+          "Cache-Control": ["no-store"]
+        }
+      },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $tls := eq (include "cadish.tlsEnabled" .) "true" -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "cadish.fullname" . }}
+  labels:
+    {{- include "cadish.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "cadish.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        {{- range .Values.networkPolicy.ingressFromCIDRs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - port: http
+          protocol: TCP
+        {{- if $tls }}
+        - port: https
+          protocol: TCP
+        {{- end }}
+  egress:
+    # DNS resolution (origins, dynamic upstream re-resolution, ACME).
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Origins + ACME directory/challenge (HTTP/HTTPS to the configured CIDRs).
+    - to:
+        {{- range .Values.networkPolicy.egressCIDRs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - port: 80
+          protocol: TCP
+        - port: 443
+          protocol: TCP
+{{- end }}

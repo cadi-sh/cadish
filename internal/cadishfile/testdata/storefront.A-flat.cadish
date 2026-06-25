@@ -1,0 +1,87 @@
+# ============================================================================
+# storefront — STYLE A: flat Caddy-style (matchers + directives, no phases)
+# A fictional e-commerce site, translated from a 478-line legacy VCL config.
+# ============================================================================
+
+example.com, *.example.com {
+
+    tls {
+        acme ops@example.com              # no separate certbot/Caddy in front
+    }
+
+    # ---- Backends + sharding (replaces ~80 lines of director/X-Shard glue) ----
+    # 'sticky by' pins each user to one frontend (multi-request session).
+    # health: a healthy frontend answers 301 to "GET /". health-aware only.
+    upstream web {
+        to          k8s://web-ingress.default:8080         # dynamic DNS, no reloads
+        sticky      by cookie PHPSESSID else client_ip
+        health      GET / expect 301 interval 5s window 6 threshold 3
+        timeout     connect 5s first_byte 600s
+        max_conns   800
+    }
+    upstream images {
+        to          https://static.example.com     # S3 bridge
+        timeout     connect 5s
+    }
+
+    # ---- Shared cache across nodes (sharded by URL) ----
+    cluster peers {
+        to        k8s://cache-peers.default:6081
+        shard_by  url
+        health    GET /health-check interval 1s window 5 threshold 3
+    }
+
+    # ---- Two-tier cache ----
+    cache {
+        ram   10GiB                 # listings / dynamic html (latency)
+        disk  /var/cache/cadish 2TiB
+    }
+
+    # ---- Synthetic healthcheck ----
+    respond /health-check 200 "OK"
+
+    # ---- Purge / ban (token-protected) ----
+    purge   when header X-Purge-Token {$PURGE_TOKEN}   regex {http.X-Purge-Regex}
+
+    # ---- Matchers ----
+    @ajax     header X-Requested-With XMLHttpRequest
+    @static   host_regex ^static
+    @images   upstream images
+    import    nocache.cadish          # @nocache + @listings (sub-config, below)
+
+    # ---- Route image hosts to S3 ----
+    route @static -> images
+
+    # ---- No-cache rules (pass = straight to origin, never to cluster) ----
+    pass   @ajax
+    pass   method POST
+    pass   @nocache
+    # Exception: category listings ARE cached -> they are not in @nocache
+
+    # ---- Cache key ----
+    cache_key   url host
+
+    # ---- TTL/grace policy by status (top-to-bottom order) ----
+    cache_ttl   status 404 410   ttl 60s grace 1h     # deleted content: replaces stale 200
+    cache_ttl   status not 200   hit_for_miss 5s      # transient 5xx must not poison the key
+    cache_ttl   @images          ttl 24h grace 365d   # S3 images: long
+    cache_ttl   @listings        ttl 2s  grace 24h    # listings: stale-while-revalidate
+    cache_ttl   default          ttl 2s  grace 24h
+
+    # ---- Storage tier ----
+    storage   @images -> disk          # sendfile + kernel page cache
+    storage   default -> ram
+
+    # ---- Cookie hygiene on static and home ----
+    strip_cookies   path_regex \.(css|js|png|gif|jpe?g|swf|ico)$
+    strip_cookies   path / /category/*
+    strip_cookies   @images
+
+    # ---- Response headers ----
+    header  -Server -X-Powered-By -Via -X-Varnish      # remove
+    header  Access-Control-Allow-Origin   *
+    header  Access-Control-Allow-Methods  "GET, OPTIONS, POST"
+    header  X-Frame-Options               SAMEORIGIN
+    header  +cache_status                 X-Cache       # automatic HIT/MISS
+    header  path_regex image/svg|text/css  Cache-Control "public, max-age=31536000"
+}

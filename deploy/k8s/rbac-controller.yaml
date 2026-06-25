@@ -1,0 +1,109 @@
+# RBAC for cadish running as an in-cluster Ingress controller (Layer 2, D55).
+#
+# This EXTENDS the Layer-1 resolver RBAC (deploy/k8s/rbac-resolver.yaml: get/list/watch
+# on endpointslices) with exactly what the controller needs and nothing more:
+#   - watch the Ingress API surface (ingresses, ingressclasses) to build routing;
+#   - read Secrets (TLS certs) and ConfigMaps (cadi.sh/policy fragments + the base);
+#   - write Ingress status.loadBalancer (the leader-elected status writer);
+#   - emit Events (accept/reject observability);
+#   - coordinate leader election via a coordination.k8s.io Lease.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cadish-ingress
+  namespace: cadish
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cadish-ingress
+rules:
+# Layer-1 endpoint resolution (k8s:// upstreams → ready pod IP:port).
+- apiGroups: ["discovery.k8s.io"]
+  resources: ["endpointslices"]
+  verbs: ["get", "list", "watch"]
+# The Ingress API surface (the source of truth for routing).
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses", "ingressclasses"]
+  verbs: ["get", "list", "watch"]
+# The publish Service: the leader status writer reads its LoadBalancer address to
+# populate Ingress status.loadBalancer (resolvePublishAddress). Without this read the
+# GET is forbidden, the address resolves to "", and status is never written.
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch"]
+# Write Ingress status.loadBalancer (leader-only writer).
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses/status"]
+  verbs: ["update", "patch"]
+# TLS certs (Secrets) + cadi.sh/policy fragments and the base Cadishfile (ConfigMaps).
+# NOTE (least privilege, Finding 4): these READS are cluster-wide because, by default, the
+# controller's informers watch cluster-wide (reconcile filters by namespace in code) — a
+# namespaced LIST/WATCH would be denied at the API server and break the informer cache. This
+# static manifest therefore grants cluster-wide read unconditionally.
+#
+# BLAST-RADIUS HARDENING (C1): a controller compromise with this rule can read EVERY Secret
+# in the cluster. To bound that, either:
+#   (a) set `-secret-label-selector` / `-configmap-label-selector` (or `-watch-label-selector`)
+#       so the informer cache only ever holds objects carrying your label (e.g.
+#       cadi.sh/managed=true) — you MUST then label your TLS Secrets + policy ConfigMaps; and/or
+#   (b) for a KNOWN set of served namespaces, run with `-namespace ns1,ns2` and apply
+#       deploy/k8s/rbac-controller-scoped.yaml INSTEAD of this file — it drops this
+#       cluster-wide rule and grants Secret/ConfigMap reads via per-namespace Roles.
+# Core k8s RBAC cannot filter by label, so (a) bounds WHICH OBJECTS are cached and (b) bounds
+# WHICH NAMESPACES are readable; combine them for the tightest result. See the Helm chart
+# (controller.labelSelector + controller.rbac.scoped) and docs/ingress-controller.md.
+- apiGroups: [""]
+  resources: ["secrets", "configmaps"]
+  verbs: ["get", "list", "watch"]
+# Accept/reject Events.
+# NOTE: the controller only WRITES (ingresses/status, events) in the namespaces it serves.
+# When you run with `-namespace ns1,ns2`, prefer the Helm chart (set controller.namespaces),
+# which DROPS these write verbs from the ClusterRole and grants them via per-namespace
+# Roles instead, so the controller cannot write status/Events cluster-wide. If you must use
+# this static manifest with namespace restriction, replace the two write rules below (and
+# the ingresses/status rule above) with namespaced Roles/RoleBindings in each served
+# namespace plus this controller's own namespace (for IngressClass/Secret Events). The
+# reads above must remain cluster-wide regardless.
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+---
+# Leader election uses a single Lease in the controller's own namespace; this
+# namespaced Role keeps the lease write-scope tight rather than cluster-wide.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cadish-ingress-leader
+  namespace: cadish
+rules:
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cadish-ingress
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cadish-ingress
+subjects:
+- kind: ServiceAccount
+  name: cadish-ingress
+  namespace: cadish
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cadish-ingress-leader
+  namespace: cadish
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cadish-ingress-leader
+subjects:
+- kind: ServiceAccount
+  name: cadish-ingress
+  namespace: cadish

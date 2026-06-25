@@ -1,0 +1,189 @@
+# cadish as an in-cluster Kubernetes Ingress controller (Layer 2, D55).
+#
+# Apply alongside deploy/k8s/namespace.yaml and deploy/k8s/rbac-controller.yaml:
+#   kubectl apply -f deploy/k8s/namespace.yaml
+#   kubectl apply -f deploy/k8s/rbac-controller.yaml
+#   kubectl apply -f deploy/k8s/ingress-controller.yaml
+#
+# Then create Ingress objects with `ingressClassName: cadish` (or make this class the
+# cluster default — see the IngressClass annotation below). Routing, TLS and policy come
+# from those Ingress objects; this base ConfigMap supplies ONLY globals.
+#
+# HA: every replica serves traffic (no coordination); a leader-elected Lease gates ONLY
+# the Ingress status.loadBalancer writer. Run >= 2 replicas.
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: cadish
+  # Uncomment to make cadish the cluster's default IngressClass (classless Ingresses
+  # are then served by cadish):
+  # annotations:
+  #   ingressclass.kubernetes.io/is-default-class: "true"
+spec:
+  controller: cadi.sh/ingress-controller
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cadish-ingress-base
+  namespace: cadish
+data:
+  # The BASE Cadishfile: globals only. Sites/routes/TLS come from Ingress objects.
+  # NOTE: `cache { … }` is PER-SITE in cadish, so it cannot live at the top level here;
+  # per-site cache policy is added via a `cadi.sh/policy` ConfigMap fragment.
+  base.cadish: |
+    # cadish ingress-controller base config (globals only).
+    #
+    # Sites/routes/TLS/policy all come from Ingress objects — keep this file to true
+    # globals. To enable the opt-in admin dashboard, set the CADISH_ADMIN_TOKEN env
+    # (e.g. from the cadish-admin Secret referenced below) and uncomment:
+    #
+    # admin {
+    #     listen :9090
+    #     auth_token {$CADISH_ADMIN_TOKEN}
+    #     metrics
+    # }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cadish-ingress
+  namespace: cadish
+  labels:
+    app.kubernetes.io/name: cadish-ingress
+spec:
+  replicas: 2 # HA: all replicas serve; one is the leader status-writer.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cadish-ingress
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cadish-ingress
+    spec:
+      # Outlast the server's ~30s in-flight drain on SIGTERM so a rollout / node
+      # drain finishes serving open connections before the kubelet SIGKILLs.
+      terminationGracePeriodSeconds: 40
+      serviceAccountName: cadish-ingress
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: cadish
+          image: ghcr.io/cadi-sh/cadish:0.2.0
+          args:
+            - ingress
+            - -config
+            - /etc/cadish/base.cadish
+            - -ingress-class
+            - cadish
+            - -addr
+            - ":80"
+            - -https-addr
+            - ":443"
+            - -acme-cache
+            - /var/lib/cadish/acme
+            - -publish-service
+            - cadish/cadish-ingress
+            - -leader-elect=true
+            - -leader-namespace
+            - cadish
+          env:
+            # Leader-election identity = the pod name (unique per replica).
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: CADISH_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cadish-admin
+                  key: token
+                  optional: true
+            - name: GOMEMLIMIT
+              value: "1700MiB"
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+            - name: https
+              containerPort: 443
+              protocol: TCP
+          startupProbe:
+            tcpSocket:
+              port: http
+            failureThreshold: 30
+            periodSeconds: 5
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - NET_BIND_SERVICE
+          volumeMounts:
+            - name: config
+              mountPath: /etc/cadish
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: acme
+              mountPath: /var/lib/cadish
+      volumes:
+        - name: config
+          configMap:
+            name: cadish-ingress-base
+        - name: tmp
+          emptyDir: {}
+        # ACME cert cache. For multi-replica ACME, use an RWX volume or BYO/cert-manager
+        # Secrets (referenced from each Ingress's spec.tls) so replicas share certs.
+        - name: acme
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cadish-ingress
+  namespace: cadish
+  labels:
+    app.kubernetes.io/name: cadish-ingress
+spec:
+  type: LoadBalancer
+  # Preserve the real client source IP (no SNAT through another node) so geo /
+  # rate_limit / ACLs see the client. Drop to Cluster only if you need cross-node
+  # spillover and accept SNAT'd client IPs.
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: cadish-ingress
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    - name: https
+      port: 443
+      targetPort: https
+      protocol: TCP

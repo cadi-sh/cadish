@@ -1,0 +1,16 @@
+{
+  "name": "17-host-regex-onerror",
+  "cadishfile": "regex.example.com {\n    upstream static { to http://static:80 }\n    @static host_regex ^static\\.\n    route @static -> static\n    respond on_error 503 \"origin down\"\n    cache_key method host path\n    cache_ttl default ttl 1m\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "static.example.com", "path": "/asset.css" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/css"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "regex.example.com", "path": "/page" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

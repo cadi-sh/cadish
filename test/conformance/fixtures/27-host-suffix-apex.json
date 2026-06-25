@@ -1,0 +1,21 @@
+{
+  "name": "27-host-suffix-apex",
+  "cadishfile": "example.com, *.example.com {\n    @sub host *.example.com\n    cache_key @sub     host path\n    cache_key default  host url\n    cache_ttl default ttl 1m grace 5m\n    header +cache_key X-Cache-Key raw\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/list", "query": { "page": ["2"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "a.example.com", "path": "/list", "query": { "page": ["2"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "deep.a.example.com", "path": "/list", "query": { "page": ["2"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

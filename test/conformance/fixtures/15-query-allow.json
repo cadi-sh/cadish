@@ -1,0 +1,26 @@
+{
+  "name": "15-query-allow",
+  "cadishfile": "qa.example.com {\n    cache_key method host path query_allow genre age ff-* header:X-Variant\n    cache_ttl default ttl 1m\n    header +cache_status X-Cache\n    header +cache_key X-Cache-Key\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "qa.example.com", "path": "/list", "query": { "genre": ["drama"], "age": ["18"], "utm_source": ["x"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "qa.example.com", "path": "/list", "query": { "genre": ["drama"], "age": ["18"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "HIT"
+    },
+    {
+      "request": { "method": "GET", "host": "qa.example.com", "path": "/list", "query": { "genre": ["drama"], "ff-beta": ["1"], "utm_medium": ["y"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "qa.example.com", "path": "/list", "query": { "genre": ["drama"] }, "header": { "X-Variant": ["b"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

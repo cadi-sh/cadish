@@ -1,0 +1,131 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "m.example.com"
+    ],
+    "redirectHosts": [
+      "m.example.com"
+    ],
+    "canonicalHost": "m.example.com"
+  },
+  "upstream": {},
+  "matchers": {},
+  "device": {
+    "rules": [
+      {
+        "class": "bot",
+        "substrings": [
+          "bot",
+          "crawler",
+          "spider",
+          "slurp",
+          "facebookexternalhit",
+          "bingpreview"
+        ]
+      },
+      {
+        "class": "tablet",
+        "substrings": [
+          "ipad",
+          "tablet",
+          "kindle",
+          "silk",
+          "playbook"
+        ]
+      },
+      {
+        "class": "tablet",
+        "substrings": [
+          "android"
+        ],
+        "exclude": [
+          "mobile"
+        ]
+      },
+      {
+        "class": "mobile",
+        "substrings": [
+          "mobile",
+          "android",
+          "iphone",
+          "ipod",
+          "blackberry",
+          "opera mini",
+          "windows phone"
+        ]
+      }
+    ],
+    "default": "desktop",
+    "folds": [
+      {
+        "from": "bot",
+        "into": "desktop"
+      },
+      {
+        "from": "tablet",
+        "into": "desktop"
+      }
+    ]
+  },
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      },
+      {
+        "kind": "device"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          },
+          {
+            "kind": "device"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_key",
+            "name": "X-Cache-Key"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {
+    "cacheKeyHeader": "X-Cache-Key"
+  },
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

@@ -1,0 +1,168 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -s -l .)
+          if [ -n "$out" ]; then
+            echo "These files are not gofmt-ed:"; echo "$out"; exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      - name: test (race)
+        # -short skips the heavy soak/chaos stress tests (they guard on testing.Short());
+        # they run locally via `make race` (no -short). Keeps the PR gate fast + reliable.
+        run: go test ./... -race -count=1 -short
+
+      # A broken shipped example must fail CI: run `cadish check -strict` over
+      # every examples/*.Cadishfile so a warning or error in any of them is a hard
+      # failure (the published recipes are part of the docs contract).
+      - name: validate examples (cadish check -strict)
+        run: |
+          fail=0
+          for f in examples/*.Cadishfile; do
+            echo "==> $f"
+            if [ "$f" = "examples/s3-cdn.Cadishfile" ]; then
+              # s3-cdn signs with a CloudFront key-pair id ({$CF_KEYPAIR_ID}) and a host-path PEM
+              # that only exist on the run host. Validate it NON-strict with a placeholder id so the
+              # env-driven recipe is still structure-checked, without failing on the unavoidable
+              # "key file not found at check time" warning.
+              if ! CF_KEYPAIR_ID=APKAEXAMPLE go run ./cmd/cadish check -config "$f"; then
+                echo "::error file=$f::example fails 'cadish check'"
+                fail=1
+              fi
+            elif ! go run ./cmd/cadish check -config "$f" -strict; then
+              echo "::error file=$f::example fails 'cadish check -strict'"
+              fail=1
+            fi
+          done
+          exit $fail
+
+  # golangci-lint: a curated, conservative linter gate (see .golangci.yml). It
+  # complements the standalone gofmt/vet gates above with errcheck-free,
+  # low-false-positive checks the tree passes clean.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+          check-latest: true
+      - name: golangci-lint
+        # v9 (Node 24) + golangci-lint v2, which is built with Go 1.26 — v1.64.8 (built with
+        # Go 1.24) hard-errors on this module's go 1.26 directive (a dependency forces it).
+        uses: golangci/golangci-lint-action@db582008a42febd596419635a5abc9d9815daa9c # v9.2.1
+        with:
+          version: v2.12.2
+
+  # Cadish Edge: the JS half of the cross-runtime conformance suite + the runtime
+  # IO tests (both dependency-free, so no npm install), and the coverage gate
+  # (`cadish edge build -strict` on a reference edge-native config). The Go half of
+  # conformance runs in build-test; this job is what stops a JS-only regression
+  # (where the interpreter diverges from the committed golden) from slipping
+  # through. The miniflare tier (real workerd) stays a local check
+  # (`npm run test:miniflare` in edge/runtime) to keep CI fast and hermetic.
+  edge-js:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+          check-latest: true
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: cross-runtime conformance (JS interpreter vs Go golden)
+        run: node edge/runtime/conformance.test.mjs
+
+      - name: edge runtime IO tests (JS)
+        run: node edge/runtime/runtime.test.mjs
+
+      - name: coverage gate — edge build -strict on the reference config
+        run: go run ./cmd/cadish edge build -config test/conformance/reference.cadish -o /dev/null -strict
+
+  # envtest integration lane (D63): the `integration`-tagged tests in internal/k8s
+  # (Layer-1 EndpointSlice resolver) and internal/ingress (Layer-2 ingress controller)
+  # run against a REAL apiserver+etcd obtained via controller-runtime's setup-envtest.
+  # These are EXCLUDED from the default green gate (build-test) — they need the envtest
+  # binaries and would otherwise just SKIP — so they get their own job here. The
+  # KUBEBUILDER_ASSETS path is what the tests look for; without it they skip, so this
+  # job exists precisely to make sure the real-apiserver paths are exercised.
+  integration-envtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # k8s control-plane version for the envtest binaries. The tests were validated
+      # against 1.36; 1.31.0 is the newest line setup-envtest reliably ships prebuilt
+      # binaries for, and the apiserver is forward-compatible with the test resources
+      # (EndpointSlice/Ingress/IngressClass are all stable in 1.31).
+      ENVTEST_K8S_VERSION: "1.31.0"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+          check-latest: true
+
+      # Cache the downloaded envtest control-plane binaries (apiserver/etcd/kubectl)
+      # keyed by k8s version, so a green run does not re-fetch them every time.
+      - name: cache envtest binaries
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        with:
+          # setup-envtest stores binaries under $XDG_DATA_HOME/io.kubebuilder.envtest,
+          # which on the ubuntu runner is ~/.local/share/io.kubebuilder.envtest.
+          path: ~/.local/share/io.kubebuilder.envtest
+          key: envtest-${{ runner.os }}-k8s-${{ env.ENVTEST_K8S_VERSION }}
+
+      - name: install setup-envtest
+        # Pinned to match sigs.k8s.io/controller-runtime in go.mod (v0.24.1).
+        run: go install sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.24.1
+
+      - name: fetch envtest assets
+        run: setup-envtest use "${ENVTEST_K8S_VERSION}"
+
+      - name: integration tests (real apiserver)
+        run: |
+          KUBEBUILDER_ASSETS="$(setup-envtest use "${ENVTEST_K8S_VERSION}" -p path)" \
+            go test -tags integration -count=1 ./internal/k8s ./internal/ingress
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.4.0
+          govulncheck ./...

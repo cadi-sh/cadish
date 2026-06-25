@@ -1,0 +1,211 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "example.com",
+      "adult.example.com"
+    ],
+    "redirectHosts": [
+      "adult.example.com",
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "adult": {
+      "kind": "host",
+      "patterns": [
+        "adult.example.com"
+      ]
+    },
+    "gated": {
+      "kind": "classify",
+      "classifyToken": "age",
+      "classifyValue": "gate"
+    },
+    "verified": {
+      "kind": "cookie",
+      "name": "verified_prod"
+    }
+  },
+  "classifiers": {
+    "age": {
+      "rows": [
+        {
+          "conj": [
+            "verified"
+          ],
+          "value": "ok"
+        },
+        {
+          "conj": [
+            "adult"
+          ],
+          "value": "gate"
+        }
+      ],
+      "default": "open"
+    }
+  },
+  "device": {
+    "rules": [
+      {
+        "class": "bot",
+        "substrings": [
+          "bot",
+          "crawler",
+          "spider",
+          "slurp",
+          "facebookexternalhit",
+          "bingpreview"
+        ]
+      },
+      {
+        "class": "tablet",
+        "substrings": [
+          "ipad",
+          "tablet",
+          "kindle",
+          "silk",
+          "playbook"
+        ]
+      },
+      {
+        "class": "tablet",
+        "substrings": [
+          "android"
+        ],
+        "exclude": [
+          "mobile"
+        ]
+      },
+      {
+        "class": "mobile",
+        "substrings": [
+          "mobile",
+          "android",
+          "iphone",
+          "ipod",
+          "blackberry",
+          "opera mini",
+          "windows phone"
+        ]
+      }
+    ],
+    "default": "desktop"
+  },
+  "recv": {
+    "redirect": [
+      {
+        "scope": {
+          "names": [
+            "gated"
+          ]
+        },
+        "status": 302,
+        "target": "https://verify.example.com/?from={host}"
+      }
+    ]
+  },
+  "key": {
+    "tokens": [
+      {
+        "kind": "method"
+      },
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      },
+      {
+        "kind": "classify",
+        "ref": "age"
+      },
+      {
+        "kind": "device"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "method"
+          },
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          },
+          {
+            "kind": "classify",
+            "ref": "age"
+          },
+          {
+            "kind": "device"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "30s",
+        "grace": "5m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "set",
+            "name": "X-Age-Class",
+            "value": "{classify.age}",
+            "valueIsTmpl": true
+          }
+        ]
+      },
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "append",
+            "name": "X-Forwarded-Host",
+            "value": "{http.Host}",
+            "valueIsTmpl": true
+          }
+        ]
+      },
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache"
+  },
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

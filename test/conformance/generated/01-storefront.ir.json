@@ -1,0 +1,182 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "example.com",
+      "*.example.com"
+    ],
+    "redirectHosts": [
+      "*.example.com",
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "ajax": {
+      "kind": "header",
+      "name": "X-Requested-With",
+      "values": [
+        "XMLHttpRequest"
+      ]
+    },
+    "listings": {
+      "kind": "path_regex",
+      "regex": "^/catalog/"
+    },
+    "nocache": {
+      "kind": "path",
+      "patterns": [
+        "/panel/*"
+      ]
+    }
+  },
+  "recv": {
+    "pass": [
+      {
+        "names": [
+          "ajax"
+        ]
+      },
+      {
+        "inline": [
+          {
+            "kind": "method",
+            "methods": [
+              "POST"
+            ]
+          }
+        ]
+      },
+      {
+        "names": [
+          "nocache"
+        ]
+      }
+    ],
+    "respond": [
+      {
+        "path": "/health-check",
+        "status": 200,
+        "body": "OK"
+      }
+    ]
+  },
+  "key": {
+    "tokens": [
+      {
+        "kind": "url"
+      },
+      {
+        "kind": "host"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "url"
+          },
+          {
+            "kind": "host"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "status_in",
+        "codes": [
+          404,
+          410
+        ],
+        "ttl": "1m0s",
+        "grace": "1h0m0s"
+      },
+      {
+        "selKind": "status_not_in",
+        "codes": [
+          200
+        ],
+        "hitForMiss": "5s",
+        "isHFM": true
+      },
+      {
+        "selKind": "scope",
+        "scope": {
+          "names": [
+            "listings"
+          ]
+        },
+        "ttl": "2s",
+        "grace": "24h0m0s"
+      },
+      {
+        "selKind": "default",
+        "ttl": "2s",
+        "grace": "24h0m0s"
+      }
+    ],
+    "storage": [
+      {
+        "selKind": "scope",
+        "scope": {
+          "names": [
+            "listings"
+          ]
+        },
+        "tier": "disk"
+      },
+      {
+        "selKind": "default",
+        "tier": "ram"
+      }
+    ],
+    "stripCookies": [
+      {
+        "inline": [
+          {
+            "kind": "path_regex",
+            "regex": "\\.(css|js|png)$"
+          }
+        ]
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "remove",
+            "name": "Server"
+          }
+        ]
+      },
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache"
+  },
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

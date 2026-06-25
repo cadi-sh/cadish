@@ -1,0 +1,97 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "example.com"
+    ],
+    "redirectHosts": [
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "lang_es": {
+      "kind": "header_regex",
+      "regex": "^es",
+      "regexFlags": "i",
+      "name": "Accept-Language"
+    },
+    "on_www": {
+      "kind": "host_regex",
+      "regex": "^www\\.",
+      "regexFlags": "i"
+    },
+    "to_es": {
+      "kind": "classify",
+      "classifyToken": "to_es",
+      "classifyValue": "1"
+    }
+  },
+  "classifiers": {
+    "to_es": {
+      "rows": [
+        {
+          "conj": [
+            "on_www",
+            "lang_es"
+          ],
+          "value": "1"
+        }
+      ],
+      "default": "0"
+    }
+  },
+  "recv": {
+    "redirect": [
+      {
+        "scope": {
+          "names": [
+            "to_es"
+          ]
+        },
+        "status": 302,
+        "target": "https://es.example.com{uri}"
+      }
+    ]
+  },
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s",
+        "grace": "5m0s"
+      }
+    ]
+  },
+  "deliver": {},
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

@@ -1,0 +1,69 @@
+# Reference EDGE-NATIVE Cadishfile for the `cadish edge build -strict` CI gate.
+#
+# Every directive here MUST stay edge-native (projected into the worker IR, never
+# delegated). `cadish edge build -strict` exits non-zero if ANYTHING delegates, so
+# a change that turns one of these into a delegated directive fails CI and flags
+# the coverage regression. Keep it broad to maximize the surface this guards.
+#
+# Do NOT add `purge` or `replace` here — both are intentionally delegated to the
+# Cadish server behind (D34 / design §9), so they belong in a non-strict fixture.
+example.com, *.example.com {
+    @ajax     header_present X-Requested-With
+    @nocache  path /panel/*
+    @listings path_regex ^/catalog/
+    @html     content_type text/html
+    @sc       set_cookie
+    @verified cookie verified_prod
+    @adult    host adult.example.com
+
+    classify {age} {
+        when @verified -> ok
+        when @adult    -> gate
+        default        -> open
+    }
+    @gated classify {age}==gate
+
+    normalize curr {
+        from cookie currency
+        map USD,usd -> usd
+        map EUR     -> eur
+        default usd
+    }
+
+    tenant {
+        from host
+        map *.example.com -> main
+        default other
+    }
+
+    respond  /health-check 200 "OK"
+    redirect ^/old/(.*)$ 301 https://{host}/new/$1
+    redirect @gated 302 https://verify.{host}/
+
+    pass @ajax
+    pass method POST
+    pass @nocache
+
+    cache_key method host path {age} {curr} {tenant} {geo} {geo.continent} {geo.region} {device} query_allow genre age
+
+    cache_ttl status 404 410 ttl 60s grace 1h
+    cache_ttl status not 200 hit_for_miss 5s
+    cache_ttl @listings      ttl 2s  grace 24h
+    cache_ttl default        ttl 2s  grace 24h
+
+    storage @listings -> disk
+    storage default   -> ram
+
+    strip_cookies @sc
+    cors https://app.example.com methods GET POST headers Content-Type
+
+    header X-Geo {geo}
+    header +cache_status X-Cache
+
+    edge {
+        worker     cadish-edge-reference
+        default    local
+        distribute @html
+        skip       @nocache
+    }
+}

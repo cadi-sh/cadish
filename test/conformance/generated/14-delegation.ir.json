@@ -1,0 +1,107 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "example.com"
+    ],
+    "redirectHosts": [
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "html": {
+      "kind": "content_type",
+      "contentTypes": [
+        "text/html"
+      ],
+      "responsePhase": true
+    }
+  },
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "method"
+      },
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "method"
+          },
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      }
+    ],
+    "transforms": [
+      {
+        "scope": {
+          "names": [
+            "html"
+          ]
+        },
+        "old": "OLD",
+        "new": "NEW"
+      }
+    ],
+    "transformMaxBytes": 1048576
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache"
+  },
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  },
+  "delegate": [
+    {
+      "directive": "rewrite",
+      "reason": "origin-request URL rewrite (rewrite) is not edge-native in v1; the Cadish server behind applies it before the origin fetch",
+      "scope": {
+        "always": true
+      }
+    },
+    {
+      "directive": "encode",
+      "reason": "on-the-fly response compression (encode) is not edge-native in v1; Cloudflare compresses at its own edge and the Cadish server applies encode for origin fetches"
+    }
+  ]
+}

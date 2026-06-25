@@ -1,0 +1,269 @@
+[
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fshop.example.com\u001f/",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [
+        {
+          "old": "http://origin.internal",
+          "new": "https://shop.example.com"
+        },
+        {
+          "old": "__TITLE__",
+          "new": "Welcome"
+        }
+      ],
+      "bodyTransformed": true,
+      "transformedBody": "\u003chtml\u003e\u003chead\u003e\u003ctitle\u003eWelcome\u003c/title\u003e\u003c/head\u003e\u003cbody\u003e\u003ca href=\"https://shop.example.com/x\"\u003ego\u003c/a\u003e and Welcome again\u003c/body\u003e\u003c/html\u003e"
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fshop.example.com\u001f/",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "HIT"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [
+        {
+          "old": "http://origin.internal",
+          "new": "https://shop.example.com"
+        },
+        {
+          "old": "__TITLE__",
+          "new": "Welcome"
+        }
+      ],
+      "bodyTransformed": true,
+      "transformedBody": "\u003chtml\u003e\u003chead\u003e\u003ctitle\u003eWelcome\u003c/title\u003e\u003c/head\u003e\u003cbody\u003e\u003ca href=\"https://shop.example.com/x\"\u003ego\u003c/a\u003e and Welcome again\u003c/body\u003e\u003c/html\u003e"
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fshop.example.com\u001f/asset.bin",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": "__TITLE__ should NOT be replaced (scope is @html only) http://origin.internal"
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fshop.example.com\u001f/",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [
+        {
+          "old": "http://origin.internal",
+          "new": "https://shop.example.com"
+        },
+        {
+          "old": "__TITLE__",
+          "new": "Welcome"
+        }
+      ],
+      "bodyTransformed": false,
+      "transformedBody": "encoded __TITLE__ http://origin.internal stays raw"
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "HEAD\u001fshop.example.com\u001f/",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [
+        {
+          "old": "http://origin.internal",
+          "new": "https://shop.example.com"
+        },
+        {
+          "old": "__TITLE__",
+          "new": "Welcome"
+        }
+      ],
+      "bodyTransformed": false,
+      "transformedBody": "__TITLE__ http://origin.internal head no-transform"
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fshop.example.com\u001f/",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "HIT"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [
+        {
+          "old": "http://origin.internal",
+          "new": "https://shop.example.com"
+        },
+        {
+          "old": "__TITLE__",
+          "new": "Welcome"
+        }
+      ],
+      "bodyTransformed": false,
+      "transformedBody": "__TITLE__ http://origin.internal range no-transform"
+    }
+  }
+]

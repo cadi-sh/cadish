@@ -1,0 +1,19 @@
+{
+  "name": "38-multi-value-header-key",
+  "cadishfile": "example.com {\n    cache_key host path header:X-Tenant\n\n    cache_ttl default ttl 60s\n\n    header +cache_key X-Key raw\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": {
+        "method": "GET",
+        "host": "example.com",
+        "path": "/p",
+        "header": { "X-Tenant": ["trial", "acme"] }
+      },
+      "origin": {
+        "status": 200,
+        "header": { "Content-Type": ["text/html"] }
+      },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

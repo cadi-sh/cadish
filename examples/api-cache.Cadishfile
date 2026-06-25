@@ -1,0 +1,56 @@
+# Recipe: API response cache
+# Cache idempotent reads briefly, never cache writes or per-user/authenticated
+# responses, scope the key so tenants don't share entries, and don't let a flaky
+# 5xx poison the cache or stampede the origin.
+
+api.example.com {
+    tls {
+        acme ops@example.com
+    }
+
+    cache {
+        ram 2GiB
+    }
+
+    upstream api {
+        to http://api.internal:8080
+    }
+
+    # Scope the cache key by tenant via a BOUNDED normalizer rather than keying on
+    # the raw X-Tenant header. Keying on a raw `header:` value has unbounded
+    # cardinality (one cache entry per distinct value → fragmentation), which
+    # `cadish check -strict` flags as `unbounded-key-token`. A `normalize` block
+    # buckets the header into a small, known enum so the key stays bounded; map
+    # your real tenant ids here (a tenant not in the table falls to `other`).
+    normalize tenant_bucket {
+        from header X-Tenant
+        map acme,globex -> paid
+        map trial -> trial
+        default other
+    }
+
+    # Never cache mutations.
+    pass method POST PUT PATCH DELETE
+
+    # Never cache authenticated responses (they're per-user). Pass anything
+    # carrying credentials, plus the private endpoints.
+    @authed header Authorization
+    @private path /v1/account/* /v1/admin/*
+    pass @authed
+    pass @private
+
+    # Vary on the bucketed {tenant} token (defined above) so tenants never share
+    # cache entries, while the key stays bounded to the normalizer's enum.
+    cache_key method host url {tenant_bucket}
+
+    # cache_ttl is first-match-wins, so put the specific status rule BEFORE the
+    # catch-all. A transient non-200 must not be cached as the answer, and
+    # shouldn't let a herd hammer a flapping origin: cache the "don't cache"
+    # decision for a few seconds (hit-for-miss).
+    cache_ttl status not 200 hit_for_miss 5s
+    # Short freshness for everything else; serve stale briefly while revalidating.
+    cache_ttl default ttl 10s grace 2m
+
+    cors * # browser/SPA clients
+    header +cache_status X-Cache
+}

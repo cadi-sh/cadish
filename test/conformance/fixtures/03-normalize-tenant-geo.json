@@ -1,0 +1,32 @@
+{
+  "name": "03-normalize-tenant-geo",
+  "cadishfile": "*.shop.example.com {\n    upstream web {\n        to http://backend\n        sticky by cookie PHPSESSID else client_ip\n    }\n    upstream images { to http://img }\n\n    @img        path /img/*\n    @fromimages upstream images\n    route @img -> images\n\n    normalize curr {\n        from cookie currency\n        map USD,usd -> usd\n        map EUR     -> eur\n        default usd\n    }\n\n    tenant {\n        from host\n        map *.shop.example.com -> shop\n        default other\n    }\n\n    @us geo country US ES\n\n    cache_key host path {curr} {tenant} {geo} {geo.continent} {geo.region} {sticky} query_allow genre age v1\n\n    header @fromimages X-Origin images\n\n    cache_ttl @us     ttl 10s grace 1m\n    cache_ttl default ttl 5s  grace 30s\n}",
+  "cases": [
+    {
+      "request": {
+        "method": "GET", "host": "a.shop.example.com", "path": "/p",
+        "query": { "genre": ["rock"], "age": ["20"], "utm_source": ["x"] },
+        "header": { "Cookie": ["currency=EUR; PHPSESSID=sess1"] },
+        "clientIP": "203.0.113.9", "geo": "US", "geoContinent": "NA", "geoRegion": "US-UT"
+      },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "HIT"
+    },
+    {
+      "request": {
+        "method": "GET", "host": "b.shop.example.com", "path": "/img/logo.png",
+        "clientIP": "203.0.113.10", "geo": "ES", "geoContinent": "EU", "geoRegion": "ES-MD"
+      },
+      "origin": { "status": 200, "header": { "Content-Type": ["image/png"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": {
+        "method": "GET", "host": "c.shop.example.com", "path": "/q",
+        "clientIP": "198.51.100.4", "geo": "FR", "geoContinent": "EU", "geoRegion": "FR-75"
+      },
+      "origin": { "status": 200 },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

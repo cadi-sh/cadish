@@ -1,0 +1,21 @@
+{
+  "name": "02-classify",
+  "cadishfile": "example.com, adult.example.com {\n    @verified cookie verified_prod\n    @adult    host adult.example.com\n    classify {age} {\n        when @verified -> ok\n        when @adult    -> gate\n        default        -> open\n    }\n    @gated classify {age}==gate\n\n    redirect @gated 302 https://verify.example.com/?from={host}\n\n    cache_key method host path {age} {device}\n\n    header X-Age-Class    {classify.age}\n    header +X-Forwarded-Host {http.Host}\n    header +cache_status  X-Cache\n\n    cache_ttl default ttl 30s grace 5m\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "adult.example.com", "path": "/cams", "device": "desktop" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "Cookie": ["verified_prod=1; theme=dark"] }, "device": "mobile" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "HIT"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/profile", "device": "tablet" },
+      "origin": { "status": 200 },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

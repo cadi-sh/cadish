@@ -1,0 +1,39 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cadish
+  namespace: cadish
+  labels:
+    app.kubernetes.io/name: cadish
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cadish
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0     # tighten to your LB / ingress source
+      ports:
+        - port: http
+          protocol: TCP
+        - port: https
+          protocol: TCP
+  egress:
+    # DNS (origins, dynamic upstream re-resolution, ACME).
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Origins + ACME directory/challenge. Tighten the CIDR to your origins.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 80
+          protocol: TCP
+        - port: 443
+          protocol: TCP

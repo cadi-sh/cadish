@@ -1,0 +1,71 @@
+{
+  "name": "07-cookie-json",
+  "cadishfile": "example.com {\n    @nsfw_needverify  cookie_json nsfwCookie needVerify true\n    @nsfw_verified    cookie_json nsfwCookie verified   true\n    @plan_pro         header_json X-Session plan.tier pro enterprise\n    @flag0_gate       cookie_json nsfwCookie flags.0.kind gate\n\n    @num_src          cookie_json numCookie n 1e3\n    @num_src_dotzero  cookie_json numCookie n 1.0\n    @num_src_trail    cookie_json numCookie n 1.50\n    @plus_tok         cookie_json plusCookie tok a+b\n    @dup_last         cookie_json dupCookie k b\n    @deep_shallow     cookie_json deepCookie shallow yes\n\n    classify {needVerify} {\n        when cookie_json nsfwCookie needVerify false -> 0\n        when @nsfw_needverify                        -> 1\n        default                                      -> 0\n    }\n    classify {nsfwVerified} {\n        when @nsfw_verified -> 1\n        default             -> 0\n    }\n\n    pass @plan_pro\n\n    cache_key host path {needVerify} {nsfwVerified}\n\n    header NEEDVERIFY   {classify.needVerify}\n    header NSFWVERIFIED {classify.nsfwVerified}\n    header @flag0_gate X-Flag0-Gate 1\n    header @num_src         X-Num-Src 1\n    header @num_src_dotzero X-Num-DotZero 1\n    header @num_src_trail   X-Num-Trail 1\n    header @plus_tok        X-Plus-Tok 1\n    header @dup_last        X-Dup-Last 1\n    header @deep_shallow    X-Deep-Shallow 1\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "Cookie": ["nsfwCookie=%7B%22needVerify%22%3Atrue%2C%22verified%22%3Afalse%7D"] } },
+      "origin": { "status": 200 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "Cookie": ["nsfwCookie={\"needVerify\":false,\"verified\":true}"] } },
+      "origin": { "status": 200 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "Cookie": ["nsfwCookie=not-json"] } },
+      "origin": { "status": 200 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/" },
+      "origin": { "status": 200 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "X-Session": ["{\"plan\":{\"tier\":\"pro\"}}"] } },
+      "origin": { "status": 200 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "X-Session": ["{\"plan\":{\"tier\":\"free\"}}"] } },
+      "origin": { "status": 200 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "Cookie": ["nsfwCookie={\"flags\":[{\"kind\":\"gate\"}]}"] } },
+      "origin": { "status": 200 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "Cookie": ["numCookie={\"n\":1e3}"] } },
+      "origin": { "status": 200 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "Cookie": ["numCookie={\"n\":1.0}"] } },
+      "origin": { "status": 200 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "Cookie": ["numCookie={\"n\":1.50}"] } },
+      "origin": { "status": 200 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "Cookie": ["plusCookie=%7B%22tok%22%3A%22a+b%22%7D"] } },
+      "origin": { "status": 200 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "Cookie": ["dupCookie={\"k\":\"a\",\"k\":\"b\"}"] } },
+      "origin": { "status": 200 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "Cookie": ["deepCookie={\"shallow\":\"yes\",\"deep\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}"] } },
+      "origin": { "status": 200 },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

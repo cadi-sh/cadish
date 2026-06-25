@@ -1,0 +1,39 @@
+{
+  "name": "25-on-error-outage",
+  "cadishfile": "api.example.com {\n    @api path /api/*\n    @static path /static/*\n    respond on_error @api 503 \"api down for maintenance\"\n    respond on_error @static 504 \"static gateway timeout\"\n    cache_key host path\n    cache_ttl default ttl 1m grace 5m max_stale 24h\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "api.example.com", "path": "/api/users" },
+      "origin": { "status": 200, "header": { "Content-Type": ["application/json"] } },
+      "cacheStatus": "MISS",
+      "originFailed": true,
+      "salvageable": false
+    },
+    {
+      "request": { "method": "GET", "host": "api.example.com", "path": "/api/users" },
+      "origin": { "status": 200, "header": { "Content-Type": ["application/json"] } },
+      "cacheStatus": "MISS",
+      "originFailed": true,
+      "salvageable": true
+    },
+    {
+      "request": { "method": "GET", "host": "api.example.com", "path": "/static/app.js" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/javascript"] } },
+      "cacheStatus": "MISS",
+      "originFailed": true,
+      "salvageable": false
+    },
+    {
+      "request": { "method": "GET", "host": "api.example.com", "path": "/home" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS",
+      "originFailed": true,
+      "salvageable": false
+    },
+    {
+      "request": { "method": "GET", "host": "api.example.com", "path": "/home" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

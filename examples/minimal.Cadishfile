@@ -1,0 +1,28 @@
+# Minimal cache: terminate TLS for one host, cache an HTTP origin.
+# The smallest useful cadish config.
+
+example.com {
+    tls {
+        acme you@example.com
+    }
+
+    cache {
+        ram 2GiB
+    }
+
+    upstream backend {
+        to https://origin.internal:8080
+    }
+
+    # Don't cache the admin area or anything behind auth.
+    @dynamic path /admin/* /api/*
+    pass @dynamic
+    pass method POST
+
+    # Negative caching: store 404s briefly so a missing path doesn't hammer the
+    # origin. Only 200/206 and 404/410 are cached; everything else streams through.
+    cache_ttl status 404 ttl 30s
+    cache_ttl default ttl 5m grace 1h
+
+    header +cache_status X-Cache
+}

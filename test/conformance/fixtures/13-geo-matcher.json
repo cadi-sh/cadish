@@ -1,0 +1,21 @@
+{
+  "name": "13-geo-matcher",
+  "cadishfile": "example.com {\n    @eu        geo continent EU\n    @regulated geo region US-UT US-TX\n    redirect @eu 302 https://eu.example.com{uri}\n    pass @regulated\n    cache_key method host path\n    cache_ttl default ttl 1m\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/p", "geoContinent": "EU" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/p", "geoContinent": "NA", "geoRegion": "US-UT" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/p", "geoContinent": "NA", "geoRegion": "US-CA" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}
