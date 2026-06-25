@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cadish
+  namespace: cadish
+  labels:
+    app.kubernetes.io/name: cadish
+spec:
+  type: LoadBalancer
+  # Preserve the client source IP (sticky / geo correctness).
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: cadish
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    - name: https
+      port: 443
+      targetPort: https
+      protocol: TCP

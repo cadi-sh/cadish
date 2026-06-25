@@ -1,0 +1,79 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "example.com"
+    ],
+    "redirectHosts": [
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "api": {
+      "kind": "path",
+      "patterns": [
+        "/api/*"
+      ]
+    }
+  },
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "method"
+      },
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "scope",
+        "scope": {
+          "names": [
+            "api"
+          ]
+        },
+        "grace": "30s",
+        "fromHeader": "X-Cache-Ttl"
+      },
+      {
+        "selKind": "default",
+        "ttl": "5s"
+      }
+    ],
+    "storage": [
+      {
+        "selKind": "default",
+        "tier": "ram"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache"
+  },
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

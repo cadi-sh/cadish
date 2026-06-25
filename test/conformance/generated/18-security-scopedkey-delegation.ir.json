@@ -1,0 +1,115 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "deleg.example.com"
+    ],
+    "redirectHosts": [
+      "deleg.example.com"
+    ],
+    "canonicalHost": "deleg.example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "admin": {
+      "kind": "path",
+      "patterns": [
+        "/admin/*"
+      ]
+    },
+    "ssr": {
+      "kind": "header",
+      "name": "X-IS-SSR-URL",
+      "values": [
+        "true"
+      ]
+    }
+  },
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "url"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "names": [
+            "ssr"
+          ]
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          }
+        ]
+      },
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "url"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      },
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_key",
+            "name": "X-Cache-Key"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache",
+    "cacheKeyHeader": "X-Cache-Key"
+  },
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  },
+  "delegate": [
+    {
+      "directive": "security",
+      "reason": "allow/deny/block/rate_limit are SERVER-ONLY and are NOT enforced at the edge; the worker cannot run the security gate, so these rules must be enforced by Cloudflare's own security layer (WAF/rules) in front of the worker"
+    }
+  ]
+}

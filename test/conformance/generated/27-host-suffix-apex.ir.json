@@ -1,0 +1,95 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "example.com",
+      "*.example.com"
+    ],
+    "redirectHosts": [
+      "*.example.com",
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "sub": {
+      "kind": "host",
+      "patterns": [
+        "*.example.com"
+      ]
+    }
+  },
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "url"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "names": [
+            "sub"
+          ]
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          }
+        ]
+      },
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "url"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s",
+        "grace": "5m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_key",
+            "name": "X-Cache-Key",
+            "value": "raw"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {
+    "cacheKeyHeader": "X-Cache-Key",
+    "cacheKeyRaw": true
+  },
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

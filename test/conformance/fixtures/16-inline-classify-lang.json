@@ -1,0 +1,31 @@
+{
+  "name": "16-inline-classify-lang",
+  "cadishfile": "example.com {\n    classify {lang} {\n        when cookie selectedLanguage es -> es\n        when cookie selectedLanguage en -> en\n        when header Accept-Language es -> es\n        default                         -> en\n    }\n\n    cache_key host path {lang}\n    cache_ttl default ttl 1m grace 5m\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "Cookie": ["selectedLanguage=es"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "Cookie": ["selectedLanguage=en"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "Accept-Language": ["es"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "Accept-Language": ["es-ES,es;q=0.9,en;q=0.8"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

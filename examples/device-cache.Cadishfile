@@ -1,0 +1,35 @@
+# Recipe: Device-varied cache (the VARY-cardinality win)
+# The origin renders different HTML for mobile vs desktop. Naively varying on the
+# raw User-Agent shatters the cache (millions of UA strings → ~0% hit rate).
+# Instead normalize UA → a small {desktop, mobile} enum and vary on THAT.
+
+www.example.com {
+    tls {
+        acme ops@example.com
+    }
+
+    cache {
+        ram 4GiB
+    }
+
+    upstream web {
+        to http://origin.internal:8080
+    }
+
+    # Classify the User-Agent into a small enum. Folding tablet+bot into desktop
+    # keeps it to TWO variants (desktop/mobile) — the lowest-cardinality split that
+    # still serves the mobile template. Drop the `fold` lines to keep 4 classes.
+    device_detect {
+        fold tablet desktop
+        fold bot desktop
+    }
+
+    # Vary the cache key on the device CLASS, not the raw UA. Two desktop users now
+    # share one cache entry instead of each getting their own.
+    cache_key host path {device}
+
+    cache_ttl default ttl 2m grace 1h
+    header +cache_status X-Cache
+
+    # `cadish check` will confirm {device} is a bounded, hit-rate-safe key token.
+}

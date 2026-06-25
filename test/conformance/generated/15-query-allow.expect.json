@@ -1,0 +1,150 @@
+[
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fqa.example.com\u001f/list\u001fage=18\u0026genre=drama\u001f",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 0,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "3678cf31da32",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fqa.example.com\u001f/list\u001fage=18\u0026genre=drama\u001f",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 0,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "HIT"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "3678cf31da32",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fqa.example.com\u001f/list\u001fff-beta=1\u0026genre=drama\u001f",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 0,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "76f16d150168",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fqa.example.com\u001f/list\u001fgenre=drama\u001fb",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 0,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "e3e73fc2bcd1",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  }
+]

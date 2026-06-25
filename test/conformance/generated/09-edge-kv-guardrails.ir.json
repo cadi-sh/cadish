@@ -1,0 +1,96 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "example.com"
+    ],
+    "redirectHosts": [
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "html": {
+      "kind": "content_type",
+      "contentTypes": [
+        "text/html"
+      ],
+      "responsePhase": true
+    },
+    "media": {
+      "kind": "path",
+      "patterns": [
+        "/media/*"
+      ]
+    }
+  },
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "url"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "url"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "30s",
+        "grace": "1h0m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache"
+  },
+  "edge": {
+    "policies": [
+      {
+        "scope": {
+          "names": [
+            "html"
+          ]
+        },
+        "tier": "distribute"
+      },
+      {
+        "scope": {
+          "names": [
+            "media"
+          ]
+        },
+        "tier": "skip"
+      }
+    ],
+    "default": "local",
+    "kvTtlSeconds": 300,
+    "kvMaxBytes": 262144
+  }
+}

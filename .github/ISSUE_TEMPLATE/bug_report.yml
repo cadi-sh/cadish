@@ -1,0 +1,55 @@
+name: Bug report
+description: Something in cadish behaves incorrectly.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! For **security vulnerabilities, do not file a public
+        issue** — see [SECURITY.md](../../SECURITY.md) (email security@cadi.sh).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you observe, and what did you expect instead?
+      placeholder: cadish returned a 502 where the origin returned a 301…
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Ideally a minimal Cadishfile + the request(s) that trigger it.
+      placeholder: |
+        1. Cadishfile:
+           ```
+           example.com { tls off; upstream o { to http://127.0.0.1:9000 } ... }
+           ```
+        2. `cadish run -config Cadishfile -addr :8080`
+        3. `curl -i http://localhost:8080/...`
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: cadishfile
+    attributes:
+      label: Output of `cadish check`
+      description: Run `cadish check -config <your file>` and paste the report (it often pinpoints the issue).
+      render: text
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: cadish version
+      description: Output of `cadish version`.
+      placeholder: cadish v0.2.0 (abc1234, go1.26.4)
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS / arch
+      placeholder: linux/amd64 (k8s), darwin/arm64, …
+    validations:
+      required: true

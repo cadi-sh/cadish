@@ -1,0 +1,317 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "example.com"
+    ],
+    "redirectHosts": [
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "__edge.classify.needVerify.0.0": {
+      "kind": "cookie_json",
+      "name": "nsfwCookie",
+      "values": [
+        "false"
+      ],
+      "jsonPath": "needVerify"
+    },
+    "deep_shallow": {
+      "kind": "cookie_json",
+      "name": "deepCookie",
+      "values": [
+        "yes"
+      ],
+      "jsonPath": "shallow"
+    },
+    "dup_last": {
+      "kind": "cookie_json",
+      "name": "dupCookie",
+      "values": [
+        "b"
+      ],
+      "jsonPath": "k"
+    },
+    "flag0_gate": {
+      "kind": "cookie_json",
+      "name": "nsfwCookie",
+      "values": [
+        "gate"
+      ],
+      "jsonPath": "flags.0.kind"
+    },
+    "nsfw_needverify": {
+      "kind": "cookie_json",
+      "name": "nsfwCookie",
+      "values": [
+        "true"
+      ],
+      "jsonPath": "needVerify"
+    },
+    "nsfw_verified": {
+      "kind": "cookie_json",
+      "name": "nsfwCookie",
+      "values": [
+        "true"
+      ],
+      "jsonPath": "verified"
+    },
+    "num_src": {
+      "kind": "cookie_json",
+      "name": "numCookie",
+      "values": [
+        "1e3"
+      ],
+      "jsonPath": "n"
+    },
+    "num_src_dotzero": {
+      "kind": "cookie_json",
+      "name": "numCookie",
+      "values": [
+        "1.0"
+      ],
+      "jsonPath": "n"
+    },
+    "num_src_trail": {
+      "kind": "cookie_json",
+      "name": "numCookie",
+      "values": [
+        "1.50"
+      ],
+      "jsonPath": "n"
+    },
+    "plan_pro": {
+      "kind": "header_json",
+      "name": "X-Session",
+      "values": [
+        "pro",
+        "enterprise"
+      ],
+      "jsonPath": "plan.tier"
+    },
+    "plus_tok": {
+      "kind": "cookie_json",
+      "name": "plusCookie",
+      "values": [
+        "a+b"
+      ],
+      "jsonPath": "tok"
+    }
+  },
+  "classifiers": {
+    "needVerify": {
+      "rows": [
+        {
+          "conj": [
+            "__edge.classify.needVerify.0.0"
+          ],
+          "value": "0"
+        },
+        {
+          "conj": [
+            "nsfw_needverify"
+          ],
+          "value": "1"
+        }
+      ],
+      "default": "0"
+    },
+    "nsfwVerified": {
+      "rows": [
+        {
+          "conj": [
+            "nsfw_verified"
+          ],
+          "value": "1"
+        }
+      ],
+      "default": "0"
+    }
+  },
+  "recv": {
+    "pass": [
+      {
+        "names": [
+          "plan_pro"
+        ]
+      }
+    ]
+  },
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      },
+      {
+        "kind": "classify",
+        "ref": "needVerify"
+      },
+      {
+        "kind": "classify",
+        "ref": "nsfwVerified"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          },
+          {
+            "kind": "classify",
+            "ref": "needVerify"
+          },
+          {
+            "kind": "classify",
+            "ref": "nsfwVerified"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "set",
+            "name": "NEEDVERIFY",
+            "value": "{classify.needVerify}",
+            "valueIsTmpl": true
+          }
+        ]
+      },
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "set",
+            "name": "NSFWVERIFIED",
+            "value": "{classify.nsfwVerified}",
+            "valueIsTmpl": true
+          }
+        ]
+      },
+      {
+        "scope": {
+          "names": [
+            "flag0_gate"
+          ]
+        },
+        "ops": [
+          {
+            "op": "set",
+            "name": "X-Flag0-Gate",
+            "value": "1"
+          }
+        ]
+      },
+      {
+        "scope": {
+          "names": [
+            "num_src"
+          ]
+        },
+        "ops": [
+          {
+            "op": "set",
+            "name": "X-Num-Src",
+            "value": "1"
+          }
+        ]
+      },
+      {
+        "scope": {
+          "names": [
+            "num_src_dotzero"
+          ]
+        },
+        "ops": [
+          {
+            "op": "set",
+            "name": "X-Num-DotZero",
+            "value": "1"
+          }
+        ]
+      },
+      {
+        "scope": {
+          "names": [
+            "num_src_trail"
+          ]
+        },
+        "ops": [
+          {
+            "op": "set",
+            "name": "X-Num-Trail",
+            "value": "1"
+          }
+        ]
+      },
+      {
+        "scope": {
+          "names": [
+            "plus_tok"
+          ]
+        },
+        "ops": [
+          {
+            "op": "set",
+            "name": "X-Plus-Tok",
+            "value": "1"
+          }
+        ]
+      },
+      {
+        "scope": {
+          "names": [
+            "dup_last"
+          ]
+        },
+        "ops": [
+          {
+            "op": "set",
+            "name": "X-Dup-Last",
+            "value": "1"
+          }
+        ]
+      },
+      {
+        "scope": {
+          "names": [
+            "deep_shallow"
+          ]
+        },
+        "ops": [
+          {
+            "op": "set",
+            "name": "X-Deep-Shallow",
+            "value": "1"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {},
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

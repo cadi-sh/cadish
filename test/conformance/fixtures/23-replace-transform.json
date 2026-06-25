@@ -1,0 +1,44 @@
+{
+  "name": "23-replace-transform",
+  "cadishfile": "shop.example.com {\n    @html content_type text/html\n    replace @html http://origin.internal https://shop.example.com\n    replace @html __TITLE__ Welcome\n    cache_ttl default ttl 1m grace 5m\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS",
+      "body": "<html><head><title>__TITLE__</title></head><body><a href=\"http://origin.internal/x\">go</a> and __TITLE__ again</body></html>"
+    },
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "HIT",
+      "body": "<html><head><title>__TITLE__</title></head><body><a href=\"http://origin.internal/x\">go</a> and __TITLE__ again</body></html>"
+    },
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/asset.bin" },
+      "origin": { "status": 200, "header": { "Content-Type": ["application/octet-stream"] } },
+      "cacheStatus": "MISS",
+      "body": "__TITLE__ should NOT be replaced (scope is @html only) http://origin.internal"
+    },
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"], "Content-Encoding": ["gzip"] } },
+      "cacheStatus": "MISS",
+      "body": "encoded __TITLE__ http://origin.internal stays raw"
+    },
+    {
+      "request": { "method": "HEAD", "host": "shop.example.com", "path": "/" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS",
+      "isHead": true,
+      "body": "__TITLE__ http://origin.internal head no-transform"
+    },
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/", "header": { "Range": ["bytes=0-10"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "HIT",
+      "isRange": true,
+      "body": "__TITLE__ http://origin.internal range no-transform"
+    }
+  ]
+}

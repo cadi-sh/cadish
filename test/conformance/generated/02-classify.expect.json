@@ -1,0 +1,146 @@
+[
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": {
+        "status": 302,
+        "location": "https://verify.example.com/?from=adult.example.com"
+      },
+      "upstream": "",
+      "cacheKey": "",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 30000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Age-Class",
+          "value": "gate"
+        },
+        {
+          "op": "append",
+          "name": "X-Forwarded-Host",
+          "value": ""
+        },
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fexample.com\u001f/\u001fok\u001fmobile",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 30000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Age-Class",
+          "value": "ok"
+        },
+        {
+          "op": "append",
+          "name": "X-Forwarded-Host",
+          "value": ""
+        },
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "HIT"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fexample.com\u001f/profile\u001fopen\u001ftablet",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 30000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Age-Class",
+          "value": "open"
+        },
+        {
+          "op": "append",
+          "name": "X-Forwarded-Host",
+          "value": ""
+        },
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  }
+]

@@ -1,0 +1,92 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "example.com"
+    ],
+    "redirectHosts": [
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "ssr": {
+      "kind": "header",
+      "name": "X-IS-SSR-URL",
+      "values": [
+        "true"
+      ]
+    }
+  },
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "url"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "names": [
+            "ssr"
+          ]
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          }
+        ]
+      },
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "url"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s",
+        "grace": "5m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_key",
+            "name": "X-Cache-Key"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {
+    "cacheKeyHeader": "X-Cache-Key"
+  },
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

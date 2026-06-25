@@ -1,0 +1,16 @@
+{
+  "name": "16-purge-guard-redaction",
+  "cadishfile": "purge.example.com {\n    purge when header X-Purge-Token s3cr3t-PURGE-DO-NOT-LEAK\n    cache_key method host path\n    cache_ttl default ttl 1m\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "purge.example.com", "path": "/page" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "purge.example.com", "path": "/other" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "HIT"
+    }
+  ]
+}

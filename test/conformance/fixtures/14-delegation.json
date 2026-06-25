@@ -1,0 +1,11 @@
+{
+  "name": "14-delegation",
+  "cadishfile": "example.com {\n    @html content_type text/html\n    replace @html OLD NEW\n    rewrite strip_query utm_*\n    encode zstd br gzip\n    cache_key method host path\n    cache_ttl default ttl 1m\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/page", "query": { "utm_source": ["x"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

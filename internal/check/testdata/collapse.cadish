@@ -1,0 +1,12 @@
+# Crafted config exercising optimization suggestions.
+example.com {
+
+    # Several single-path pass rules → should suggest collapsing into one matcher.
+    pass path /one
+    pass path /two
+    pass path /three
+
+    # An anchored-literal path_regex → should suggest a glob instead.
+    @legacy path_regex ^/legacy
+    route @legacy -> web
+}

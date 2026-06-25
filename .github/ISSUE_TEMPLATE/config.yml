@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/cadi-sh/cadish/blob/main/SECURITY.md
+    about: Do NOT open a public issue. Report privately per SECURITY.md (security@cadi.sh).
+  - name: Question / discussion
+    url: https://github.com/cadi-sh/cadish/discussions
+    about: For usage questions and ideas, start a discussion.
+  - name: Documentation
+    url: https://github.com/cadi-sh/cadish/tree/main/docs
+    about: Getting started, the Cadishfile reference, and the cookbook.

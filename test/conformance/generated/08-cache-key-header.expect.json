@@ -1,0 +1,190 @@
+[
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fck.example.com\u001f/page\u001fa=1",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 3600000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "HIT"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "a8d707140198",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fck.example.com\u001f/page\u001fa=1",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 3600000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "a8d707140198",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fck.example.com\u001f/page\u001fa=2",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 3600000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "e9a937a69a24",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fck.example.com\u001f/page\u001fa=1",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 3600000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "HIT"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": true,
+      "cacheKeyValue": "GET\u001fck.example.com\u001f/page\u001fa=1",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": {
+        "status": 200,
+        "body": "OK"
+      },
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 3600000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  }
+]

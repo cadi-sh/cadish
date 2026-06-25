@@ -1,0 +1,9 @@
+# A config that compiles cleanly but has a lint WARNING (an unused matcher):
+# exit 0 normally, 1 under -strict. Used to verify the check exit-code contract
+# independent of the dead_rules fixture (which also carries a compile-error).
+example.com {
+    @unused path /never/used/*
+
+    cache_key host path
+    upstream b { to http://127.0.0.1:8080 }
+}

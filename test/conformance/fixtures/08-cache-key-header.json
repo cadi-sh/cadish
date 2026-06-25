@@ -1,0 +1,31 @@
+{
+  "name": "08-cache-key-header",
+  "cadishfile": "ck.example.com {\n    @debug header X-Debug 1\n\n    respond /health 200 \"OK\"\n\n    cache_key   method host path query\n\n    cache_ttl   default ttl 60s grace 1h\n\n    header  +cache_status   X-Cache\n    header  +cache_key       X-Cache-Key\n    header  @debug +cache_key X-Cache-Key raw\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "ck.example.com", "path": "/page", "query": { "a": ["1"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "HIT"
+    },
+    {
+      "request": { "method": "GET", "host": "ck.example.com", "path": "/page", "query": { "a": ["1"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "ck.example.com", "path": "/page", "query": { "a": ["2"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "ck.example.com", "path": "/page", "query": { "a": ["1"] }, "header": { "X-Debug": ["1"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "HIT"
+    },
+    {
+      "request": { "method": "GET", "host": "ck.example.com", "path": "/health" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

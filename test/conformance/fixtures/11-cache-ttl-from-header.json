@@ -1,0 +1,47 @@
+{
+  "name": "11-cache-ttl-from-header",
+  "cadishfile": "example.com {\n    @api path /api/*\n    cache_ttl @api from_header X-Cache-Ttl grace 30s\n    cache_ttl default ttl 5s\n    storage default -> ram\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/api/present" },
+      "origin": {
+        "status": 200,
+        "header": {
+          "Content-Type": ["text/html"],
+          "X-Cache-Ttl": ["300"]
+        }
+      },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/api/absent" },
+      "origin": {
+        "status": 200,
+        "header": { "Content-Type": ["text/html"] }
+      },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/api/unparseable" },
+      "origin": {
+        "status": 200,
+        "header": {
+          "Content-Type": ["text/html"],
+          "X-Cache-Ttl": ["not-a-duration"]
+        }
+      },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/other" },
+      "origin": {
+        "status": 200,
+        "header": {
+          "Content-Type": ["text/html"],
+          "X-Cache-Ttl": ["300"]
+        }
+      },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

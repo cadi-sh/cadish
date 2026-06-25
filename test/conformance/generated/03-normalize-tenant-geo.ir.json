@@ -1,0 +1,189 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "*.shop.example.com"
+    ],
+    "redirectHosts": [
+      "*.shop.example.com"
+    ],
+    "canonicalHost": "*.shop.example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "fromimages": {
+      "kind": "upstream",
+      "upstreams": [
+        "images"
+      ]
+    },
+    "img": {
+      "kind": "path",
+      "patterns": [
+        "/img/*"
+      ]
+    },
+    "us": {
+      "kind": "geo",
+      "geoGranularity": "country",
+      "geoValues": [
+        "ES",
+        "US"
+      ]
+    }
+  },
+  "normalizers": {
+    "curr": {
+      "source": "cookie",
+      "sourceName": "currency",
+      "map": {
+        "EUR": "eur",
+        "USD": "usd",
+        "usd": "usd"
+      },
+      "default": "usd"
+    }
+  },
+  "tenant": {
+    "rules": [
+      {
+        "pattern": "*.shop.example.com",
+        "name": "shop"
+      }
+    ],
+    "default": "other"
+  },
+  "recv": {
+    "route": [
+      {
+        "scope": {
+          "names": [
+            "img"
+          ]
+        },
+        "upstream": "images"
+      }
+    ]
+  },
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      },
+      {
+        "kind": "normalize",
+        "ref": "curr"
+      },
+      {
+        "kind": "tenant"
+      },
+      {
+        "kind": "geo"
+      },
+      {
+        "kind": "geo.continent"
+      },
+      {
+        "kind": "geo.region"
+      },
+      {
+        "kind": "sticky",
+        "arg": "PHPSESSID"
+      },
+      {
+        "kind": "query_allow",
+        "allow": [
+          "age",
+          "genre",
+          "v1"
+        ]
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          },
+          {
+            "kind": "normalize",
+            "ref": "curr"
+          },
+          {
+            "kind": "tenant"
+          },
+          {
+            "kind": "geo"
+          },
+          {
+            "kind": "geo.continent"
+          },
+          {
+            "kind": "geo.region"
+          },
+          {
+            "kind": "sticky",
+            "arg": "PHPSESSID"
+          },
+          {
+            "kind": "query_allow",
+            "allow": [
+              "age",
+              "genre",
+              "v1"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "scope",
+        "scope": {
+          "names": [
+            "us"
+          ]
+        },
+        "ttl": "10s",
+        "grace": "1m0s"
+      },
+      {
+        "selKind": "default",
+        "ttl": "5s",
+        "grace": "30s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "names": [
+            "fromimages"
+          ]
+        },
+        "ops": [
+          {
+            "op": "set",
+            "name": "X-Origin",
+            "value": "images"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {},
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "21-max-stale",
+  "cadishfile": "stale.example.com {\n    cache_key host path\n    cache_ttl default ttl 1m grace 5m max_stale 24h\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "stale.example.com", "path": "/a" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "stale.example.com", "path": "/a" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "HIT-STALE"
+    }
+  ]
+}

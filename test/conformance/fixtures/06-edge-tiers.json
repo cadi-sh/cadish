@@ -1,0 +1,16 @@
+{
+  "name": "06-edge-tiers",
+  "cadishfile": "example.com {\n    @html   content_type text/html\n    @assets path /assets/*\n    edge {\n        worker  cadish-edge-example\n        kv      EDGE_CACHE\n        default local\n        distribute @html\n        skip @assets\n    }\n    cache_key url\n    cache_ttl default ttl 30s grace 10m\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/page" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/assets/app.js" },
+      "origin": { "status": 200, "header": { "Content-Type": ["application/javascript"] } },
+      "cacheStatus": "HIT"
+    }
+  ]
+}

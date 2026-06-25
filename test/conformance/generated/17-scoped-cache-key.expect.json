@@ -1,0 +1,95 @@
+[
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "example.com\u001f/list",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "278ba8d850e1",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "example.com\u001f/list?page=2\u0026utm_source=mailing",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "94e109685347",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "example.com\u001f/",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "a2ce0864f60d",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  }
+]

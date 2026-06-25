@@ -1,0 +1,22 @@
+# nocache.cadish — importable fragment for the storefront migration target.
+#
+# The VCL's ~50 `if (req.url ~ "…") return(pass)` lines collapse into ONE path
+# matcher: a single set/trie lookup, not 50 sequential regex evaluations. This is
+# exactly the optimization `cadish check` rewards.
+
+@nocache path \
+    /account/*  /publish/*  /upload-photo/*  /security-check/* \
+    /order-error/*  /user-panel/*  /mailer/*  /videos/getvideo/* \
+    /embed-video/*  /favorites/*  /sellers/*  /buy-credits/* \
+    /private/*  /pub/*  /panel/*  /admin-area/*  /wallet/* \
+    /buy/*  /transaction/*  /response/*  /payment-done/* \
+    /payment-error/*  /media/image_server.php  *sitemap*
+
+# Category listings are the EXCEPTION that IS cached (short TTL + long grace).
+# In the VCL this was an ugly nested if/else; here it is one named matcher that
+# the TTL policy references directly. Because @listings is separate from
+# @nocache, a `/catalog/…` request is cached, not passed.
+@listings path_regex \
+    /(catalog|deals|brands|electronics|\
+      clothing|home-garden|toys|books|sports|grocery|\
+      beauty|automotive|outlet)/

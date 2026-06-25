@@ -1,0 +1,86 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "shop.example.com"
+    ],
+    "redirectHosts": [
+      "shop.example.com"
+    ],
+    "canonicalHost": "shop.example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "html": {
+      "kind": "content_type",
+      "contentTypes": [
+        "text/html"
+      ],
+      "responsePhase": true
+    }
+  },
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "method"
+      },
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s",
+        "grace": "5m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      }
+    ],
+    "transforms": [
+      {
+        "scope": {
+          "names": [
+            "html"
+          ]
+        },
+        "old": "http://origin.internal",
+        "new": "https://shop.example.com"
+      },
+      {
+        "scope": {
+          "names": [
+            "html"
+          ]
+        },
+        "old": "__TITLE__",
+        "new": "Welcome"
+      }
+    ],
+    "transformMaxBytes": 1048576
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache"
+  },
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

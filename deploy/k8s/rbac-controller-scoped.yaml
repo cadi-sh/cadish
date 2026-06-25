@@ -1,0 +1,158 @@
+# OPTIONAL, TIGHTER alternative to rbac-controller.yaml — namespace-scoped Secret/ConfigMap
+# reads (C1, hostile-multi-tenant hardening). USE THIS INSTEAD OF rbac-controller.yaml when
+# the controller serves a KNOWN, FIXED set of namespaces and you want to bound a controller
+# compromise so it cannot read every Secret in the cluster.
+#
+# Trade-off vs the default ClusterRole (rbac-controller.yaml):
+#   - DEFAULT: the controller reads Secrets/ConfigMaps CLUSTER-WIDE (its informers watch all
+#     namespaces). Simple, works for "serve all namespaces", but a compromise reads every
+#     Secret in the cluster.
+#   - SCOPED (this file): the controller reads Secrets/ConfigMaps ONLY in the enumerated
+#     namespaces, via per-namespace Roles. A compromise is bounded to those namespaces.
+#     REQUIRES running the controller with `-namespace ns1,ns2,...` matching THIS list, so
+#     its informers list/watch only those namespaces (a cluster-wide LIST would be denied
+#     and the informer cache would never sync).
+#
+# PAIR WITH `-secret-label-selector` / `-configmap-label-selector` (or `-watch-label-selector`)
+# for defense in depth: core Kubernetes RBAC cannot filter by label, so RBAC here bounds
+# WHICH NAMESPACES the controller may read; the informer label selector bounds WHICH OBJECTS
+# within them are ever cached. When you set a selector you MUST label your cadish-consumed
+# TLS Secrets and cadi.sh/policy ConfigMaps (e.g. `cadi.sh/managed: "true"`) or the
+# controller will not see them (TLS hosts fall through to ACME; policy fragments resolve to
+# empty).
+#
+# ── HOW TO USE ────────────────────────────────────────────────────────────────────────
+#   1. Edit the namespace list below: enumerate every namespace whose Ingresses cadish
+#      serves, PLUS the controller's own namespace (`cadish`, for the base ConfigMap).
+#   2. Run the controller with the SAME set:
+#        cadish ingress -namespace team-a,team-b [-watch-label-selector cadi.sh/managed=true]
+#   3. Apply THIS file instead of rbac-controller.yaml.
+#
+# This file omits the `secrets`/`configmaps` rule from the ClusterRole (the only change to
+# the cluster-wide reads); endpointslices/ingresses/ingressclasses/services reads remain
+# cluster-wide (they are either cluster-scoped or required cluster-wide by the resolver).
+# For per-namespace WRITE scoping (ingresses/status + events), see the note in
+# rbac-controller.yaml or prefer the Helm chart (controller.namespaces + controller.rbac.scoped).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cadish-ingress
+  namespace: cadish
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cadish-ingress
+rules:
+# Layer-1 endpoint resolution (k8s:// upstreams → ready pod IP:port). Cluster-wide.
+- apiGroups: ["discovery.k8s.io"]
+  resources: ["endpointslices"]
+  verbs: ["get", "list", "watch"]
+# The Ingress API surface (the source of truth for routing). Cluster-wide.
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses", "ingressclasses"]
+  verbs: ["get", "list", "watch"]
+# The publish Service (leader status writer reads its LoadBalancer address). Cluster-wide.
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch"]
+# Write Ingress status.loadBalancer (leader-only writer).
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses/status"]
+  verbs: ["update", "patch"]
+# Accept/reject Events.
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+# NOTE: NO cluster-wide `secrets`/`configmaps` rule here — those reads are granted by the
+# per-namespace Roles below. This is the whole point of the scoped variant.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cadish-ingress
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cadish-ingress
+subjects:
+- kind: ServiceAccount
+  name: cadish-ingress
+  namespace: cadish
+---
+# Leader election: a single Lease in the controller's own namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cadish-ingress-leader
+  namespace: cadish
+rules:
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cadish-ingress-leader
+  namespace: cadish
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cadish-ingress-leader
+subjects:
+- kind: ServiceAccount
+  name: cadish-ingress
+  namespace: cadish
+# ── PER-NAMESPACE Secret/ConfigMap READS ───────────────────────────────────────────────
+# Repeat this Role + RoleBinding pair for EACH served namespace (and the controller's own
+# `cadish` namespace, for the base ConfigMap). The example below covers `cadish` and a
+# served namespace `team-a`; add more by copying the pair and changing `namespace:`.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cadish-ingress-reads
+  namespace: cadish
+rules:
+- apiGroups: [""]
+  resources: ["secrets", "configmaps"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cadish-ingress-reads
+  namespace: cadish
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cadish-ingress-reads
+subjects:
+- kind: ServiceAccount
+  name: cadish-ingress
+  namespace: cadish
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cadish-ingress-reads
+  namespace: team-a
+rules:
+- apiGroups: [""]
+  resources: ["secrets", "configmaps"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cadish-ingress-reads
+  namespace: team-a
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cadish-ingress-reads
+subjects:
+- kind: ServiceAccount
+  name: cadish-ingress
+  namespace: cadish

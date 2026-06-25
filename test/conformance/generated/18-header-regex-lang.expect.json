@@ -1,0 +1,163 @@
+[
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": {
+        "status": 302,
+        "location": "https://es.example.com/registro"
+      },
+      "upstream": "",
+      "cacheKey": "",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "www.example.com\u001f/registro",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "es.example.com\u001f/registro",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": {
+        "status": 302,
+        "location": "https://es.example.com/registro"
+      },
+      "upstream": "",
+      "cacheKey": "",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "www.example.com\u001f/registro",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  }
+]

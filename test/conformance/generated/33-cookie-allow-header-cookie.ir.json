@@ -1,0 +1,84 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "example.com"
+    ],
+    "redirectHosts": [
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {},
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      },
+      {
+        "kind": "header",
+        "arg": "Cookie"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          },
+          {
+            "kind": "header",
+            "arg": "Cookie"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s",
+        "grace": "1h0m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache"
+  },
+  "cookieAllow": [
+    "sess"
+  ],
+  "cookieAllowSet": true,
+  "keyHeaderNames": [
+    "cookie"
+  ],
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

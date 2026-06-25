@@ -1,0 +1,26 @@
+{
+  "name": "05-redirect-sticky-literal",
+  "cadishfile": "old.example.com {\n    redirect ^/p/(\\d+)$ 301 https://new.example.com/product/$1\n    redirect 302 map {\n        /registro -> /register\n        /acceso   -> /login\n    }\n    cache_key host path tag-v1 {sticky}\n    cache_ttl default ttl 1m grace 5m\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "old.example.com", "path": "/p/42" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "old.example.com", "path": "/registro/step2" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "old.example.com", "path": "/registro" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "OLD.example.com:8443", "path": "/other", "clientIP": "198.51.100.7" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "HIT"
+    }
+  ]
+}

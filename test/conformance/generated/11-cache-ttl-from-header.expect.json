@@ -1,0 +1,150 @@
+[
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fexample.com\u001f/api/present",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 300000000000,
+      "graceNs": 30000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "ram",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fexample.com\u001f/api/absent",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 5000000000,
+      "graceNs": 0,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "ram",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fexample.com\u001f/api/unparseable",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 5000000000,
+      "graceNs": 0,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "ram",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fexample.com\u001f/other",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 5000000000,
+      "graceNs": 0,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "ram",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  }
+]

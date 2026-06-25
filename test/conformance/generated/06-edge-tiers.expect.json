@@ -1,0 +1,76 @@
+[
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "/page",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 30000000000,
+      "graceNs": 600000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "/assets/app.js",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 30000000000,
+      "graceNs": 600000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "HIT"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  }
+]

@@ -1,0 +1,19 @@
+# Integration-harness Cadishfile (test/integration). Two sites on one cadish process:
+#   http.local -> the test-origin (plain HTTP upstream)
+#   s3.local   -> a MinIO bucket (S3-compatible upstream, path-style, anonymous read)
+# Both cache with a short TTL and echo the cache status into X-Cache so the
+# real-binary integration test can assert MISS -> HIT and request coalescing.
+
+http.local {
+	cache { ram 64MiB }
+	upstream backend { to http://origin:9000 }
+	cache_ttl default ttl 60s
+	header +cache_status X-Cache
+}
+
+s3.local {
+	cache { ram 64MiB }
+	upstream media { to http://minio:9000; bucket media }
+	cache_ttl default ttl 60s
+	header +cache_status X-Cache
+}

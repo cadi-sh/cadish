@@ -1,0 +1,219 @@
+[
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "shop.example.com\u001f/p\u001fmobile",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "7cfde70ed4e3",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "shop.example.com\u001f/p\u001ftablet",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "43b96f054602",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "shop.example.com\u001f/p\u001fbot",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "845a84fcf594",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "shop.example.com\u001f/p\u001fmobile",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "7cfde70ed4e3",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "shop.example.com\u001f/p\u001ftablet",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "43b96f054602",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "shop.example.com\u001f/p\u001fdesktop",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "ac9b6b052cc0",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "shop.example.com\u001f/p\u001fdesktop",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "ac9b6b052cc0",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  }
+]

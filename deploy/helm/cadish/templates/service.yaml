@@ -1,0 +1,41 @@
+{{- if not .Values.controller.enabled }}
+{{- $tls := eq (include "cadish.tlsEnabled" .) "true" -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cadish.fullname" . }}
+  labels:
+    {{- include "cadish.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  {{- if and (eq .Values.service.type "LoadBalancer") .Values.service.loadBalancerIP }}
+  loadBalancerIP: {{ .Values.service.loadBalancerIP }}
+  {{- end }}
+  {{- if eq .Values.service.type "LoadBalancer" }}
+  externalTrafficPolicy: {{ .Values.service.externalTrafficPolicy }}
+  {{- end }}
+  selector:
+    {{- include "cadish.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.ports.http }}
+      targetPort: http
+      protocol: TCP
+    {{- if $tls }}
+    - name: https
+      port: {{ .Values.service.ports.https }}
+      targetPort: https
+      protocol: TCP
+    {{- end }}
+    {{- if .Values.metrics.enabled }}
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+    {{- end }}
+
+{{- end }}

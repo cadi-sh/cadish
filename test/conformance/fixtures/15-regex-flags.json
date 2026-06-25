@@ -1,0 +1,36 @@
+{
+  "name": "15-regex-flags",
+  "cadishfile": "example.com {\n    @bypass_admin path_regex (?i)^/(atvpanel|admin|api)\n    @assets      path_regex (?is)\\.(css|js|png|jpe?g)$\n\n    redirect (?i)^/cams/?$ 301 https://example.com/broadcast\n\n    pass @bypass_admin\n    pass @assets\n\n    cache_key host path\n    cache_ttl default ttl 1m grace 5m\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/cams" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/CAMS/" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/ATVpanel/x" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/atvpanel/x" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/styles/Main.CSS" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/css"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/broadcast", "header": { "Accept-Language": ["es-ES,es;q=0.9,en;q=0.8"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "HIT"
+    }
+  ]
+}

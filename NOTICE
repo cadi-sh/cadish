@@ -1,0 +1,27 @@
+cadish
+Copyright 2026 The cadish Authors
+
+This product is licensed under the Apache License, Version 2.0 (see the LICENSE
+file). It includes third-party software that ships its own NOTICE file under the
+same license; the Apache-2.0 §4(d) attributions required by those dependencies
+are reproduced below.
+
+--------------------------------------------------------------------------------
+AWS SDK for Go v2 (github.com/aws/aws-sdk-go-v2)
+Licensed under the Apache License, Version 2.0.
+
+  AWS SDK for Go
+  Copyright 2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+  Copyright 2014-2015 Stripe, Inc.
+
+--------------------------------------------------------------------------------
+Smithy Go (github.com/aws/smithy-go)
+Licensed under the Apache License, Version 2.0.
+
+  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+--------------------------------------------------------------------------------
+YAML support for the Go language (gopkg.in/yaml.v3, go.yaml.in/yaml)
+Licensed under the Apache License, Version 2.0.
+
+  Copyright 2011-2016 Canonical Ltd.

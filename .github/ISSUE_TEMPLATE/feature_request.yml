@@ -1,0 +1,36 @@
+name: Feature request
+description: Propose a new directive, matcher, or capability.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        cadish's pitch is "express your VCL as clean config." The best feature
+        requests come from a **real config you couldn't write** — include it.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What can't you express today?
+      description: The real scenario / the VCL or config behavior cadish can't represent.
+      placeholder: |
+        I want to bypass the cache only for logged-in users (a `session` cookie),
+        but matchers only see whole-header presence, not a specific cookie.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Cadishfile syntax
+      description: Sketch the directive/matcher as you'd want to write it (flat, Caddy-style).
+      placeholder: |
+        pass cookie sessionid          # bypass when this cookie is present
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives / workarounds
+      description: What do you do today? Is this v1 or v2 (see design/v2-plan.md)?
+    validations:
+      required: false

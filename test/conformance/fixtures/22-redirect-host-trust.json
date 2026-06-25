@@ -1,0 +1,31 @@
+{
+  "name": "22-redirect-host-trust",
+  "cadishfile": "shop.example.com, *.cdn.example.com {\n    redirect ^/old/(.*)$ 301 https://{host}/new/$1\n    cache_key host path\n    cache_ttl default ttl 1m grace 5m\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/old/widgets" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "evil.attacker.test", "path": "/old/widgets" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "assets.cdn.example.com", "path": "/old/img.png" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "cdn.example.com", "path": "/old/img.png" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "SHOP.example.com:8443", "path": "/old/cased" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

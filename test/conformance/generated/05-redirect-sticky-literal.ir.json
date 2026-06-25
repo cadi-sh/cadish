@@ -1,0 +1,86 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "old.example.com"
+    ],
+    "redirectHosts": [
+      "old.example.com"
+    ],
+    "canonicalHost": "old.example.com"
+  },
+  "upstream": {},
+  "matchers": {},
+  "recv": {
+    "redirect": [
+      {
+        "regex": "^/p/(\\d+)$",
+        "status": 301,
+        "target": "https://new.example.com/product/$1"
+      },
+      {
+        "regex": "^/registro(/.*|)$",
+        "status": 302,
+        "target": "https://{host}/register$1"
+      },
+      {
+        "regex": "^/acceso(/.*|)$",
+        "status": 302,
+        "target": "https://{host}/login$1"
+      }
+    ]
+  },
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      },
+      {
+        "kind": "literal",
+        "arg": "tag-v1"
+      },
+      {
+        "kind": "sticky"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          },
+          {
+            "kind": "literal",
+            "arg": "tag-v1"
+          },
+          {
+            "kind": "sticky"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s",
+        "grace": "5m0s"
+      }
+    ]
+  },
+  "deliver": {},
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

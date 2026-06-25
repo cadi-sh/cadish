@@ -1,0 +1,19 @@
+{
+  "name": "37-json-cookie-key",
+  "cadishfile": "example.com {\n    cache_key host path cookie:sess\n\n    cache_ttl default ttl 60s\n\n    header +cache_key X-Key raw\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": {
+        "method": "GET",
+        "host": "example.com",
+        "path": "/p",
+        "header": { "Cookie": ["sess={\"uid\":\"alice\"}"] }
+      },
+      "origin": {
+        "status": 200,
+        "header": { "Content-Type": ["text/html"] }
+      },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

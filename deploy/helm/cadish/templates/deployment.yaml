@@ -1,0 +1,221 @@
+{{- if not .Values.controller.enabled }}
+{{- $tls := eq (include "cadish.tlsEnabled" .) "true" -}}
+{{- $needCap := or (lt (int .Values.containerPorts.http) 1024) (and $tls (lt (int .Values.containerPorts.https) 1024)) -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cadish.fullname" . }}
+  labels:
+    {{- include "cadish.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    {{- toYaml .Values.strategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "cadish.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- if not .Values.existingConfigMap }}
+        checksum/config: {{ .Values.config | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "cadish.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      # Outlast the server's in-flight drain on SIGTERM so a rollout / node drain
+      # finishes serving open connections before the kubelet SIGKILLs.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 40 }}
+      serviceAccountName: {{ include "cadish.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.volumePermissions.enabled }}
+      # Some volume types (hostPath, many local/NFS provisioners) ignore the pod
+      # fsGroup, leaving a fresh volume root-owned — and cadish runs non-root (65532),
+      # so it can't create /var/cache/cadish/blobs. This initContainer runs once as
+      # root and chowns the cache (and ACME) mounts to 65532 before cadish starts.
+      initContainers:
+        - name: volume-permissions
+          image: "{{ .Values.volumePermissions.image.repository }}:{{ .Values.volumePermissions.image.tag }}"
+          imagePullPolicy: {{ .Values.volumePermissions.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - chown -R 65532:65532 /var/cache/cadish{{ if $tls }} /var/lib/cadish{{ end }}
+          securityContext:
+            # Must run as root to chown; this container does no request handling.
+            runAsNonRoot: false
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/cadish
+            {{- if $tls }}
+            - name: acme
+              mountPath: /var/lib/cadish
+            {{- end }}
+      {{- end }}
+      containers:
+        - name: cadish
+          image: {{ include "cadish.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - run
+            - -config
+            - /etc/cadish/Cadishfile
+            - -addr
+            - ":{{ .Values.containerPorts.http }}"
+            - -idle-timeout
+            - {{ .Values.idleTimeout | quote }}
+            {{- if $tls }}
+            - -https-addr
+            - ":{{ .Values.containerPorts.https }}"
+            - -acme-cache
+            - /var/lib/cadish/acme
+            {{- end }}
+          env:
+            {{- if .Values.gomemlimit }}
+            - name: GOMEMLIMIT
+              value: {{ .Values.gomemlimit | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.containerPorts.http }}
+              {{- if .Values.hostPort.enabled }}
+              hostPort: {{ .Values.containerPorts.http }}
+              {{- end }}
+              protocol: TCP
+            {{- if $tls }}
+            - name: https
+              containerPort: {{ .Values.containerPorts.https }}
+              {{- if .Values.hostPort.enabled }}
+              hostPort: {{ .Values.containerPorts.https }}
+              {{- end }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+            {{- end }}
+          startupProbe:
+            {{- if $tls }}
+            tcpSocket:
+              port: https
+            {{- else }}
+            httpGet:
+              path: {{ .Values.probes.path }}
+              port: http
+            {{- end }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+          readinessProbe:
+            {{- if $tls }}
+            tcpSocket:
+              port: https
+            {{- else }}
+            httpGet:
+              path: {{ .Values.probes.path }}
+              port: http
+            {{- end }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          livenessProbe:
+            {{- if $tls }}
+            tcpSocket:
+              port: https
+            {{- else }}
+            httpGet:
+              path: {{ .Values.probes.path }}
+              port: http
+            {{- end }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+              {{- if $needCap }}
+              add:
+                - NET_BIND_SERVICE
+              {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/cadish
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /var/cache/cadish
+            {{- if $tls }}
+            - name: acme
+              mountPath: /var/lib/cadish
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "cadish.configMapName" . }}
+        # /tmp is writable scratch (RAM-only cache tiers create temp dirs here);
+        # the root filesystem is read-only.
+        - name: tmp
+          emptyDir: {}
+        - name: cache
+          {{- if .Values.persistence.cache.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "cadish.fullname" . }}-cache
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if $tls }}
+        - name: acme
+          {{- if .Values.persistence.acme.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "cadish.fullname" . }}-acme
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+{{- end }}

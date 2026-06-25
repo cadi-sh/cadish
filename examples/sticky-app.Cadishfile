@@ -1,0 +1,40 @@
+# Recipe: Sticky-session app cache
+# A stateful app where each user must stick to one backend (in-memory sessions),
+# but anonymous pages are still cacheable. Pin users by their session cookie;
+# cache only anonymous GETs; pass anything authenticated.
+
+app.example.com {
+    tls {
+        acme ops@example.com
+    }
+
+    cache {
+        ram 4GiB
+    }
+
+    # Pin each user to one backend for their session's lifetime (consistent hash
+    # on PHPSESSID; fall back to client IP for cookieless first hits). Only healthy
+    # backends are eligible.
+    upstream web {
+        to http://app-1.internal:8080 http://app-2.internal:8080
+        sticky by cookie PHPSESSID else client_ip
+        health GET /healthz expect 200 interval 5s window 6 threshold 3
+        timeout connect 5s first_byte 30s
+        max_conns 500
+    }
+
+    # Authenticated requests are per-user → never cache them.
+    pass method POST PUT PATCH DELETE
+    @authed header Authorization
+    pass @authed
+
+    # Anonymous GETs are shared and cacheable. Keep the key simple (no cookie in
+    # the key, or every user gets their own entry).
+    cache_key host path
+    cache_ttl default ttl 30s grace 5m
+
+    # Drop Set-Cookie on the cacheable anonymous responses so a cached page can't
+    # leak one user's session to another.
+    strip_cookies path /
+    header +cache_status X-Cache
+}

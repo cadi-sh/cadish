@@ -1,0 +1,29 @@
+cadish {{ .Chart.AppVersion }} deployed as {{ include "cadish.fullname" . }}.
+
+TLS mode: {{ .Values.tls.mode }}
+{{- if eq .Values.tls.mode "acme" }}
+
+cadish is terminating TLS with automatic ACME. For certificates to issue:
+  1. Your Service must have a stable public IP (type={{ .Values.service.type }}).
+     Get it with:
+       kubectl get svc {{ include "cadish.fullname" . }} -o wide
+  2. Point each site's DNS A/AAAA record at that IP.
+  3. cadish obtains a certificate on the first HTTPS request for the host.
+
+The ACME store ({{ if .Values.persistence.acme.enabled }}PVC {{ include "cadish.fullname" . }}-acme{{ else }}emptyDir — NOT persisted!{{ end }}) MUST survive restarts to avoid re-issuing and hitting rate limits.
+{{- else }}
+
+cadish is serving plain HTTP (tls.mode=off) — put it behind an Ingress/LB that
+terminates TLS. Health probes hit `httpGet {{ .Values.probes.path }}` on :{{ .Values.containerPorts.http }};
+make sure your Cadishfile defines it (e.g. `respond {{ .Values.probes.path }} 200 "OK"`).
+{{- end }}
+
+Verify your config before/after deploy:
+  kubectl exec deploy/{{ include "cadish.fullname" . }} -- cadish check -config /etc/cadish/Cadishfile
+
+{{- if gt (int .Values.replicaCount) 1 }}
+
+WARNING: replicaCount={{ .Values.replicaCount }} with ReadWriteOnce PVCs and strategy
+{{ .Values.strategy.type }} will not schedule multiple pods on different nodes. For HA,
+use ReadWriteMany volumes (or disable persistence) — see deploy/README.md.
+{{- end }}

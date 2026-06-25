@@ -1,0 +1,21 @@
+# Crafted config exercising dead-rule detection.
+example.com {
+
+    @api   path /api/*
+    @apiv2 path /api/v2/sub
+
+    # cache_ttl: a `default` selector before later rules makes them dead.
+    cache_ttl default        ttl 10s
+    cache_ttl status 404      ttl 60s     # dead: default above wins first
+    cache_ttl @api            ttl 5s       # dead: default above wins first
+
+    # storage: duplicate @api selector — second never wins.
+    storage @api -> disk
+    storage @api -> ram                    # dead: duplicate selector
+
+    # pass: a subset path is shadowed by an earlier broader pass.
+    pass @api
+    pass @apiv2                            # dead: /api/v2/sub ⊂ /api/*
+    pass                                   # catch-all
+    pass method POST                       # dead: unconditioned pass above
+}

@@ -1,0 +1,62 @@
+# Local ACME test stack for the guarded TLS e2e (internal/tlsacme,
+# TestPebbleEndToEnd). pebble is Let's Encrypt's small ACME test server;
+# pebble-challtestsrv provides the DNS the test seeds so pebble can resolve the
+# challenge domain back to the `go test` process running on the host.
+#
+#   docker compose -f test/acme/docker-compose.yml up -d
+#   # …run the guarded test (see docs/tls.md)…
+#   docker compose -f test/acme/docker-compose.yml down
+#
+# The test answers challenges itself on non-privileged ports 5002 (HTTP-01) and
+# 5001 (TLS-ALPN-01) — matching pebble-config.json — so it needs no sudo. pebble
+# must be able to reach the host on those ports.
+#
+# NETWORKING:
+#   - Linux / CI (recommended, deterministic): give both services
+#     `network_mode: host` and run the test with CADISH_ACME_HOST_IP=127.0.0.1 —
+#     pebble then dials 127.0.0.1:5002 directly (no NAT). With host networking,
+#     drop the `ports:` mappings.
+#   - Docker Desktop (macOS/Windows): no host networking; pebble reaches the host
+#     via the gateway `host.docker.internal` (e.g. 192.168.65.254 — find it with
+#     `docker run --rm --add-host host.docker.internal:host-gateway alpine \
+#      getent ahosts host.docker.internal`). The stack comes up and pebble runs
+#     REAL validation against the test's challenge listener, but Docker Desktop's
+#     container→host NAT can drop pebble's concurrent multi-perspective probes, so
+#     issuance may not complete. Use the Linux path for a deterministic pass.
+services:
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:latest
+    command: -config /etc/pebble/pebble-config.json -dnsserver challtestsrv:8053
+    volumes:
+      - ./pebble-config.json:/etc/pebble/pebble-config.json:ro
+    ports:
+      - "14000:14000"   # ACME directory (HTTPS, self-signed)
+      - "15000:15000"   # management API
+    environment:
+      # Validate immediately and don't randomly reject (deterministic tests).
+      - PEBBLE_VA_NOSLEEP=1
+      - PEBBLE_VA_ALWAYS_VALID=0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - challtestsrv
+
+  challtestsrv:
+    image: ghcr.io/letsencrypt/pebble-challtestsrv:latest
+    # DNS + management only — cadish answers the HTTP-01/TLS-ALPN-01 challenges
+    # itself, so challtestsrv's own challenge responders are disabled (empty bind
+    # strings). Args MUST be a YAML list so the empty strings survive intact.
+    command:
+      - -dnsserver
+      - ":8053"
+      - -management
+      - ":8055"
+      - -http01
+      - ""
+      - -https01
+      - ""
+      - -tlsalpn01
+      - ""
+    ports:
+      - "8055:8055"        # management REST (the test seeds A/AAAA records here)
+      - "8053:8053/udp"    # DNS

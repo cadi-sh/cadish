@@ -1,0 +1,21 @@
+{
+  "name": "20-device-detect-folds",
+  "cadishfile": "m.example.com {\n    device_detect {\n        fold tablet desktop\n        fold bot desktop\n    }\n    cache_key host path {device}\n    cache_ttl default ttl 1m\n    header +cache_key X-Cache-Key\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "m.example.com", "path": "/a", "header": { "User-Agent": ["Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) Mobile Safari/604.1"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "m.example.com", "path": "/a", "header": { "User-Agent": ["Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "m.example.com", "path": "/a", "header": { "User-Agent": ["Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

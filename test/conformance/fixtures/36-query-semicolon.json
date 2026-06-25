@@ -1,0 +1,19 @@
+{
+  "name": "36-query-semicolon",
+  "cadishfile": "example.com {\n    cache_key url\n\n    cache_ttl default ttl 60s\n\n    header +cache_key X-Key raw\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": {
+        "method": "GET",
+        "host": "example.com",
+        "path": "/p",
+        "query": { "cb": ["PWNED;x=1"] }
+      },
+      "origin": {
+        "status": 200,
+        "header": { "Content-Type": ["text/html"] }
+      },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

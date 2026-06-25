@@ -1,0 +1,45 @@
+# S3-backed CDN with composable origin fallback — the S3-origin CDN use case,
+# expressed as plain config. On an S3 miss, fall back to CloudFront, re-signing
+# each request with the CloudFront private key. Large media on NVMe, small hot
+# objects in RAM.
+
+cdn.example.com, *.cdn.example.com {
+    tls {
+        acme ops@example.com
+    }
+
+    cache {
+        ram 8GiB
+        disk /var/cache/cadish 2TiB
+        tier .ts .mp4 -> disk
+        tier .m3u8 .jpg .png -> ram
+    }
+
+    upstream s3 {
+        to https://s3.gra.io.cloud.ovh.net
+        bucket media
+    }
+    upstream cloudfront {
+        to https://d111111abcdef8.cloudfront.net
+        # Re-sign every request to this distribution with a CloudFront canned-policy
+        # signature: <key-pair-id> + the private-key PEM, with a short validity
+        # window. The `to` host is the distribution domain the signature is bound to.
+        # Set CF_KEYPAIR_ID in the environment to your CloudFront key-pair id (an unset
+        # value is a hard error at `cadish check`, not a surprise at run-time).
+        sign cloudfront {$CF_KEYPAIR_ID} key /etc/cadish/keys/cloudfront.pem ttl 5m
+    }
+
+    # Try S3; on miss/4xx/5xx fall back to CloudFront. Pure config composition.
+    origin chain s3 -> cloudfront
+
+    # HLS segments are loaded unsigned by the player; everything else verifies.
+    @segments path *.ts
+    pass @segments
+
+    cache_ttl @segments ttl 7d
+    cache_ttl status 404 410 ttl 60s grace 1h
+    cache_ttl default ttl 2s grace 24h
+
+    cors *
+    header +cache_status X-Cache
+}

@@ -1,0 +1,175 @@
+[
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "api.example.com\u001f/api/users",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 86400000000000,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    },
+    "outage": {
+      "kind": "onError",
+      "status": 503,
+      "body": "api down for maintenance",
+      "contentType": "text/html; charset=utf-8"
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "api.example.com\u001f/api/users",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 86400000000000,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    },
+    "outage": {
+      "kind": "stale"
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "api.example.com\u001f/static/app.js",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 86400000000000,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    },
+    "outage": {
+      "kind": "onError",
+      "status": 504,
+      "body": "static gateway timeout",
+      "contentType": "text/html; charset=utf-8"
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "api.example.com\u001f/home",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 86400000000000,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    },
+    "outage": {
+      "kind": "bareError"
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "api.example.com\u001f/home",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 86400000000000,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  }
+]

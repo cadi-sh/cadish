@@ -1,0 +1,341 @@
+[
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "/catalog/shoes?color=red\u0026utm_source=x\u001fexample.com",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 2000000000,
+      "graceNs": 86400000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "disk",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "remove",
+          "name": "Server",
+          "value": ""
+        },
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "HIT"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": true,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "/panel/settings\u001fexample.com",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 2000000000,
+      "graceNs": 86400000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "ram",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "remove",
+          "name": "Server",
+          "value": ""
+        },
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": true,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "/cart\u001fexample.com",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 2000000000,
+      "graceNs": 86400000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "ram",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "remove",
+          "name": "Server",
+          "value": ""
+        },
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": true,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "/api\u001fexample.com",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 2000000000,
+      "graceNs": 86400000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "ram",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "remove",
+          "name": "Server",
+          "value": ""
+        },
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": {
+        "status": 200,
+        "body": "OK"
+      },
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 0,
+      "graceNs": 0,
+      "maxStaleNs": 0,
+      "hitForMissNs": 5000000000,
+      "storeTier": "ram",
+      "cacheable": false
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "remove",
+          "name": "Server",
+          "value": ""
+        },
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "/missing\u001fshop.example.com",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 3600000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "ram",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "remove",
+          "name": "Server",
+          "value": ""
+        },
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "/flaky\u001fexample.com",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 0,
+      "graceNs": 0,
+      "maxStaleNs": 0,
+      "hitForMissNs": 5000000000,
+      "storeTier": "ram",
+      "cacheable": false
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "remove",
+          "name": "Server",
+          "value": ""
+        },
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "/assets/app.css\u001fexample.com",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 2000000000,
+      "graceNs": 86400000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "ram",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "remove",
+          "name": "Server",
+          "value": ""
+        },
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "HIT-STALE"
+        }
+      ],
+      "stripCookies": true,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  }
+]

@@ -1,0 +1,14 @@
+{{- if not .Values.controller.enabled }}
+{{- if not .Values.existingConfigMap }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cadish.fullname" . }}
+  labels:
+    {{- include "cadish.labels" . | nindent 4 }}
+data:
+  Cadishfile: |
+{{ .Values.config | indent 4 }}
+{{- end }}
+
+{{- end }}

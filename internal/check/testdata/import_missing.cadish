@@ -1,0 +1,4 @@
+example.com {
+    import does_not_exist.cadish
+    cache_key url
+}

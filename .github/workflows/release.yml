@@ -1,0 +1,97 @@
+name: release
+
+# Cut a release by pushing a semver tag:
+#   git tag v0.2.0 && git push origin v0.2.0
+on:
+  push:
+    tags:
+      - "v*"
+
+# Least privilege: the default token is read-only; each job below requests only
+# the write scopes it actually uses.
+permissions:
+  contents: read
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release + upload archives/checksums
+      id-token: write # keyless (OIDC) cosign signing of the checksums file
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0 # full history so the changelog can be generated
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26"
+          check-latest: true
+
+      # cosign + syft power the keyless signing and SBOM stanzas in .goreleaser.yaml.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+        with:
+          distribution: goreleaser
+          version: "v2.16.0" # pinned (was "~> v2") for reproducible releases
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Build + push a multi-arch container image straight from the project's
+  # from-source deploy/Dockerfile (reused as-is). Independent of the binary
+  # release above.
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read  # checkout only
+      packages: write # push the multi-arch image + SBOM/provenance attestations to GHCR
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Derive version from the tag
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: true # SLSA build-provenance attestation on the image
+          sbom: true # attach an SBOM attestation to the image
+          build-args: |
+            VERSION=v${{ steps.ver.outputs.version }}
+            COMMIT=${{ github.sha }}
+            DATE=${{ github.event.head_commit.timestamp }}
+          tags: |
+            ghcr.io/cadi-sh/cadish:${{ steps.ver.outputs.version }}
+            ghcr.io/cadi-sh/cadish:latest
+          labels: |
+            org.opencontainers.image.title=cadish
+            org.opencontainers.image.version=${{ steps.ver.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/cadi-sh/cadish

@@ -1,0 +1,14 @@
+{
+  "name": "cadish-edge-runtime",
+  "private": true,
+  "type": "module",
+  "description": "Cadish Edge worker runtime (the JS half of one Cadishfile, two runtimes).",
+  "scripts": {
+    "test": "node conformance.test.mjs && node runtime.test.mjs",
+    "test:miniflare": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.8.59",
+    "vitest": "3.2.4"
+  }
+}

@@ -1,0 +1,36 @@
+# Recipe: Static-site / asset CDN
+# Cache an HTTP origin behind automatic HTTPS, hold assets a long time, give the
+# browser a long client-side cache for fingerprinted assets, and keep cookies off
+# cacheable static responses.
+
+assets.example.com {
+    tls {
+        acme ops@example.com
+    } # automatic HTTPS, no proxy in front
+
+    cache {
+        ram 4GiB # hot small assets in memory
+        disk /var/cache/cadish 200GiB # the long tail on NVMe
+    }
+
+    upstream web {
+        to http://origin.internal:8080
+    }
+
+    # Assets are immutable (content-hashed filenames) → cache hard, serve stale
+    # while revalidating. HTML is short so deploys show up fast.
+    @assets path_regex \.(css|js|woff2?|png|jpe?g|gif|svg|ico|webp)$
+    cache_ttl @assets ttl 30d grace 365d
+    cache_ttl default ttl 60s grace 1h
+
+    # Long *client-side* cache for fingerprinted text assets (matched on the
+    # response Content-Type, so it follows what the origin actually served).
+    header content_type text/css Cache-Control "public, max-age=31536000, immutable"
+    header content_type application/javascript Cache-Control "public, max-age=31536000, immutable"
+
+    # A stray Set-Cookie on a static asset would make it per-user (uncacheable in
+    # shared caches). Strip it on the asset paths.
+    strip_cookies @assets
+
+    header +cache_status X-Cache
+}

@@ -1,0 +1,19 @@
+{
+  "name": "35-cookie-allow-unkeyed",
+  "cadishfile": "example.com {\n    cookie_allow session\n\n    cache_ttl default ttl 60s\n\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": {
+        "method": "GET",
+        "host": "example.com",
+        "path": "/page",
+        "header": { "Cookie": ["session=AAA"] }
+      },
+      "origin": {
+        "status": 200,
+        "header": { "Content-Type": ["text/html"] }
+      },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

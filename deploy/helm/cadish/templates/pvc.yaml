@@ -1,0 +1,39 @@
+{{- if not .Values.controller.enabled }}
+{{- $tls := eq (include "cadish.tlsEnabled" .) "true" -}}
+{{- if .Values.persistence.cache.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "cadish.fullname" . }}-cache
+  labels:
+    {{- include "cadish.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.persistence.cache.accessMode }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.cache.size }}
+  {{- if .Values.persistence.cache.storageClass }}
+  storageClassName: {{ .Values.persistence.cache.storageClass | quote }}
+  {{- end }}
+{{- end }}
+{{- if and $tls .Values.persistence.acme.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "cadish.fullname" . }}-acme
+  labels:
+    {{- include "cadish.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.persistence.acme.accessMode }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.acme.size }}
+  {{- if .Values.persistence.acme.storageClass }}
+  storageClassName: {{ .Values.persistence.acme.storageClass | quote }}
+  {{- end }}
+{{- end }}
+
+{{- end }}

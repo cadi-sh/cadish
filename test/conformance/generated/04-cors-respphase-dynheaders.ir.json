@@ -1,0 +1,147 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "api.example.com"
+    ],
+    "redirectHosts": [
+      "api.example.com"
+    ],
+    "canonicalHost": "api.example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "html": {
+      "kind": "content_type",
+      "contentTypes": [
+        "text/html"
+      ],
+      "responsePhase": true
+    },
+    "sc": {
+      "kind": "set_cookie",
+      "responsePhase": true
+    }
+  },
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "url"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "url"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "scope",
+        "scope": {
+          "names": [
+            "html"
+          ]
+        },
+        "ttl": "1m0s",
+        "grace": "10m0s"
+      },
+      {
+        "selKind": "default",
+        "ttl": "10s"
+      }
+    ],
+    "stripCookies": [
+      {
+        "names": [
+          "sc"
+        ]
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "set",
+            "name": "Access-Control-Allow-Origin",
+            "value": "{http.Origin}",
+            "valueIsTmpl": true
+          }
+        ]
+      },
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "set",
+            "name": "X-Client",
+            "value": "{client_ip}",
+            "valueIsTmpl": true
+          }
+        ]
+      },
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "set",
+            "name": "X-Geo",
+            "value": "{geo}",
+            "valueIsTmpl": true
+          }
+        ]
+      },
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      }
+    ],
+    "cors": {
+      "scope": {
+        "always": true
+      },
+      "origins": [
+        "https://app.example.com"
+      ],
+      "methods": [
+        "GET",
+        "POST",
+        "OPTIONS"
+      ],
+      "headers": [
+        "Content-Type",
+        "X-Token"
+      ]
+    }
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache"
+  },
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

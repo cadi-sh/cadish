@@ -1,0 +1,31 @@
+{
+  "name": "12-query-present",
+  "cadishfile": "example.com {\n    @adparams query_present adult_content t a ff-* pub-*\n    pass @adparams\n    cache_key method host path\n    cache_ttl default ttl 1m\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "query": { "adult_content": ["1"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "query": { "ff-foo": [""] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "query": { "ff": ["1"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "query": { "other": ["x"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

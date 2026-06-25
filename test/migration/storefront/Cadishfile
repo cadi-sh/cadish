@@ -1,0 +1,115 @@
+# ============================================================================
+# storefront — production-complete cadish v1 translation of a legacy storefront.vcl
+# ----------------------------------------------------------------------------
+# This is the canonical migration target: a (fictional) e-commerce Varnish config
+# expressed as a flat (form-A) Cadishfile using ONLY directives the pipeline
+# implements. Each block cites the VCL behavior it mirrors; golden_cases.md
+# asserts the request-by-request decisions. `# TODO(v2):` marks behavior the real
+# VCL had that cadish v1 cannot yet express (the v2 classifier/module machinery).
+#
+# Verified: `cadish check -config test/migration/storefront/Cadishfile` ->
+# 0 errors. (See test/migration/README.md for the rendered report.)
+# ============================================================================
+
+example.com, *.example.com {
+
+    # -- TLS termination + ACME (replaces certbot/Caddy/Hitch in front) -------
+    # VCL ran behind a separate TLS terminator; cadish does it inline.
+    tls {
+        acme ops@example.com
+    }
+
+    # -- Backends + sticky sharding ------------------------------------------
+    # VCL: ~80 lines of director + X-Shard anti-loop + sticky-key glue. Here it
+    # is one `upstream` with first-class `sticky by`. A user pins to one frontend
+    # for the life of their PHPSESSID; health-aware (a healthy frontend answers
+    # 301 to "GET /"). `to k8s://…` re-resolves DNS (no reloads on pod churn).
+    upstream web {
+        to          k8s://web-ingress.default:8080
+        sticky      by cookie PHPSESSID else client_ip
+        health      GET / expect 301 interval 5s window 6 threshold 3
+        timeout     connect 5s first_byte 600s
+        max_conns   800
+    }
+    # Static/image origin (the S3 bridge the VCL sent image hosts to).
+    # TODO(v2): the prod VCL fell back from one S3 bucket to a CDN with URL
+    # re-signing. That is a v2 module + `origin chain images -> cdn`; v1 serves
+    # images from the single static origin below.
+    upstream images {
+        to          https://static.example.com
+        timeout     connect 5s
+    }
+
+    # -- Peer cache cluster (sharded by URL) ---------------------------------
+    # VCL's inter-node cache sharing; consistent-hash by URL.
+    cluster peers {
+        to        k8s://cache-peers.default:6081
+        shard_by  url
+        health    GET /health-check interval 1s window 5 threshold 3
+    }
+
+    # -- Two-tier cache ------------------------------------------------------
+    # RAM for hot dynamic HTML/listings (latency); NVMe for large static.
+    cache {
+        ram   10GiB
+        disk  /var/cache/cadish 2TiB
+    }
+
+    # -- Synthetic health-check (VCL: vcl_recv early synthetic 200 "OK") ------
+    respond /health-check 200 "OK"
+
+    # -- Purge / ban, token-guarded (VCL: PURGE/BAN with secret header) ------
+    purge   when header X-Purge-Token {$PURGE_TOKEN}   regex {http.X-Purge-Regex}
+
+    # -- Matchers ------------------------------------------------------------
+    @ajax      header X-Requested-With XMLHttpRequest  # VCL: req.http.X-Requested-With
+    @static    host_regex ^static                      # VCL: req.http.host ~ "^static"
+    @images    upstream images                         # requests routed to images
+    @longcache content_type text/css image/svg+xml     # matches the RESPONSE Content-Type
+    import     nocache.cadish                           # defines @nocache + @listings
+
+    # -- Route image hosts to the images origin (VCL: set req.backend = images)
+    route @static -> images
+
+    # -- No-cache rules (pass = straight to origin, never stored) ------------
+    # First-match-wins. Order matters: @listings is NOT in @nocache, so category
+    # listings fall through to the cacheable TTL policy below.
+    pass   @ajax            # VCL: if (req.http.X-Requested-With) return(pass)
+    pass   method POST      # VCL: if (req.method == "POST") return(pass)
+    pass   @nocache         # VCL: ~50 `if (req.url ~ "…") return(pass)` lines
+
+    # -- Cache key (VCL: hash_data(req.url) + hash_data(req.http.host)) -------
+    cache_key   url host
+
+    # -- Per-status TTL / grace policy (first match wins) --------------------
+    cache_ttl   status 404 410   ttl 60s grace 1h     # VCL: deleted content replaces stale 200
+    cache_ttl   status not 200   hit_for_miss 5s      # VCL: transient 5xx must not poison the key
+    cache_ttl   @images          ttl 24h grace 365d   # VCL: images cached long
+    cache_ttl   @listings        ttl 2s  grace 24h    # VCL: listings — stale-while-revalidate
+    cache_ttl   default          ttl 2s  grace 24h    # VCL: default beresp.ttl
+
+    # -- Storage tier --------------------------------------------------------
+    storage   @images -> disk    # sendfile + kernel page cache for large files
+    storage   default -> ram
+
+    # -- Cookie hygiene (VCL: unset req/beresp cookies on static & home) -----
+    strip_cookies   path_regex \.(css|js|png|gif|jpe?g|swf|ico)$
+    strip_cookies   path / /category/*
+    strip_cookies   @images
+
+    # -- Response headers (VCL: unset debug headers, add CORS + cache status) -
+    header  -Server -X-Powered-By -Via -X-Varnish
+    header  Access-Control-Allow-Origin   *
+    header  Access-Control-Allow-Methods  "GET, OPTIONS, POST"
+    header  X-Frame-Options               SAMEORIGIN
+    header  +cache_status                 X-Cache       # emits HIT/MISS/HIT-STALE
+    # gap #4 CLOSED: scope on the RESPONSE Content-Type (a deliver-phase matcher),
+    # not the request path. The old `path_regex image/svg|text/css` matched the URL
+    # path and so never fired on a CSS/SVG response.
+    header  @longcache  Cache-Control "public, max-age=31536000"
+
+    # TODO(v2): the prod VCL also did User-Agent device detection (desktop/mobile
+    # Vary normalization), brand whitelabeling, and feature-flag VARY collapsing.
+    # Those need the v2 classifier/normalizer machinery ({device}/{geo}) and are
+    # intentionally omitted from the v1 parity target.
+}

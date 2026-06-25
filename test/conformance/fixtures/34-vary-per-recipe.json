@@ -1,0 +1,32 @@
+{
+  "name": "34-vary-per-recipe",
+  "cadishfile": "example.com {\n    @a path /a/*\n\n    cache_key @a host path header:X-Country\n    cache_key default host path\n\n    cache_ttl default ttl 60s\n\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": {
+        "method": "GET",
+        "host": "example.com",
+        "path": "/b/page",
+        "header": { "X-Country": ["US"] }
+      },
+      "origin": {
+        "status": 200,
+        "header": { "Content-Type": ["text/html"], "Vary": ["X-Country"] }
+      },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": {
+        "method": "GET",
+        "host": "example.com",
+        "path": "/a/page",
+        "header": { "X-Country": ["US"] }
+      },
+      "origin": {
+        "status": 200,
+        "header": { "Content-Type": ["text/html"], "Vary": ["X-Country"] }
+      },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

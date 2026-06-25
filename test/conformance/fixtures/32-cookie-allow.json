@@ -1,0 +1,19 @@
+{
+  "name": "32-cookie-allow",
+  "cadishfile": "example.com {\n    cookie_allow lang darkMode wp_logged_in_*\n\n    cache_key host path cookie:lang\n\n    cache_ttl default ttl 60s\n\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": {
+        "method": "GET",
+        "host": "example.com",
+        "path": "/page",
+        "header": { "Cookie": ["lang=es; session=AAA; darkMode=1"] }
+      },
+      "origin": {
+        "status": 200,
+        "header": { "Content-Type": ["text/html"] }
+      },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

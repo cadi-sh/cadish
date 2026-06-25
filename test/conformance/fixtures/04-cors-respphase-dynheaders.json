@@ -1,0 +1,25 @@
+{
+  "name": "04-cors-respphase-dynheaders",
+  "cadishfile": "api.example.com {\n    @html content_type text/html\n    @sc   set_cookie\n\n    cors https://app.example.com methods GET POST OPTIONS headers Content-Type X-Token\n\n    cache_key url\n\n    cache_ttl @html    ttl 1m grace 10m\n    cache_ttl default  ttl 10s\n\n    strip_cookies @sc\n\n    header Access-Control-Allow-Origin {http.Origin}\n    header X-Client {client_ip}\n    header X-Geo    {geo}\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": {
+        "method": "GET", "host": "api.example.com", "path": "/page",
+        "query": { "b": ["2"], "a": ["1"] },
+        "header": { "Origin": ["https://app.example.com"] },
+        "clientIP": "203.0.113.1", "geo": "US"
+      },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html; charset=utf-8"] } },
+      "cacheStatus": "HIT"
+    },
+    {
+      "request": {
+        "method": "GET", "host": "api.example.com", "path": "/data",
+        "header": { "Origin": ["https://evil.example.com"] },
+        "clientIP": "198.51.100.2", "geo": "ES"
+      },
+      "origin": { "status": 200, "header": { "Content-Type": ["application/json"], "Set-Cookie": ["sid=x; Path=/"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

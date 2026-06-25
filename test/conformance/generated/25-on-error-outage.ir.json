@@ -1,0 +1,90 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "api.example.com"
+    ],
+    "redirectHosts": [
+      "api.example.com"
+    ],
+    "canonicalHost": "api.example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "api": {
+      "kind": "path",
+      "patterns": [
+        "/api/*"
+      ]
+    },
+    "static": {
+      "kind": "path",
+      "patterns": [
+        "/static/*"
+      ]
+    }
+  },
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s",
+        "grace": "5m0s",
+        "maxStale": "24h0m0s"
+      }
+    ],
+    "onError": [
+      {
+        "scope": {
+          "names": [
+            "api"
+          ]
+        },
+        "status": 503,
+        "body": "api down for maintenance",
+        "contentType": "text/html; charset=utf-8"
+      },
+      {
+        "scope": {
+          "names": [
+            "static"
+          ]
+        },
+        "status": 504,
+        "body": "static gateway timeout",
+        "contentType": "text/html; charset=utf-8"
+      }
+    ]
+  },
+  "deliver": {},
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

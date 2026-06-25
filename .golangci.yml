@@ -1,0 +1,36 @@
+# golangci-lint configuration for cadish.
+#
+# Run locally:  go run github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8 run ./...
+#
+# The enabled set is deliberately CONSERVATIVE and DEFENSIBLE: every linter here
+# catches a real class of correctness or hygiene bug and the tree passes it green.
+# `go vet` and `gofmt` already run as separate CI gates, so this adds the linters
+# that vet does not cover. The broad-but-noisy `unused`/`staticcheck` checks are
+# left off the default gate (the codebase keeps a few intentionally-unused
+# interface-completeness methods and deliberate idempotency assertions in tests).
+
+run:
+  timeout: 5m
+
+linters:
+  disable-all: true
+  enable:
+    - govet         # the vet suite (also a standalone CI gate; cheap to re-run)
+    - ineffassign   # assignments never read
+    - misspell      # common spelling mistakes in comments/strings
+    - unconvert     # redundant type conversions
+    - asciicheck    # non-ASCII identifiers sneaking into the source
+    - durationcheck # multiplying two durations (a units bug)
+# Intentionally NOT enabled, with reasons (each would flag deliberate, correct code):
+#   bodyclose  — the proxy hands live upstream bodies to the caller to close
+#                (ownership transfer bodyclose can't track → false positives).
+#   errorlint  — conventional `err == io.EOF` checks + deliberate
+#                `*ParseError`/`*CompileError` type assertions in tests.
+#   errcheck   — best-effort ignored errors (corrupt-index recovery, abort-close,
+#                test-server writes) that are correct by design.
+#   nilerr     — deliberate "recover to a clean state on a parse error" returns.
+
+issues:
+  # Show every finding (don't cap per-linter/per-file), so the gate is honest.
+  max-issues-per-linter: 0
+  max-same-issues: 0

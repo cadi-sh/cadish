@@ -1,0 +1,18 @@
+# nocache.cadish — importable sub-config.
+# The ~50 `if (req.url ~ "...") return(pass)` VCL rules collapsed.
+# `cadish check` would warn: "these 50 routes are 1 lookup, not 50 regexes".
+
+@nocache path \
+    /account/*  /publish/*  /upload-photo/*  /security-check/* \
+    /order-error/*  /user-panel/*  /mailer/*  /videos/getvideo/* \
+    /embed-video/*  /favorites/*  /sellers/*  /buy-credits/* \
+    /private/*  /pub/*  /panel/*  /admin-area/*  /wallet/* \
+    /buy/*  /transaction/*  /response/*  /payment-done/* \
+    /payment-error/*  /media/image_server.php  *sitemap*
+
+# Category listings: the EXCEPTION that IS cached (short TTL + grace).
+# In the VCL this was an ugly nested if/else; here it is one named matcher.
+@listings path_regex \
+    /(catalog|deals|brands|electronics|\
+      clothing|home-garden|toys|books|sports|grocery|\
+      beauty|automotive|outlet)/

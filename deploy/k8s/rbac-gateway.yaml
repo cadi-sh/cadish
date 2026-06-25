@@ -1,0 +1,94 @@
+# RBAC for cadish running as an in-cluster Gateway API controller (Layer 2, slices 1+2).
+#
+# This parallels deploy/k8s/rbac-controller.yaml (the Ingress controller) for the Gateway
+# API surface. It grants exactly what the Gateway controller needs and nothing more:
+#   - watch the Gateway API surface (gatewayclasses, gateways, httproutes, referencegrants)
+#     to build routing and authorize cross-namespace refs;
+#   - read Secrets (BYO TLS certs for HTTPS listener certificateRefs) and EndpointSlices
+#     (Layer-1 k8s:// upstream resolution, the SAME path the Ingress controller uses, D53);
+#   - read Services (so a backendRef can resolve and, later, a publish-address can be read);
+#   - write GatewayClass / Gateway / HTTPRoute STATUS (the leader-elected status writer);
+#   - coordinate leader election via a coordination.k8s.io Lease.
+#
+# Run the Gateway controller as a SEPARATE Deployment from the Ingress controller (a
+# distinct ServiceAccount + controllerName), so the two never contend for the same objects.
+#
+# HARDENING (slice-A/B/C posture): label-scoping of Secret reads + a namespaced-Role variant
+# for restricted-namespace deployments (mirroring rbac-controller-scoped.yaml) is a follow-up
+# for the hostile-multi-tenant story; see the Ingress controller's C1 notes. Slice 1 grants
+# cluster-wide read because the controller's informers watch cluster-wide.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cadish-gateway
+  namespace: cadish
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cadish-gateway
+rules:
+# Layer-1 endpoint resolution (k8s:// upstreams → ready pod IP:port).
+- apiGroups: ["discovery.k8s.io"]
+  resources: ["endpointslices"]
+  verbs: ["get", "list", "watch"]
+# The Gateway API surface (the source of truth for routing). referencegrants authorize
+# cross-namespace backendRef / certificateRef (slice 2): a reference INTO a namespace is
+# allowed only when a ReferenceGrant in that namespace permits it.
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["gatewayclasses", "gateways", "httproutes", "referencegrants"]
+  verbs: ["get", "list", "watch"]
+# Write the Gateway API status subresources (leader-only writer): GatewayClass Accepted,
+# Gateway Accepted/Programmed + listener status, HTTPRoute parent Accepted/ResolvedRefs.
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["gatewayclasses/status", "gateways/status", "httproutes/status"]
+  verbs: ["update", "patch"]
+# Services (backendRef resolution; and, later, a publish-address read for Gateway addresses).
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch"]
+# TLS certs (Secrets) — read for the slice-2 certificateRefs / HTTPS listener work.
+# NOTE (least privilege): cluster-wide because the informers watch cluster-wide. The
+# label-scoping + scoped-namespace hardening the Ingress controller offers (C1 /
+# rbac-controller-scoped.yaml) is a follow-up for the Gateway controller.
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch"]
+---
+# Leader election uses a single Lease in the controller's own namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cadish-gateway-leader
+  namespace: cadish
+rules:
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cadish-gateway
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cadish-gateway
+subjects:
+- kind: ServiceAccount
+  name: cadish-gateway
+  namespace: cadish
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cadish-gateway-leader
+  namespace: cadish
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cadish-gateway-leader
+subjects:
+- kind: ServiceAccount
+  name: cadish-gateway
+  namespace: cadish

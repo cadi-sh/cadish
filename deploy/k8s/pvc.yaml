@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cadish-acme
+  namespace: cadish
+  labels:
+    app.kubernetes.io/name: cadish
+spec:
+  # ACME certificate store (/var/lib/cadish). MUST persist — losing it re-issues
+  # every cert on restart and risks Let's Encrypt rate limits.
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 256Mi
+  # storageClassName: <your-class>
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cadish-cache
+  namespace: cadish
+  labels:
+    app.kubernetes.io/name: cadish
+spec:
+  # NVMe disk cache tier (/var/cache/cadish). Persisting it avoids a cold cache
+  # (origin stampede) on restart.
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  # storageClassName: <your-fast-class>

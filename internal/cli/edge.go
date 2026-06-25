@@ -1,0 +1,545 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	edgebundle "github.com/cadi-sh/cadish/edge"
+	"github.com/cadi-sh/cadish/internal/cadishfile"
+	"github.com/cadi-sh/cadish/internal/edgedeploy"
+	"github.com/cadi-sh/cadish/internal/edgeir"
+	"github.com/cadi-sh/cadish/internal/pipeline"
+)
+
+// edgeUsage is the `cadish edge` subcommand help.
+const edgeUsage = `cadish edge — Cadish Edge management plane (Cloudflare Workers).
+
+Usage:
+  cadish edge build   [-config Cadishfile] [-o FILE] [-bundle FILE] [-strict]
+  cadish edge deploy  [-config Cadishfile] [-origin URL]   # upload, NO routes (dark)
+  cadish edge enable  [-config Cadishfile]                 # attach routes (go-live)
+  cadish edge disable [-config Cadishfile]                 # detach routes (kill switch)
+
+  build    compile a Cadishfile, project the edge IR, and optionally assemble the
+           worker bundle (generic runtime + baked IR). Prints a coverage report.
+  deploy   build + upload the worker script + bindings to Cloudflare WITHOUT routes
+           (testable via the *.workers.dev URL; no production traffic).
+  enable   attach the site's routes to the worker (traffic flows through the edge).
+  disable  detach the worker's routes (instant bypass to the cadish server behind).
+
+Auth: a Cloudflare API token in env CF_API_TOKEN (deploy/enable/disable). The
+deploy identity (account/zone/worker/route/kv) comes from the edge {} block.
+
+Flags (build):
+  -config PATH   path to the Cadishfile (default Cadishfile)
+  -o FILE        write the IR JSON here (default: build/<site>.edgeir.json per site; - = stdout)
+  -bundle FILE   write the worker bundle here (- = stdout; "auto" = per-site
+                 build/<host>.worker.js); omitted = no bundle
+  -strict        exit non-zero if anything is delegated (a coverage regression)
+  -json          print the coverage report as JSON instead of text
+
+Flags (deploy):
+  -config PATH   path to the Cadishfile (default Cadishfile)
+  -origin URL    the upstream the worker fetches (the cadish server behind); falls
+                 back to env CADISH_EDGE_ORIGIN. Required.
+`
+
+// Edge dispatches the `cadish edge …` subcommands. It is the management plane for
+// Cadish Edge; this first slice ships only `build` (IR + coverage report).
+func Edge(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprint(os.Stderr, edgeUsage)
+		return 2
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "build":
+		return EdgeBuild(rest)
+	case "deploy":
+		return EdgeDeploy(rest)
+	case "enable":
+		return EdgeManageRoutes(rest, "enable")
+	case "disable":
+		return EdgeManageRoutes(rest, "disable")
+	case "help", "-h", "--help":
+		fmt.Fprint(os.Stdout, edgeUsage)
+		return 0
+	default:
+		fmt.Fprintf(os.Stderr, "cadish edge: unknown subcommand %q\n\n", sub)
+		fmt.Fprint(os.Stderr, edgeUsage)
+		return 2
+	}
+}
+
+// EdgeBuild compiles a Cadishfile, projects each site to an EdgeIR, writes the IR
+// JSON, and prints a coverage report. With -strict it exits non-zero when anything
+// is delegated (the edge equivalent of `cadish check -strict`).
+func EdgeBuild(args []string) int {
+	fs := flag.NewFlagSet("edge build", flag.ContinueOnError)
+	cfgPath := fs.String("config", defaultConfigPath, "path to the Cadishfile")
+	out := fs.String("o", "", "write the IR JSON here (default: build/<site>.edgeir.json; - = stdout)")
+	bundle := fs.String("bundle", "", `write the worker bundle here (- = stdout; "auto" = per-site build/<host>.worker.js)`)
+	strict := fs.Bool("strict", false, "exit non-zero if anything is delegated (coverage regression)")
+	asJSON := fs.Bool("json", false, "print the coverage report as JSON")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	return runEdgeBuild(*cfgPath, *out, *bundle, *strict, *asJSON, os.Stdout, os.Stderr)
+}
+
+// edgeSite pairs a site's projected IR with its coverage report.
+type edgeSite struct {
+	hosts string
+	ir    edgeir.EdgeIR
+	rep   edgeir.CoverageReport
+}
+
+// runEdgeBuild is the testable core of EdgeBuild.
+func runEdgeBuild(cfgPath, out, bundle string, strict, asJSON bool, stdout, stderr io.Writer) int {
+	pipelines, err := loadEdgePipelines(cfgPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "cadish edge build: %v\n", err)
+		return 1
+	}
+
+	sites := make([]edgeSite, 0, len(pipelines))
+	for _, p := range pipelines {
+		ir, rep, perr := edgeir.Project(p)
+		if perr != nil {
+			fmt.Fprintf(stderr, "cadish edge build: %v\n", perr)
+			return 1
+		}
+		sites = append(sites, edgeSite{hosts: strings.Join(p.EdgeHosts(), ","), ir: ir, rep: rep})
+	}
+
+	// Write the IR JSON. With -o - everything goes to stdout (an array when multiple
+	// sites); with -o FILE the same; otherwise one <site>.edgeir.json per site.
+	if werr := writeEdgeIR(sites, out, stdout); werr != nil {
+		fmt.Fprintf(stderr, "cadish edge build: %v\n", werr)
+		return 1
+	}
+
+	// Optionally assemble the worker bundle(s): the generic JS runtime + the baked IR.
+	if bundle != "" {
+		if werr := writeBundles(sites, bundle, stdout); werr != nil {
+			fmt.Fprintf(stderr, "cadish edge build: %v\n", werr)
+			return 1
+		}
+	}
+
+	// Coverage report.
+	if asJSON {
+		if werr := writeCoverageJSON(sites, stdout); werr != nil {
+			fmt.Fprintf(stderr, "cadish edge build: %v\n", werr)
+			return 1
+		}
+	} else {
+		writeCoverageText(sites, stderr)
+	}
+
+	// Exit code: under -strict any delegated directive is a coverage regression, AND
+	// two safety signals fail the build even though they are surfaced as warnings in
+	// non-strict mode: a SERVER-ONLY security gate that the edge silently won't
+	// enforce (Fix A), and a matcher literal value that would ship into the public
+	// worker bundle (a potential baked-in secret, Fix B).
+	if strict {
+		var delegated, secGate, exposed int
+		for _, s := range sites {
+			delegated += s.rep.Delegated
+			secGate += s.rep.SecurityGate
+			exposed += s.rep.ValueExposed
+		}
+		failed := false
+		if delegated > 0 {
+			fmt.Fprintf(stderr, "cadish edge build: -strict: %d directive(s) delegated (not edge-native)\n", delegated)
+			failed = true
+		}
+		if secGate > 0 {
+			fmt.Fprintf(stderr, "cadish edge build: -strict: a security gate (allow/deny/block/rate_limit) is present but is NOT enforced at the edge — enforce it via Cloudflare's own security layer\n")
+			failed = true
+		}
+		if exposed > 0 {
+			fmt.Fprintf(stderr, "cadish edge build: -strict: %d literal value(s) (matcher values, header op values, on_error/respond bodies, redirect targets, or cache_key literals) would be exposed in the public worker bundle (a potential secret) — remove the literal or quote the `{$VAR}` to keep it server-side\n", exposed)
+			failed = true
+		}
+		if failed {
+			return 1
+		}
+	}
+	return 0
+}
+
+// loadEdgePipelines reads, env-substitutes, splices imports, expands site-groups,
+// and compiles every site of the Cadishfile at path — the same load sequence as
+// config.Load, minus the runtime cache stores (the edge plane needs only the
+// compiled Pipeline to project).
+func loadEdgePipelines(path string) ([]*pipeline.Pipeline, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	file, err := cadishfile.Parse(path, data)
+	if err != nil {
+		return nil, err
+	}
+	cadishfile.SubstituteEnv(file, os.LookupEnv)
+	sites, err := cadishfile.ExpandGroups(file.Sites)
+	if err != nil {
+		return nil, err
+	}
+	baseDir := filepath.Dir(path)
+	var out []*pipeline.Pipeline
+	for _, site := range sites {
+		spliced, err := pipeline.SpliceImports(site, pipeline.FileImportResolver(baseDir))
+		if err != nil {
+			return nil, err
+		}
+		p, err := pipeline.Compile(spliced)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s: config defines no sites", path)
+	}
+	return out, nil
+}
+
+// writeEdgeIR emits the IR JSON. With out == "-" (or out == "" and stdout is the
+// only sink chosen for a single combined doc) it writes to stdout; with out == ""
+// it writes one <site>.edgeir.json per site into the build/ output dir; with out
+// FILE it writes one combined document (an array when multiple sites).
+func writeEdgeIR(sites []edgeSite, out string, stdout io.Writer) error {
+	switch {
+	case out == "-":
+		return encodeIR(stdout, sites)
+	case out != "":
+		f, err := os.Create(out)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		return encodeIR(f, sites)
+	default:
+		// One file per site, named from the first host (sanitized), under build/ so
+		// a test run leaves no scattered files in cwd — clean with `rm -rf build/`.
+		if err := os.MkdirAll(edgeOutputDir, 0o755); err != nil {
+			return err
+		}
+		for _, s := range sites {
+			name := filepath.Join(edgeOutputDir, edgeIRFilename(s.ir.Site.Hosts))
+			f, err := os.Create(name)
+			if err != nil {
+				return err
+			}
+			enc := json.NewEncoder(f)
+			enc.SetIndent("", "  ")
+			werr := enc.Encode(s.ir)
+			cerr := f.Close()
+			if werr != nil {
+				return werr
+			}
+			if cerr != nil {
+				return cerr
+			}
+		}
+		return nil
+	}
+}
+
+// writeBundles assembles the worker bundle(s). With out == "-" the bundle goes to
+// stdout (only valid for a single site); with out == "auto" one <host>.worker.js
+// is written per site into the build/ output dir; otherwise out is a single FILE
+// (only valid for one site).
+func writeBundles(sites []edgeSite, out string, stdout io.Writer) error {
+	switch {
+	case out == "-":
+		if len(sites) != 1 {
+			return fmt.Errorf("-bundle -: cannot write %d sites to stdout; use -bundle auto", len(sites))
+		}
+		src, err := edgebundle.Bundle(sites[0].ir)
+		if err != nil {
+			return err
+		}
+		_, err = io.WriteString(stdout, src)
+		return err
+	case out == "auto":
+		if err := os.MkdirAll(edgeOutputDir, 0o755); err != nil {
+			return err
+		}
+		for _, s := range sites {
+			src, err := edgebundle.Bundle(s.ir)
+			if err != nil {
+				return err
+			}
+			name := filepath.Join(edgeOutputDir, edgeWorkerFilename(s.ir.Site.Hosts))
+			if err := os.WriteFile(name, []byte(src), 0o644); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		if len(sites) != 1 {
+			return fmt.Errorf("-bundle %s: cannot write %d sites to one file; use -bundle auto", out, len(sites))
+		}
+		src, err := edgebundle.Bundle(sites[0].ir)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(out, []byte(src), 0o644)
+	}
+}
+
+// edgeOutputDir is where `edge build` drops per-site IR/bundle files when no explicit
+// -o / -bundle path is given. A single gitignored dir keeps test runs from scattering
+// <host>.edgeir.json / <host>.worker.js across the cwd — clean up with `rm -rf build/`.
+const edgeOutputDir = "build"
+
+// edgeWorkerFilename derives a stable worker-bundle BASENAME from a site's first
+// host (same sanitization as edgeIRFilename). Callers join it under edgeOutputDir.
+func edgeWorkerFilename(hosts []string) string {
+	base := "site"
+	if len(hosts) > 0 && hosts[0] != "" {
+		base = hosts[0]
+	}
+	base = strings.ReplaceAll(base, "*", "wildcard")
+	base = strings.ReplaceAll(base, "/", "_")
+	return base + ".worker.js"
+}
+
+// encodeIR writes the IR(s) to w: a single object for one site, an array otherwise.
+func encodeIR(w io.Writer, sites []edgeSite) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if len(sites) == 1 {
+		return enc.Encode(sites[0].ir)
+	}
+	irs := make([]edgeir.EdgeIR, 0, len(sites))
+	for _, s := range sites {
+		irs = append(irs, s.ir)
+	}
+	return enc.Encode(irs)
+}
+
+// edgeIRFilename derives a stable IR filename from a site's first host. A wildcard
+// host (*.example.com) sanitizes to wildcard.example.com; an empty host set falls
+// back to "site".
+func edgeIRFilename(hosts []string) string {
+	base := "site"
+	if len(hosts) > 0 && hosts[0] != "" {
+		base = hosts[0]
+	}
+	base = strings.ReplaceAll(base, "*", "wildcard")
+	base = strings.ReplaceAll(base, "/", "_")
+	return base + ".edgeir.json"
+}
+
+func writeCoverageJSON(sites []edgeSite, w io.Writer) error {
+	type siteCov struct {
+		Hosts  []string              `json:"hosts"`
+		Report edgeir.CoverageReport `json:"report"`
+	}
+	out := make([]siteCov, 0, len(sites))
+	for _, s := range sites {
+		out = append(out, siteCov{Hosts: s.ir.Site.Hosts, Report: s.rep})
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(out)
+}
+
+// EdgeDeploy builds each site's worker bundle and uploads it (script + bindings,
+// no routes) to Cloudflare. Auth: CF_API_TOKEN; origin: -origin or CADISH_EDGE_ORIGIN.
+func EdgeDeploy(args []string) int {
+	fs := flag.NewFlagSet("edge deploy", flag.ContinueOnError)
+	cfgPath := fs.String("config", defaultConfigPath, "path to the Cadishfile")
+	origin := fs.String("origin", "", "upstream URL the worker fetches (else env CADISH_EDGE_ORIGIN)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	return runEdgeDeploy(*cfgPath, *origin, os.Stdout, os.Stderr)
+}
+
+func runEdgeDeploy(cfgPath, origin string, stdout, stderr io.Writer) int {
+	token := os.Getenv("CF_API_TOKEN")
+	if token == "" {
+		fmt.Fprintln(stderr, "cadish edge deploy: CF_API_TOKEN is required (a Cloudflare API token)")
+		return 1
+	}
+	if origin == "" {
+		origin = os.Getenv("CADISH_EDGE_ORIGIN")
+	}
+	if origin == "" {
+		fmt.Fprintln(stderr, "cadish edge deploy: an origin is required (set -origin URL or CADISH_EDGE_ORIGIN)")
+		return 1
+	}
+	pipelines, err := loadEdgePipelines(cfgPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "cadish edge deploy: %v\n", err)
+		return 1
+	}
+	client := edgedeploy.New(token)
+	ctx := context.Background()
+	for _, p := range pipelines {
+		cfg, err := deployConfigFor(p, origin)
+		if err != nil {
+			fmt.Fprintf(stderr, "cadish edge deploy: %v\n", err)
+			return 1
+		}
+		ir, _, perr := edgeir.Project(p)
+		if perr != nil {
+			fmt.Fprintf(stderr, "cadish edge deploy: %v\n", perr)
+			return 1
+		}
+		src, berr := edgebundle.Bundle(ir)
+		if berr != nil {
+			fmt.Fprintf(stderr, "cadish edge deploy: %v\n", berr)
+			return 1
+		}
+		if err := client.Deploy(ctx, cfg, src); err != nil {
+			fmt.Fprintf(stderr, "cadish edge deploy: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "deployed worker %q (dark — no routes; run `cadish edge enable` to go live)\n", cfg.WorkerName)
+	}
+	return 0
+}
+
+// EdgeManageRoutes attaches (enable) or detaches (disable) the worker routes.
+func EdgeManageRoutes(args []string, action string) int {
+	fs := flag.NewFlagSet("edge "+action, flag.ContinueOnError)
+	cfgPath := fs.String("config", defaultConfigPath, "path to the Cadishfile")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	return runEdgeManageRoutes(*cfgPath, action, os.Stdout, os.Stderr)
+}
+
+func runEdgeManageRoutes(cfgPath, action string, stdout, stderr io.Writer) int {
+	token := os.Getenv("CF_API_TOKEN")
+	if token == "" {
+		fmt.Fprintf(stderr, "cadish edge %s: CF_API_TOKEN is required\n", action)
+		return 1
+	}
+	pipelines, err := loadEdgePipelines(cfgPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "cadish edge %s: %v\n", action, err)
+		return 1
+	}
+	client := edgedeploy.New(token)
+	ctx := context.Background()
+	for _, p := range pipelines {
+		cfg, err := deployConfigFor(p, "")
+		if err != nil {
+			fmt.Fprintf(stderr, "cadish edge %s: %v\n", action, err)
+			return 1
+		}
+		if action == "enable" {
+			err = client.Enable(ctx, cfg)
+		} else {
+			err = client.Disable(ctx, cfg)
+		}
+		if err != nil {
+			fmt.Fprintf(stderr, "cadish edge %s: %v\n", action, err)
+			return 1
+		}
+		verb := "enabled (routes attached — traffic flows through the edge)"
+		if action == "disable" {
+			verb = "disabled (routes detached — traffic bypasses the edge)"
+		}
+		fmt.Fprintf(stdout, "worker %q %s\n", cfg.WorkerName, verb)
+	}
+	return 0
+}
+
+// deployConfigFor resolves a pipeline's edge {} block (+ env fallbacks + the
+// origin) into an edgedeploy.Config. origin may be "" for enable/disable (which
+// do not set bindings). Routes default to the site hosts (`host/*`) when the edge
+// block lists none.
+func deployConfigFor(p *pipeline.Pipeline, origin string) (edgedeploy.Config, error) {
+	d := p.EdgeDeployConfig()
+	if !d.Configured {
+		return edgedeploy.Config{}, fmt.Errorf("site %s has no `edge { }` block — add account/zone/worker/route to deploy", strings.Join(p.EdgeHosts(), ","))
+	}
+	account := d.Account
+	if account == "" {
+		account = os.Getenv("CF_ACCOUNT_ID")
+	}
+	if account == "" {
+		return edgedeploy.Config{}, fmt.Errorf("edge: no account (set `account` in the edge block or CF_ACCOUNT_ID)")
+	}
+	if d.Worker == "" {
+		return edgedeploy.Config{}, fmt.Errorf("edge: no worker name (set `worker` in the edge block)")
+	}
+	routes := d.Routes
+	if len(routes) == 0 {
+		routes = deriveRoutes(p.EdgeHosts())
+	}
+	cfg := edgedeploy.Config{
+		AccountID:  account,
+		Zone:       d.Zone,
+		WorkerName: d.Worker,
+		Routes:     routes,
+		OriginURL:  origin,
+	}
+	if p.EdgeUsesKV() {
+		ns := d.KVNamespace
+		if ns == "" {
+			ns = d.Worker + "-cache"
+		}
+		cfg.KVNamespace = ns
+	}
+	return cfg, nil
+}
+
+// deriveRoutes turns a site's host set into default worker route patterns
+// (`host/*`), used when the edge block lists no explicit `route`.
+func deriveRoutes(hosts []string) []string {
+	out := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		if h == "" {
+			continue
+		}
+		out = append(out, h+"/*")
+	}
+	return out
+}
+
+// writeCoverageText prints a human coverage report per site (to stderr, like
+// `cadish check`, so the IR on stdout stays pipeable).
+func writeCoverageText(sites []edgeSite, w io.Writer) {
+	for _, s := range sites {
+		fmt.Fprintf(w, "edge coverage — %s (IR v%d)\n", s.hosts, s.ir.IRVersion)
+		fmt.Fprintf(w, "  edge-native: %d directive(s)\n", s.rep.EdgeNative)
+		fmt.Fprintf(w, "  delegated:   %d directive(s)\n", s.rep.Delegated)
+		// Group delegate reasons by directive for a compact summary.
+		counts := map[string]int{}
+		reasons := map[string]string{}
+		for _, d := range s.rep.DelegatedItems {
+			counts[d.Directive]++
+			reasons[d.Directive] = d.Reason
+		}
+		dirs := make([]string, 0, len(counts))
+		for k := range counts {
+			dirs = append(dirs, k)
+		}
+		sort.Strings(dirs)
+		for _, d := range dirs {
+			fmt.Fprintf(w, "    - %s x%d → pass: %s\n", d, counts[d], reasons[d])
+		}
+		if len(s.rep.Warnings) > 0 {
+			fmt.Fprintf(w, "  warnings:    %d\n", len(s.rep.Warnings))
+			for _, warn := range s.rep.Warnings {
+				fmt.Fprintf(w, "    ! %s\n", warn)
+			}
+		}
+	}
+}

@@ -1,0 +1,86 @@
+{
+  "irVersion": 4,
+  "site": {
+    "hosts": [
+      "shop.example.com"
+    ],
+    "redirectHosts": [
+      "shop.example.com"
+    ],
+    "canonicalHost": "shop.example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "api": {
+      "kind": "path",
+      "patterns": [
+        "/api/*"
+      ]
+    }
+  },
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "status_in",
+        "codes": [
+          404,
+          410
+        ],
+        "ttl": "1m0s",
+        "grace": "1h0m0s"
+      },
+      {
+        "selKind": "status_in",
+        "codes": [
+          200
+        ],
+        "ttl": "1m0s",
+        "grace": "5m0s",
+        "maxStale": "24h0m0s"
+      }
+    ],
+    "onError": [
+      {
+        "scope": {
+          "names": [
+            "api"
+          ]
+        },
+        "status": 503,
+        "body": "api maintenance",
+        "contentType": "text/html; charset=utf-8"
+      }
+    ]
+  },
+  "deliver": {},
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

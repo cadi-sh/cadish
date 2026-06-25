@@ -1,0 +1,286 @@
+# Default values for the cadish chart.
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/cadi-sh/cadish
+  # Defaults to the chart's appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# -- The Cadishfile. This is mounted at /etc/cadish/Cadishfile via a ConfigMap.
+# Replace it with your real config. NOTE: for HTTP health probes (tls.mode=off)
+# it MUST define a synthetic at `probes.path` (e.g. `respond /healthz 200 "OK"`).
+# To supply your own ConfigMap instead, set existingConfigMap and leave this empty.
+config: |
+  # Minimal example — replace with your real Cadishfile.
+  example.com {
+      tls { acme you@example.com }
+
+      cache { ram 1GiB }
+
+      upstream backend {
+          to http://my-origin.default.svc.cluster.local:8080
+      }
+
+      respond /healthz 200 "OK"     # health probe target (keep this)
+
+      cache_ttl default ttl 1m grace 1h
+      header +cache_status X-Cache
+  }
+
+# -- Use an existing ConfigMap (with key `Cadishfile`) instead of `config` above.
+existingConfigMap: ""
+
+tls:
+  # "acme"  — cadish terminates TLS and obtains certificates automatically.
+  #           Binds :80 (ACME HTTP-01 challenge + HTTPS redirect) and :443.
+  #           Needs the ACME persistent volume and CAP_NET_BIND_SERVICE.
+  # "off"   — plain HTTP only (e.g. behind an Ingress/LB that terminates TLS).
+  mode: acme
+
+# Ports the cadish process binds INSIDE the container, passed as -addr / -https-addr.
+# Defaults to the privileged 80/443 (requires CAP_NET_BIND_SERVICE, granted below);
+# set to e.g. 8080/8443 to run fully unprivileged and drop the capability.
+containerPorts:
+  http: 80
+  https: 443
+
+# Also bind the container ports on the NODE (hostPort) — for bare-metal / edge
+# setups that route node traffic straight to the pod instead of via a Service LB.
+# Constrains scheduling to one cadish pod per node per port. Off by default.
+hostPort:
+  enabled: false
+
+# -idle-timeout: abort an origin body that stalls this long (0 disables).
+idleTimeout: 60s
+
+service:
+  # LoadBalancer is the usual choice when cadish terminates TLS (it needs a stable
+  # public IP the DNS A record points at, so ACME can validate). Use ClusterIP
+  # behind an Ingress (tls.mode=off).
+  type: LoadBalancer
+  annotations: {}
+  ports:
+    http: 80
+    https: 443
+  # Pin the external IP (optional).
+  loadBalancerIP: ""
+  externalTrafficPolicy: Local   # preserve client source IP (sticky/geo correctness)
+
+# Make the persistent volumes writable by the non-root cadish uid (65532). A FRESH
+# volume is created root-owned, so the distroless-nonroot process can't create
+# /var/cache/cadish/blobs (or the ACME dir) and crash-loops on "permission denied".
+#
+# The pod `podSecurityContext.fsGroup` (65532, set below) is the primary fix: most
+# CSI drivers chown/relabel a mounted volume to fsGroup on attach, which is enough.
+# SOME volume types (hostPath, many `local`/NFS provisioners) IGNORE fsGroup — for
+# those, enable this chown initContainer, which runs once as root and chowns the
+# cache (and ACME) mounts to 65532 before cadish starts. Off by default because
+# fsGroup covers the common case and the initContainer needs to run as root (uid 0).
+volumePermissions:
+  enabled: false
+  image:
+    repository: busybox
+    tag: "1.36"
+    pullPolicy: IfNotPresent
+
+# Pod-level securityContext. fsGroup makes mounted volumes group-owned and
+# group-writable by the non-root uid on CSI drivers that honor it (the primary fix
+# for the root-owned-volume crash above). Override to {} only if your platform
+# forbids fsGroup AND you rely solely on volumePermissions.enabled.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+persistence:
+  # ACME certificate store (mounted at /var/lib/cadish). MUST persist — losing it
+  # re-issues every cert on restart and risks Let's Encrypt rate limits.
+  acme:
+    enabled: true
+    size: 256Mi
+    storageClass: ""
+    accessMode: ReadWriteOnce
+  # NVMe disk cache tier (mounted at /var/cache/cadish). Persisting it avoids a
+  # cold cache (origin stampede) on restart.
+  cache:
+    enabled: true
+    size: 20Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce
+
+# A soft memory ceiling for the Go runtime (set below the container limit, leaving
+# headroom over your `cache { ram … }` budget). Empty disables GOMEMLIMIT.
+# Defaults to a soft ceiling under the 2Gi limit, matching the raw controller manifest;
+# tune it to your cache budget (or set "" to disable).
+gomemlimit: "1700MiB"
+
+extraEnv: []
+# - name: PURGE_TOKEN
+#   valueFrom: { secretKeyRef: { name: cadish-secrets, key: purge-token } }
+
+# Pods outlive their SIGTERM drain by this many seconds before the kubelet
+# SIGKILLs, so a rollout / node drain finishes in-flight connections.
+terminationGracePeriodSeconds: 40
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    # No CPU limit by default (CPU is compressible; a limit only adds CFS throttling).
+    # If you DO set a cpu limit, cadish reads it via automaxprocs and pins GOMAXPROCS
+    # to the quota automatically — recommended on shared/many-core nodes, e.g.:
+    #   cpu: "2"
+    memory: 2Gi
+
+# Probe tuning. The probe MECHANISM is chosen by tls.mode:
+#   tls.mode=off   → httpGet `path` on the HTTP port (the synthetic `respond`).
+#   tls.mode=acme  → tcpSocket on the HTTPS port (:80 only redirects; :443 needs a
+#                    cert, so a TCP "is it accepting connections" probe is robust).
+probes:
+  path: /healthz
+  startup:
+    failureThreshold: 30
+    periodSeconds: 5
+  readiness:
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  liveness:
+    periodSeconds: 20
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# Prometheus metrics. cadish serves /metrics from its off-path admin listener, so
+# enabling scraping is TWO steps: (1) set metrics.enabled (opens the container/Service
+# port + optional ServiceMonitor), and (2) add the admin block to your `config` above
+# on the SAME port, e.g.:
+#     admin { listen :9090; auth_token {$CADISH_ADMIN_TOKEN}; metrics }
+# The ServiceMonitor scrapes with that bearer token via serviceMonitor.bearerTokenSecret.
+metrics:
+  enabled: false
+  port: 9090
+  path: /metrics
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    # Extra labels so a Prometheus Operator release selects this ServiceMonitor.
+    labels: {}
+    # Secret holding the admin bearer token Prometheus presents when scraping.
+    bearerTokenSecret: {}
+    #   name: cadish-secrets
+    #   key: admin-token
+
+# Deployment strategy. Recreate is the safe default because the RWO PVCs (cache +
+# ACME store) cannot be mounted by two pods at once during a rolling update. For
+# multi-replica HA, use RWX volumes (or external cert/cache management) and switch
+# to RollingUpdate — see deploy/README.md.
+strategy:
+  type: Recreate
+
+# PodDisruptionBudget — keep N pods up during voluntary disruptions (node drains,
+# upgrades). Disabled by default: with a single replica a PDB would BLOCK node
+# drains. Enable it only for multi-replica HA (replicaCount > 1). Set exactly one
+# of minAvailable / maxUnavailable.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  maxUnavailable: ""
+
+networkPolicy:
+  # Restrict pod traffic: allow ingress to :80/:443, allow egress to DNS, your
+  # origins, and ACME (HTTP/HTTPS to the internet). Tighten egressCIDRs for your
+  # origins in production.
+  enabled: false
+  ingressFromCIDRs:
+    - 0.0.0.0/0
+  egressCIDRs:
+    - 0.0.0.0/0
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+# -- Ingress-controller mode (Layer 2, D55). When enabled, the chart renders cadish as
+# an in-cluster Kubernetes Ingress controller (IngressClass + RBAC + base ConfigMap +
+# Deployment + LoadBalancer Service) INSTEAD of the plain `run` Deployment above. Routing
+# /TLS/policy come from Ingress objects; `controller.base` supplies only globals. Every
+# replica serves; a leader-elected Lease gates ONLY the status writer (run >= 2 replicas).
+controller:
+  enabled: false
+  className: cadish
+  # Mark this IngressClass the cluster default (classless Ingresses served by cadish).
+  defaultClass: false
+  replicaCount: 2
+  # Outlive the SIGTERM drain before SIGKILL (rollout / node-drain connection safety).
+  terminationGracePeriodSeconds: 40
+  # NOTE on multi-replica + ACME: with replicaCount > 1 and the built-in ACME cache on
+  # an emptyDir, each replica issues its own certs and re-issues on restart, which can
+  # hit Let's Encrypt rate limits. For production multi-replica, terminate TLS with
+  # cert-manager / a BYO TLS Secret (per-Ingress `spec.tls.secretName`) instead of the
+  # built-in ACME, or run a single controller replica for ACME.
+  # Restrict watched namespaces (comma-separated); empty = all namespaces.
+  namespaces: ""
+  # ns/name of THIS chart's Service, written to Ingress status.loadBalancer (leader-only).
+  # Empty disables status writing.
+  publishService: ""
+  # Label-scoped Secret/ConfigMap reads (C1, hostile-multi-tenant hardening). OFF by
+  # default (empty = watch all Secrets/ConfigMaps cluster-wide — unchanged behaviour).
+  # When set, ONLY objects matching the selector enter the controller's informer cache,
+  # so a controller compromise cannot read every Secret in the cluster — only the ones
+  # you explicitly label for cadish to consume. You MUST then label your BYO/cert-manager
+  # TLS Secrets and your cadi.sh/policy ConfigMaps with the same label, or the controller
+  # will not see them (TLS hosts fall through to ACME; policy fragments resolve to empty).
+  labelSelector:
+    # Applied to BOTH Secrets and ConfigMaps unless overridden below, e.g.
+    # "cadi.sh/managed=true".
+    watch: ""
+    # Per-resource overrides (take precedence over watch). Empty = use watch.
+    secrets: ""
+    configMaps: ""
+  rbac:
+    # When true (and controller.namespaces lists a known set of namespaces), grant the
+    # Secret/ConfigMap READS via per-namespace Roles in those namespaces instead of a
+    # cluster-wide ClusterRole — bounding a compromise to those namespaces' Secrets.
+    # Core k8s RBAC cannot filter by label, so pair this with labelSelector above for the
+    # tightest result: RBAC bounds WHICH NAMESPACES, the label selector bounds WHICH
+    # OBJECTS within them are cached. Requires controller.namespaces to be non-empty
+    # (cluster-wide reads are unavoidable when serving all namespaces). Default false =
+    # cluster-wide reads (back-compat). EndpointSlices and Ingresses still need
+    # cluster-wide reads in this mode unless you also enumerate them per-namespace; this
+    # toggle scopes ONLY the high-blast-radius Secret/ConfigMap reads.
+    scoped: false
+  leaderElection:
+    enabled: true
+  # The BASE Cadishfile (globals only — NO top-level `cache {}`; it is per-site).
+  base: |
+    # cadish ingress-controller base (globals only).
+  service:
+    type: LoadBalancer
+    annotations: {}
+    # For a LoadBalancer service, preserve the real client source IP (geo/rate_limit/ACLs).
+    externalTrafficPolicy: Local
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2Gi

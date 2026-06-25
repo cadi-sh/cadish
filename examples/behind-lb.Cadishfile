@@ -1,0 +1,38 @@
+# Recipe: Behind an external LB / ingress (TLS terminated upstream)
+# A load balancer / ingress / CDN already terminates TLS and forwards plain HTTP
+# to cadish. cadish serves HTTP only and trusts the front for the client's real
+# IP and country.
+
+cache.example.com {
+    tls off # the LB/ingress terminates TLS; cadish is HTTP
+
+    cache {
+        ram 4GiB
+        disk /var/cache/cadish 200GiB
+    }
+
+    upstream app {
+        to http://app.internal:8080
+    }
+
+    # The front sets the real client IP in X-Forwarded-For and (often) a country
+    # header. Use that country as a bounded {geo} key dimension — e.g. to cache
+    # region-specific pages without varying on the raw IP.
+    geo {
+        source header CF-IPCountry # the country your CDN/LB injects
+        # CIDR(s) of the fronting LB/CDN whose X-Forwarded-For we trust — set the real
+        # subnet of your ingress/LB. `0.0.0.0/0 ::/0` means "trust the immediate peer
+        # from anywhere", which is only safe when cadish is reachable EXCLUSIVELY via
+        # the LB (never directly).
+        trust_proxy 10.0.0.0/8 ::1/128
+    }
+
+    pass method POST PUT PATCH DELETE
+    cache_key host path {geo}
+    cache_ttl default ttl 1m grace 1h
+
+    # Pass the cache status through to the front for observability.
+    header +cache_status X-Cache
+    # NOTE: with `tls off`, run cadish behind the LB only — its :80 serves traffic
+    # directly (no ACME challenge / HTTPS redirect). See docs/deployment.md.
+}

@@ -1,0 +1,102 @@
+{
+  "name": "26-origin-returned-5xx",
+  "cadishfile": "shop.example.com {\n    @api path /api/*\n    respond on_error @api 503 \"api maintenance\"\n    cache_key host path\n    cache_ttl status 404 410 ttl 60s grace 1h\n    cache_ttl status 200 ttl 1m grace 5m max_stale 24h\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/api/users" },
+      "origin": { "status": 503 },
+      "cacheStatus": "MISS",
+      "originFailed": true,
+      "outageStatus": 503,
+      "salvageable": true
+    },
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/api/users" },
+      "origin": { "status": 503 },
+      "cacheStatus": "MISS",
+      "originFailed": true,
+      "outageStatus": 503,
+      "salvageable": false
+    },
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/home" },
+      "origin": { "status": 500 },
+      "cacheStatus": "MISS",
+      "originFailed": true,
+      "outageStatus": 500,
+      "salvageable": false
+    },
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/home" },
+      "origin": { "status": 404 },
+      "cacheStatus": "MISS",
+      "originFailed": true,
+      "outageStatus": 404,
+      "salvageable": false
+    },
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/api/users" },
+      "origin": { "status": 404 },
+      "cacheStatus": "MISS",
+      "originFailed": true,
+      "outageStatus": 404,
+      "salvageable": false
+    },
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/home" },
+      "origin": { "status": 404 },
+      "cacheStatus": "MISS",
+      "originFailed": true,
+      "outageStatus": 404,
+      "salvageable": true
+    },
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/api/users" },
+      "origin": { "status": 403 },
+      "cacheStatus": "MISS",
+      "originFailed": true,
+      "outageStatus": 403,
+      "salvageable": true
+    },
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/api/users" },
+      "origin": { "status": 403 },
+      "cacheStatus": "MISS",
+      "originFailed": true,
+      "outageStatus": 403,
+      "salvageable": false
+    },
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/api/users" },
+      "origin": { "status": 429 },
+      "cacheStatus": "MISS",
+      "originFailed": true,
+      "outageStatus": 429,
+      "salvageable": false
+    },
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/api/users" },
+      "origin": { "status": 405 },
+      "cacheStatus": "MISS",
+      "originFailed": true,
+      "outageStatus": 405,
+      "salvageable": false
+    },
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/home" },
+      "origin": { "status": 403 },
+      "cacheStatus": "MISS",
+      "originFailed": true,
+      "outageStatus": 403,
+      "salvageable": false
+    },
+    {
+      "request": { "method": "GET", "host": "shop.example.com", "path": "/home" },
+      "origin": { "status": 429 },
+      "cacheStatus": "MISS",
+      "originFailed": true,
+      "outageStatus": 429,
+      "salvageable": false
+    }
+  ]
+}
