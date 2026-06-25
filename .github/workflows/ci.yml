@@ -75,7 +75,7 @@ jobs:
       - name: golangci-lint
         # v9 (Node 24) + golangci-lint v2, which is built with Go 1.26 — v1.64.8 (built with
         # Go 1.24) hard-errors on this module's go 1.26 directive (a dependency forces it).
-        uses: golangci/golangci-lint-action@db582008a42febd596419635a5abc9d9815daa9c # v9.2.1
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9.2.1
         with:
           version: v2.12.2
 
