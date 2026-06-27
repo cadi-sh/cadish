@@ -3,9 +3,9 @@ name: cadish
 description: cadish — single-binary HTTP cache server with TLS/ACME, load balancing, and Kubernetes ingress.
 type: application
 # Chart version — bump on chart changes.
-version: 0.2.0
+version: 0.2.1
 # The cadish release this chart deploys by default.
-appVersion: "0.2.0"
+appVersion: "0.2.1"
 home: https://cadi.sh
 sources:
   - https://github.com/cadi-sh/cadish
