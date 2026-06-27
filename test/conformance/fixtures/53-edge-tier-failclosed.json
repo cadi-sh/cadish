@@ -1,0 +1,5 @@
+{
+  "name": "53-edge-tier-failclosed",
+  "cadishfile": "example.com {\n    @ungreedy path_regex (?U)^/(live|stream)\n    edge {\n        worker w\n        kv     EDGE_CACHE\n        default local\n        skip @ungreedy\n    }\n    cache_key host path\n    cache_ttl default ttl 1h\n}",
+  "cases": []
+}

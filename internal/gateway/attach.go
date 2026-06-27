@@ -105,10 +105,14 @@ func attachedGateways(ls []httpListener) map[string]bool {
 }
 
 // effectiveHosts computes the site hostnames for a route given its attached listeners: the
-// route's hostnames constrained to the listeners' hostnames (intersection); when the route
-// declares no hostnames it inherits the listeners' concrete hostnames. A route with neither
-// a concrete hostname nor a concrete listener hostname is rejected (cadish renders one named
-// site per host).
+// route's hostnames intersected with the listeners' hostnames (the UNION over listeners of
+// each per-listener intersection); when the route declares no hostnames it inherits the
+// listeners' concrete hostnames. The intersection follows Gateway API semantics — an
+// unconstrained (empty-hostname) listener admits any route host as-is, a wildcard listener
+// admits a covered concrete route host (and vice versa: a wildcard ROUTE host is admitted by
+// a covered concrete LISTENER host), with the more-specific name winning. A route with
+// neither a concrete hostname nor a concrete listener hostname is rejected (cadish renders
+// one named site per host).
 func effectiveHosts(rt *gatewayv1.HTTPRoute, attached []httpListener) ([]string, []Reject) {
 	rk := routeKey(rt)
 	var rejects []Reject
@@ -127,40 +131,90 @@ func effectiveHosts(rt *gatewayv1.HTTPRoute, attached []httpListener) ([]string,
 		routeHosts = append(routeHosts, host)
 	}
 
-	listenerHosts := map[string]bool{}
-	listenerHasConstraint := false
+	// Partition the attached listeners: an unconstrained (empty-hostname) listener admits any
+	// host; the rest carry a hostname the route host must intersect.
+	var listenerHosts []string
+	hasUnconstrained := false
 	for _, l := range attached {
-		if l.hostname != "" {
-			listenerHosts[l.hostname] = true
-			listenerHasConstraint = true
+		if l.hostname == "" {
+			hasUnconstrained = true
+		} else {
+			listenerHosts = append(listenerHosts, l.hostname)
 		}
 	}
 
 	set := map[string]bool{}
 	switch {
-	case len(routeHosts) > 0 && listenerHasConstraint:
-		for _, h := range routeHosts {
-			if hostMatchesAny(h, listenerHosts) {
-				set[h] = true
+	case len(routeHosts) > 0:
+		// Per-listener intersection, unioned. An unconstrained listener admits each route host
+		// as itself (incl. a wildcard route host, which becomes a wildcard site); constrained
+		// listeners contribute the more-specific intersection name (so a wildcard route host
+		// meeting a concrete listener serves the concrete host, and vice versa).
+		for _, rh := range routeHosts {
+			if hasUnconstrained {
+				set[rh] = true
+				continue
+			}
+			for _, lh := range listenerHosts {
+				if eff, ok := intersectHost(rh, lh); ok {
+					set[eff] = true
+				}
 			}
 		}
 		if len(set) == 0 {
 			rejects = append(rejects, Reject{Kind: "HTTPRoute", Object: rk,
 				Reason: "no route hostname intersects an attached listener's hostname; route serves nothing"})
 		}
-	case len(routeHosts) > 0:
-		for _, h := range routeHosts {
-			set[h] = true
-		}
-	case listenerHasConstraint:
-		for h := range listenerHosts {
-			set[h] = true
+	case len(listenerHosts) > 0:
+		// Route declares no hostnames: inherit the listeners' concrete hostnames.
+		for _, lh := range listenerHosts {
+			set[lh] = true
 		}
 	default:
 		rejects = append(rejects, Reject{Kind: "HTTPRoute", Object: rk,
 			Reason: "route has no hostname and attaches only to listeners without a hostname; a named site is required"})
 	}
 	return sortedKeys(set), rejects
+}
+
+// intersectHost returns the effective hostname for one route host meeting one (non-empty)
+// listener host per Gateway API hostname intersection, and whether they intersect at all.
+// Equal names intersect to themselves; when exactly one side is a "*.suffix" wildcard that
+// covers the other, the concrete (more-specific) side wins; two wildcards intersect to the
+// more-specific of the two when one covers the other. Wildcard coverage reuses the same
+// suffix semantics as hostMatchesAny.
+func intersectHost(routeHost, listenerHost string) (string, bool) {
+	if routeHost == listenerHost {
+		return routeHost, true
+	}
+	rWild := strings.HasPrefix(routeHost, "*.")
+	lWild := strings.HasPrefix(listenerHost, "*.")
+	switch {
+	case lWild && !rWild:
+		if wildcardCovers(listenerHost, routeHost) {
+			return routeHost, true // concrete route host is more specific
+		}
+	case rWild && !lWild:
+		if wildcardCovers(routeHost, listenerHost) {
+			return listenerHost, true // concrete listener host is more specific
+		}
+	case rWild && lWild:
+		// Both wildcards: the one whose base falls under the other's suffix is more specific.
+		if wildcardCovers(listenerHost, routeHost[2:]) {
+			return routeHost, true
+		}
+		if wildcardCovers(routeHost, listenerHost[2:]) {
+			return listenerHost, true
+		}
+	}
+	return "", false
+}
+
+// wildcardCovers reports whether the "*.suffix" wildcard admits name (a concrete host, or a
+// more-specific name under the same suffix) — the same suffix match hostMatchesAny uses.
+func wildcardCovers(wild, name string) bool {
+	suffix := wild[1:] // ".suffix"
+	return strings.HasSuffix(name, suffix) && len(name) > len(suffix)
 }
 
 // hostMatchesAny reports whether host is admitted by the listener hostname set, honoring a

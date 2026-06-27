@@ -253,8 +253,10 @@ func TestSecurityCompileErrors(t *testing.T) {
 	}
 }
 
-// TestSecurityNotInEdgeIR verifies security rules + the ip matcher are NOT
-// projected into the edge IR (design §2.15: security is server-only).
+// TestSecurityNotInEdgeIR verifies the allow/deny SECURITY RULES are NOT projected into the
+// edge IR (design §2.15: security is server-only). The `ip` matcher IS now projected as a
+// SERVER-ONLY (`ip`) view (R02) — never with its IP/CIDR data — so the projector can fail
+// closed any directive that scopes it; but there is still no edge surface for allow/deny.
 func TestSecurityNotInEdgeIR(t *testing.T) {
 	p := compileSrc(t, `example.com {
 	@office ip 203.0.113.43/32
@@ -264,14 +266,16 @@ func TestSecurityNotInEdgeIR(t *testing.T) {
 	cache_ttl default ttl 60s
 }
 `)
-	// The `ip` matcher (server-only) must not appear in the projected matchers.
-	for name, em := range p.EdgeMatchers() {
-		if em.Kind == "ip" || em.Kind == "unknown" {
-			t.Errorf("ip / unknown matcher %q leaked into the edge IR (kind=%q)", name, em.Kind)
-		}
+	// The `ip` matcher projects as a SERVER-ONLY view carrying no IP/CIDR data.
+	em, ok := p.EdgeMatchers()["office"]
+	if !ok {
+		t.Fatal("the @office ip matcher must be projected (server-only) so an ip-scoped directive fails closed")
 	}
-	if _, ok := p.EdgeMatchers()["office"]; ok {
-		t.Error("the @office ip matcher must not be projected to the edge IR")
+	if em.Kind != "ip" {
+		t.Errorf("@office projected with kind=%q, want \"ip\"", em.Kind)
+	}
+	if len(em.Patterns) != 0 || em.Regex != "" || len(em.Values) != 0 {
+		t.Errorf("the projected `ip` matcher must carry no IP/CIDR data, got %+v", em)
 	}
 	// There is no edge projection for allow/deny rules at all — they are absent by
 	// construction (the projector never reads p.allowRules/p.denyRules).

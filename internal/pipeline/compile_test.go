@@ -29,6 +29,8 @@ func TestCompileErrors(t *testing.T) {
 		{"respond-bad-code", "x {\n respond /h abc OK\n}\n", "status must be a number"},
 		{"duplicate-matcher", "x {\n @m path /a/*\n @m path /b/*\n}\n", "duplicate matcher"},
 		{"purge-no-when", "x {\n purge header X-T t\n}\n", "when"},
+		{"redirect-extra-arg", "x {\n redirect ^/a$ 301 /b /c\n}\n", "extra"},
+		{"redirect-scoped-extra-arg", "x {\n @s host_regex ^s\n redirect @s ^/a$ 301 /b /c\n}\n", "extra"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

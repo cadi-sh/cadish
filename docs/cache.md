@@ -31,6 +31,23 @@ Reads check **RAM first, then disk** and return the first hit. `GetTier` also
 reports which tier served the hit (`"ram"` / `"disk"` / `""`) for per-tier
 hit-rate metrics.
 
+> **RAM-only gotcha — chunked / unknown-length responses need a disk tier.** A
+> **RAM-only** cache (`cache { ram … }` with **no** `disk` tier, so the disk budget
+> is `0`) only stores objects routing rule 1 or 2 sends to RAM: **always-RAM
+> extensions** and **other objects with a known `Content-Length` `<=
+> SmallObjectThreshold`**. Rule 3 — **unknown-length (chunked / streamed, i.e.
+> `Content-Length: -1`) or large objects** — routes to the disk tier, which on a
+> RAM-only deployment has zero budget, so those responses are **cached nowhere and
+> stream through uncached**. A dynamic origin that replies with `Transfer-Encoding:
+> chunked` therefore gets **zero caching** on a RAM-only cadish. Correctness is
+> unaffected (clients still get the right bytes), but it is easy to miss. To detect
+> it, watch the **`DiskNoTierDiscards`** stat (a throttled log line — *"RAM-only
+> deployment has no disk tier for this object"* — is emitted as well). To fix it,
+> add a `disk` tier so unknown-length/large objects have a home, or make the origin
+> send a small `Content-Length` so the response can live in RAM. (This is distinct
+> from `DiskOversizeDiscards`, which counts objects too big for a *configured* disk
+> tier — there the fix is raising the disk budget.)
+
 ## Sharding and eviction
 
 Each tier is split into up to **64 independent shards** (fewer for small/test
@@ -155,6 +172,8 @@ type Stats struct {
     RAMMaxBytes             int64
     DiskMaxBytes            int64
     DiskPersistErrors       int64
+    DiskOversizeDiscards    int64 // object too big for a configured disk tier
+    DiskNoTierDiscards      int64 // RAM-only: chunked/large object had no tier to land in
 }
 
 var ErrNotFound = errors.New("cache: not found")

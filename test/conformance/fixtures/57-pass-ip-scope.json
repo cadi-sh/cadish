@@ -1,0 +1,5 @@
+{
+  "name": "57-pass-ip-scope",
+  "cadishfile": "example.com {\n    @internal ip 10.0.0.0/8\n    pass @internal\n    cache_key host path\n    cache_ttl default ttl 1h\n}",
+  "cases": []
+}

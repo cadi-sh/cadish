@@ -85,6 +85,15 @@ type Config struct {
 	// the run command merges into this field before constructing the server.
 	ProxyProtocol *ProxyProtocolConfig
 
+	// Server is the parsed global `server { maxconn N; read_timeout D; idle_timeout D }`
+	// block (the inbound data-plane connection knobs), or NIL when absent (the common
+	// case). When set, the server overrides its hardcoded inbound http.Server timeouts
+	// from the non-zero fields and wraps the public listener(s) with a LimitListener
+	// when maxconn>0. When nil, the shipped default constants apply and no limiter is
+	// installed (zero cost). It governs the data plane only — the admin server keeps
+	// its own configuration.
+	Server *ServerConfig
+
 	// tempDirs are scratch directories created to back the disk tier of RAM-only
 	// caches (the disk tier always needs a directory even when its budget is 0).
 	// Close removes them.
@@ -256,6 +265,28 @@ type Site struct {
 	// well-named seam (clusterRoute) and the read-through PeerOrigin is already
 	// composed before the real origin in this site's Origin chain.
 	Cluster *cluster.Membership
+
+	// cacheKeyFP fingerprints the directives that define this site's CACHE-KEY
+	// namespace — the `cache_key` recipe plus every block its tokens can reference
+	// (`normalize`, `classify`, `tenant`, `device_detect`, `geo`). It gates the warm
+	// store transplant across a reload (TransplantStoresFrom): if a site's key scheme
+	// CHANGED, the old store's entries are keyed under the OLD recipe, so reusing it
+	// could serve a wrong (cross-content) object for a key that now means something
+	// else. When the fingerprint differs the store is NOT transplanted — the reload
+	// starts a cold store for that site (a fail-safe flush) instead of serving wrong.
+	// An UNCHANGED key scheme keeps the warm store (the common case; hit ratio
+	// preserved). Computed once at build (buildSite); compared by primary host on reload.
+	cacheKeyFP string
+
+	// PoolHealthy resolves an upstream POOL name to its current liveness (≥1 backend
+	// up, lb nbsrv()>0) for the `upstream_healthy NAME…` matcher (the AWS health probe).
+	// It is built ONLY when the site's pipeline references the matcher (gated by
+	// Pipeline.NeedsPoolHealth) — NIL on every other site, so the request fast path pays
+	// nothing. The server injects it into Request.PoolHealthy before EvalRequest. It reads
+	// this site's Origins map at CALL time, so it always resolves to the LIVE pool after a
+	// reload pool transplant (which repoints Origins in place); a name that is not a pool
+	// resolves false (fail-closed).
+	PoolHealthy func(name string) bool
 }
 
 // LoadOptions tunes Load behavior with knobs that come from run-time flags rather
@@ -361,13 +392,21 @@ func loadFromSource(name, src, baseDir string, opts LoadOptions) (*Config, error
 		return nil, err
 	}
 
+	// Parse the optional global `server { … }` block: the inbound data-plane
+	// connection knobs (maxconn + read/idle timeouts). OFF by default (nil) — the
+	// hardcoded default constants then apply (zero cost when absent).
+	serverOpts, err := serverConfigFromFile(file)
+	if err != nil {
+		return nil, err
+	}
+
 	// Expand any `group { … }` site-groups into one site per tenant (V2d).
 	sites, err := cadishfile.ExpandGroups(file.Sites)
 	if err != nil {
 		return nil, err
 	}
 
-	cfg := &Config{Admin: admin, Security: security, AccessLogOff: accessLogOff, StrictHost: strictHost, ProxyProtocol: proxyProto, ConfigPath: name, kubeconfig: opts.Kubeconfig, injectedResolver: opts.EndpointResolver}
+	cfg := &Config{Admin: admin, Security: security, AccessLogOff: accessLogOff, StrictHost: strictHost, ProxyProtocol: proxyProto, Server: serverOpts, ConfigPath: name, kubeconfig: opts.Kubeconfig, injectedResolver: opts.EndpointResolver}
 	for _, site := range sites {
 		rs, tlsCfg, err := cfg.buildSite(site, baseDir)
 		if err != nil {
@@ -460,12 +499,16 @@ func (c *Config) buildSite(site *cadishfile.Site, baseDir string) (*Site, tlsacm
 	// TLS config from the site's `tls` directive (soft warnings are ignored here;
 	// `cadish check` surfaces them).
 	tlsCfg, _ := tlsacme.SiteConfigFromSite(spliced)
+	// Hand the site's trust_proxy set to the TLS layer so the :80 HTTP→HTTPS redirect
+	// loop guard honors `X-Forwarded-Proto: https` only from a trusted socket peer
+	// (WS-B / R15 — the single trust-boundary policy, ADR D95).
+	tlsCfg.TrustedProxies = trustedProxies
 
 	name := ""
 	if len(spliced.Addresses) > 0 {
 		name = spliced.Addresses[0]
 	}
-	return &Site{
+	out := &Site{
 		Addresses:           spliced.Addresses,
 		Name:                name,
 		Pipeline:            p,
@@ -480,7 +523,48 @@ func (c *Config) buildSite(site *cadishfile.Site, baseDir string) (*Site, tlsacm
 		geoDBs:              geoDBs,
 		TrustedProxies:      trustedProxies,
 		Cluster:             membership,
-	}, tlsCfg, nil
+		cacheKeyFP:          cacheKeyFingerprint(spliced),
+	}
+	// `upstream_healthy` matcher seam (HEALTH): build a name→liveness resolver ONLY when
+	// the pipeline references the matcher, keeping the resolver nil (zero cost) otherwise.
+	// It closes over the Origins map (mutated in place by a reload pool transplant), so it
+	// resolves the LIVE pool at request time; a non-pool name fails closed.
+	if p.NeedsPoolHealth() {
+		out.PoolHealthy = poolHealthResolver(out.Origins)
+	}
+	return out, tlsCfg, nil
+}
+
+// poolHealthResolver returns a name→liveness function for the `upstream_healthy`
+// matcher. It reads origins at CALL time so a reload pool transplant (which repoints
+// Origins in place) is reflected. The three cases:
+//
+//   - the name is an lb.Upstream pool → report its AnyHealthy() (nbsrv()>0), the live
+//     health-FSM view;
+//   - the name is a KNOWN non-pool origin (a trivial single-backend httporigin, an
+//     s3/sign/chain origin) → report HEALTHY. Such an origin has no health FSM to
+//     consult — there is nothing to actively probe — so "live" is the only honest
+//     answer: it exists and is being served. Returning false here was R03: a trivial
+//     `upstream foo { to … }` referenced by `upstream_healthy foo` answered 503
+//     FOREVER (the single-backend probe `respond @probe @live 200 / respond @probe 503`),
+//     which an L4/DNS LB reads as "eject this node" — a self-inflicted outage. (A
+//     single backend the operator wants ACTIVELY probed becomes a real pool the moment
+//     it carries a `health { … }` block; `cadish check` warns when the name can't carry
+//     pool health — see detectUpstreamHealthyNonPool.)
+//   - the name is UNKNOWN (never declared) → false, fail-closed. Compile already
+//     rejects an undeclared upstream_healthy name (validateUpstreamHealthy), so this is
+//     belt-and-suspenders.
+func poolHealthResolver(origins map[string]origin.Origin) func(name string) bool {
+	return func(name string) bool {
+		o, ok := origins[name]
+		if !ok {
+			return false // unknown name: fail closed
+		}
+		if up, ok := o.(*lb.Upstream); ok {
+			return up.AnyHealthy() // a real pool: ask the health FSM
+		}
+		return true // a known non-pool origin has no FSM — treat it as live
+	}
 }
 
 // Start launches background workers for every lb.Upstream (active health probing
@@ -580,6 +664,23 @@ func (c *Config) TransplantStoresFrom(old *Config) {
 		if prev == nil || prev.Store == nil || s.Store == nil || prev.Store == s.Store {
 			continue
 		}
+		// Fail-safe against a cross-content wrong-object serve: only carry the warm store
+		// when the site's CACHE-KEY namespace is unchanged. If the `cache_key` recipe (or a
+		// block its tokens reference) changed, the old store's entries are keyed under the
+		// OLD recipe — reusing them could serve a wrong object for a key that now addresses
+		// different content (e.g. `cache_key host path` -> `cache_key host url`, where a
+		// query-less /p collides with a stored /p?x=1). Keep the freshly-built cold store
+		// instead (a flush for that site); the old store is closed with the old config.
+		//
+		// The cold store, opened on the SAME disk path, has already RELOADED the previous
+		// run's on-disk blobs (load() re-homes the persisted index), which are likewise
+		// keyed under the OLD recipe. Reset() drops them (and persists an emptied index) so
+		// a colliding new-recipe key cannot HIT a stale blob from the disk tier — the flush
+		// is genuine, not just a RAM-tier cold start.
+		if prev.cacheKeyFP != s.cacheKeyFP {
+			s.Store.Reset()
+			continue
+		}
 		cold := s.Store
 		s.Store = prev.Store // serve from the warm store; preserve the hit ratio
 		if d := cold.DiskDir(); d != "" {
@@ -599,6 +700,98 @@ func (c *Config) TransplantStoresFrom(old *Config) {
 		kept = append(kept, d)
 	}
 	c.tempDirs = kept
+}
+
+// willTransplantStore reports whether TransplantStoresFrom will carry old's warm store
+// (prev.Store) onto the new site s: the sites matched by primary host (prev != nil),
+// both have a store, the instances differ (a real carry, not the same object), AND the
+// cache-key fingerprint is unchanged — otherwise TransplantStoresFrom FLUSHES s's cold
+// store instead of carrying the warm one. It is the single predicate both
+// TransplantStoresFrom's carry branch and CacheBudgetChanges key on, so the warning
+// fires for EXACTLY the sites whose store is reused as-is.
+func willTransplantStore(prev, s *Site) bool {
+	return prev != nil && prev.Store != nil && s.Store != nil &&
+		prev.Store != s.Store && prev.cacheKeyFP == s.cacheKeyFP
+}
+
+// CacheBudgetChange describes one surviving site whose NEW cache budget or disk path
+// differs from the warm store carried across a reload. cache.Store has NO live resize,
+// so the change is silently a no-op until a full restart: the OLD store (old RAM/disk
+// budget, old path) keeps serving. The reload path surfaces this as a WARNING so an
+// operator who "resized the cache" and reloaded is not misled into thinking it applied.
+type CacheBudgetChange struct {
+	Host    string   // the surviving site's primary host
+	Details []string // per-field diffs, e.g. "ram 67108864B->134217728B", `disk_path "/a"->"/b"`
+}
+
+// CacheBudgetChanges reports, for every site that SURVIVES a reload from old onto c
+// (matched by primary host with an UNCHANGED cache-key fingerprint — i.e. exactly the
+// sites whose warm store TransplantStoresFrom carries over), whether the new RAM budget,
+// disk budget or disk PATH differs from the running store. Because the warm store is
+// transplanted as-is and cache.Store has no live resize, such a difference NEVER takes
+// effect until restart, so ApplyConfig logs it. A site whose fingerprint CHANGED is not
+// reported: its store is flushed and the freshly-built cold store (new budget/path) is
+// used, so the change DOES apply. A scratch temp dir (a site with no `disk` directive)
+// is treated as "no configured path" on both sides, so a per-reload random temp dir is
+// never mistaken for a path change.
+//
+// Call it BEFORE TransplantStoresFrom, which overwrites c.Sites' Store with old's warm
+// store (after which the cold budget/path is no longer observable).
+func (c *Config) CacheBudgetChanges(old *Config) []CacheBudgetChange {
+	oldByHost := make(map[string]*Site, len(old.Sites))
+	for _, s := range old.Sites {
+		oldByHost[primaryHost(s)] = s
+	}
+	oldTemp := tempDirSet(old.tempDirs)
+	newTemp := tempDirSet(c.tempDirs)
+	var out []CacheBudgetChange
+	for _, s := range c.Sites {
+		prev := oldByHost[primaryHost(s)]
+		if !willTransplantStore(prev, s) {
+			continue
+		}
+		oldStats := prev.Store.Stats()
+		newStats := s.Store.Stats()
+		oldPath := configuredDiskDir(prev.Store, oldTemp)
+		newPath := configuredDiskDir(s.Store, newTemp)
+		var d []string
+		if oldStats.RAMMaxBytes != newStats.RAMMaxBytes {
+			d = append(d, fmt.Sprintf("ram %dB->%dB", oldStats.RAMMaxBytes, newStats.RAMMaxBytes))
+		}
+		if oldStats.DiskMaxBytes != newStats.DiskMaxBytes {
+			d = append(d, fmt.Sprintf("disk %dB->%dB", oldStats.DiskMaxBytes, newStats.DiskMaxBytes))
+		}
+		if oldPath != newPath {
+			d = append(d, fmt.Sprintf("disk_path %q->%q", oldPath, newPath))
+		}
+		if len(d) > 0 {
+			out = append(out, CacheBudgetChange{Host: primaryHost(s), Details: d})
+		}
+	}
+	return out
+}
+
+// tempDirSet indexes a config's scratch temp dirs for O(1) membership.
+func tempDirSet(dirs []string) map[string]bool {
+	if len(dirs) == 0 {
+		return nil
+	}
+	m := make(map[string]bool, len(dirs))
+	for _, d := range dirs {
+		m[d] = true
+	}
+	return m
+}
+
+// configuredDiskDir returns st's disk directory unless it is a scratch temp dir (a site
+// with no `disk` directive, whose dir is a per-load random path), in which case "" — so
+// the absence of a configured disk path is not mistaken for a path CHANGE on reload.
+func configuredDiskDir(st *cache.Store, temp map[string]bool) string {
+	d := st.DiskDir()
+	if temp[d] {
+		return ""
+	}
+	return d
 }
 
 // TransplantPoolsFrom moves UNCHANGED lb pools from old onto c (the freshly loaded

@@ -1,0 +1,148 @@
+{
+  "irVersion": 6,
+  "site": {
+    "hosts": [
+      "example.com"
+    ],
+    "redirectHosts": [
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "__edge.classify.loyal.0.0": {
+      "kind": "cookie",
+      "name": "loyalty",
+      "values": [
+        "gold"
+      ]
+    },
+    "premium": {
+      "kind": "cookie",
+      "name": "premium",
+      "values": [
+        "1"
+      ]
+    }
+  },
+  "classifiers": {
+    "loyal": {
+      "rows": [
+        {
+          "conj": [
+            "__edge.classify.loyal.0.0"
+          ],
+          "value": "g"
+        }
+      ],
+      "default": "z",
+      "derivesFrom": [
+        "loyalty"
+      ],
+      "derivesForward": [
+        "loyalty"
+      ]
+    },
+    "tier": {
+      "rows": [
+        {
+          "conj": [
+            "premium"
+          ],
+          "value": "p"
+        }
+      ],
+      "default": "f",
+      "derivesFrom": [
+        "premium"
+      ]
+    }
+  },
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "url"
+      },
+      {
+        "kind": "classify",
+        "ref": "loyal"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "names": [
+            "premium"
+          ]
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "url"
+          },
+          {
+            "kind": "classify",
+            "ref": "tier"
+          }
+        ]
+      },
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "url"
+          },
+          {
+            "kind": "classify",
+            "ref": "loyal"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache"
+  },
+  "cookieAllow": [
+    "loyalty",
+    "premium"
+  ],
+  "cookieAllowSet": true,
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

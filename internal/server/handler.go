@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/textproto"
 	"net/url"
 	"path"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cadi-sh/cadish/internal/cache"
+	"github.com/cadi-sh/cadish/internal/cluster"
 	"github.com/cadi-sh/cadish/internal/config"
 	"github.com/cadi-sh/cadish/internal/geo"
 	"github.com/cadi-sh/cadish/internal/lb"
@@ -59,6 +61,11 @@ func (b *boundSite) rateLimitKey(key string) string {
 type reqInfo struct {
 	cacheStatus string // HIT / MISS / HIT-STALE / PASS / "" (error before classify)
 	upstream    string
+	// upgraded marks a request served as a connection-upgrade (WebSocket) tunnel. The
+	// tunnel is long-lived and bidirectional, so its wall time does NOT belong in the
+	// request-latency histogram (it would skew p50/p99); the access log still records
+	// it, and the dedicated upgrades-active gauge tracks the live count instead.
+	upgraded bool
 	// tr is the per-request transaction-trace record (nil when tracing is off, in
 	// which case every hook on it is a no-op). It rides on reqInfo so the deep
 	// serve helpers can record their decisions without a signature change. See
@@ -95,10 +102,42 @@ func canonicalizeRequestCookies(h http.Header) {
 	h["Cookie"] = []string{strings.Join(lines, "; ")}
 }
 
+// readyzPath is the reserved warm-readiness probe path. The whole "/.cadish/" prefix is
+// reserved for cadish infra endpoints, so a global intercept at the very top of ServeHTTP
+// cannot collide with operator routing/config — making the probe Host-agnostic and safe.
+const readyzPath = "/.cadish/readyz"
+
+// serveReadyz answers the reserved warm-readiness probe. It is a Host-agnostic INFRA
+// probe, not data-plane traffic: ServeHTTP intercepts it before site selection, the
+// security gate, the `ip` ACL, rate-limit, the cache, and the access log + trace — so it
+// never hits an origin, is never gated by a deny ACL, and is never logged as a request.
+// warm==true → 200 "ok\n"; warm==false → 503 "warming\n". It is lock-free (one atomic
+// read) and allocation-free beyond the constant body. ANY method is accepted (Kubernetes
+// probes use GET, but an infra probe must not 405).
+func (h *Handler) serveReadyz(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if h.warm.Load() {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok\n")
+		return
+	}
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = io.WriteString(w, "warming\n")
+}
+
 // ServeHTTP implements the cadish request lifecycle: site selection, EvalRequest
 // (respond/purge/pass/key), LOOKUP (fresh/stale/miss), ORIGIN (coalesced fetch +
 // serve-and-cache), and DELIVER (header ops, cache-status).
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Reserved warm-readiness probe (Kubernetes controllers): intercepted at the VERY
+	// top — before site selection, the security gate, the `ip` ACL, rate-limit, the
+	// cache, and the access log/trace — because it is an infra probe, not traffic. It
+	// answers for ANY method and ANY Host and never touches an origin. See serveReadyz.
+	if r.URL.Path == readyzPath {
+		h.serveReadyz(w)
+		return
+	}
+
 	start := h.now()
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	info := &reqInfo{}
@@ -152,6 +191,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		writeStatus(rec, status, "no site configured for host")
 		return
+	}
+
+	// TRUST-BOUNDARY STRIP for the cluster hop header (WS-B / R10). X-Cadish-Peer is an
+	// INTER-NODE loop guard (a peer stamps it before forwarding so the receiving peer
+	// serves locally and does not re-forward); it is NEVER a client header. The guard is
+	// read both here (owner-route, clusterRoute) and on the read-through path
+	// (peerorigin, via the buildOriginHeader copy of r.Header), so a client that forged
+	// `X-Cadish-Peer: <region>` could suppress a peer fetch wholesale — a peer-cache
+	// bypass + origin-load amplification (DoS lever), and a guessable region poisons
+	// owner routing. Honor it ONLY when the immediate socket peer is a trusted
+	// proxy/peer (the SAME geo.PeerTrusted gate as XFF/geo headers — the single WS-B
+	// trust boundary, ADR D95); from any untrusted/direct peer strip it so the request
+	// is treated as a fresh client request. With no trust_proxy configured the peer is
+	// never trusted, so a cluster deployment must declare its peer network via
+	// `trust_proxy` for the loop guard to be honored (docs/cadishfile-reference.md).
+	// The OUTBOUND stamping (proxyToPeer / peerorigin) happens on freshly built headers
+	// after this strip, so legitimate inter-node forwarding is unaffected.
+	if site.Cluster != nil && r.Header.Get(cluster.HopHeader) != "" &&
+		!geo.PeerTrusted(r.RemoteAddr, site.TrustedProxies) {
+		r.Header.Del(cluster.HopHeader)
 	}
 
 	// Optional request-body cap (DoS): when an operator set MaxRequestBodyBytes, wrap
@@ -297,7 +356,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// controlled cookies. Stripping the rest (incl. any session) is what makes caching the
 	// cookie-bearing request safe. preq.Header is r.Header, so the forwarded origin request
 	// inherits the filtered Cookie too.
-	if filtered, active := site.Pipeline.FilterRequestCookies(r.Header.Get("Cookie")); active {
+	//
+	// Snapshot the ORIGINAL client Cookie BEFORE this (the FIRST cookie mutation) and the
+	// COOKIE-NORM derives_from strip further down (Finding 1 + SPEC-PASS-FORWARDS-COOKIES).
+	// Every UNCACHED path — the genuine-upgrade tunnel AND the plain pass / credential-bypass
+	// path — runs OFF the cache entirely (it never uses rd.CacheKey), so both strips (pure
+	// cache-key normalizations) are useless AND harmful for it: a WebSocket / socket.io
+	// handshake, or a `pass`ed per-user endpoint (`/me`, account, cart), must reach the
+	// upstream carrying the user's session cookie or it is rejected as anonymous (a logged-in
+	// user read as GUEST). serveUpgrade and the pass branch restore this value onto the
+	// OUTBOUND origin request via restoreClientCookie; the CACHEABLE path keeps the
+	// filtered/stripped cookie (so the cache-key collapse holds). This reuses the same
+	// Header.Get the filter already performs — zero extra cost.
+	origClientCookie := r.Header.Get("Cookie")
+	if filtered, active := site.Pipeline.FilterRequestCookies(origClientCookie); active {
 		if filtered == "" {
 			r.Header.Del("Cookie")
 		} else {
@@ -308,9 +380,43 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// geo pre-pass for the cache key / `geo` matchers in EvalRequest. Idempotent:
 	// a no-op when the security gate above already resolved geo for its matcher.
 	resolveGeo()
+	// upstream_healthy probe seam (HEALTH): inject the site's name→pool-liveness view so
+	// an `upstream_healthy NAME…` matcher (the AWS /aws-health-check probe) can answer
+	// 200/503 off live lb state — only when the pipeline references it (NeedsPoolHealth),
+	// so the fast path is untouched on every other site. site.PoolHealthy is non-nil iff
+	// the matcher is present; left nil the matcher fails closed.
+	if site.Pipeline.NeedsPoolHealth() {
+		preq.PoolHealthy = site.PoolHealthy
+	}
 	rd := site.Pipeline.EvalRequest(preq)
 	info.tr.recv(rd)         // RECV decision: route/pass/respond/purge + req-header ops
 	info.tr.key(rd.CacheKey) // KEY: computed cache key
+
+	// COOKIE-NORM derive→strip: AFTER the cache key is captured (rd.CacheKey above, built
+	// from the ORIGINAL cookies the derives_from axis read) but BEFORE the credential
+	// bypass (BypassForCredentials, below) and the origin fetch, strip the cookies the
+	// ACTIVE `derives_from` axes consume. Because they are then absent, the credential
+	// check sees no per-user cookie (so it does not bypass) and the origin receives an
+	// anonymous request (Varnish's `unset req.http.Cookie` after deriving VARY-*), so the
+	// per-user reply collapses onto the normalized (shared) key. preq.Header IS r.Header,
+	// so the forwarded origin request inherits the strip. Gated on HasDerivesFrom so a
+	// site without the feature is byte-for-byte unchanged here.
+	//
+	// Snapshot the ORIGINAL Cookie header BEFORE the strip, but ONLY for an unsafe method
+	// (Finding 4): the §4.4 sibling-GET invalidation below re-evaluates the request as a
+	// GET to derive the key the real GET stored under. Under an UNSCOPED derives_from
+	// recipe that axis reads a cookie the strip is about to remove — so without the
+	// original Cookie the sibling key collapses to the classifier default and the WRONG
+	// key is forgotten. GET/HEAD never reach §4.4, so they pay nothing.
+	var origCookie string
+	if !isSafeMethod(r.Method) {
+		origCookie = preq.Header.Get("Cookie")
+	}
+	if site.Pipeline.HasDerivesFrom() {
+		if site.Pipeline.StripDerivedCookies(preq) {
+			info.tr.note("COOKIE-NORM", "stripped derives_from cookies post-key")
+		}
+	}
 
 	// respond: synthetic short-circuits cache + origin.
 	if rd.Synthetic != nil {
@@ -373,6 +479,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// upgrade: a GENUINE connection-upgrade (WebSocket / `Connection: Upgrade`) request
+	// on a route that opted in via `upgrade @scope` is TUNNELLED — a NEW server path
+	// that bypasses LOOKUP/ORIGIN/cache and the Origin fetch interface entirely. The
+	// global hopByHop strip / buildOriginHeader stay UNTOUCHED (no header smuggling on
+	// the normal path); only this tunnel path forwards the upgrade headers, via the
+	// ReverseProxy. A non-upgrade request on an upgrade route is NOT tunnelled — it
+	// falls through to the plain pass path below (rd.Upgrade implies rd.Pass).
+	if rd.Upgrade && isUpgradeRequest(r) {
+		h.serveUpgrade(rec, r, site, preq, rd, origClientCookie, info)
+		return
+	}
+
 	// SAFE BY DEFAULT (security, AUTH-LEAK/COOKIE-LEAK): an explicit `pass` rule OR a
 	// request carrying a credential the cache key does not cover (Authorization, or a
 	// Cookie not exempted by `cookie_allow` — see BypassForCredentials) bypasses the
@@ -381,11 +499,56 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// does NOT lift this — only keying by the credential, or `cookie_allow`-controlling the
 	// cookie, does. Applied here (not in EvalRequest) so the portable pipeline decision stays
 	// unchanged; the edge worker enforces the same rule.
-	if rd.Pass || site.Pipeline.BypassForCredentials(preq) {
+	// cache_credentialed (D101): a request matching a `cache_credentialed @scope` makes
+	// caching ORIGIN-AUTHORITATIVE — the request-time credential bypass is SKIPPED (the
+	// response rules decide cacheability) and the original cookies are forwarded to origin
+	// for auth. Computed once here; zero cost on a site without the directive (the call
+	// short-circuits on an empty rule set). An explicit `pass` still wins (the operator said
+	// pass) — cache_credentialed only overrides the implicit credential bypass.
+	credentialed := site.Pipeline.CacheCredentialedMatches(preq)
+	if rd.Pass || (!credentialed && site.Pipeline.BypassForCredentials(preq)) {
 		info.cacheStatus = "PASS"
 		info.tr.lookup("PASS (bypass cache)")
+		// SPEC-PASS-FORWARDS-COOKIES: a passed (uncached) request forwards the ORIGINAL,
+		// pre-filter client Cookie to the origin. cookie_allow / derives_from stripped
+		// r.Header's Cookie purely to normalize the CACHE KEY — but this path never consults
+		// rd.CacheKey (we pass key=""), so that strip has no caching benefit and only harms
+		// the backend (a `pass`ed /me would arrive anonymous → logged-in user read as GUEST).
+		// Restoring here mirrors what serveUpgrade already does for the tunnel. SAFE: a passed
+		// response is NEVER stored (store=false below), so forwarding the per-user cookie
+		// cannot contaminate a shared cache entry — the same reason the tunnel does it. Done
+		// ONLY on this uncached branch; the cacheable path below keeps the stripped cookie so
+		// the key + COOKIE-NORM collapse stays intact. A cookieless client synthesizes none.
+		restoreClientCookie(r.Header, origClientCookie)
 		h.serveOrigin(rec, r, site, preq, rd, "", false, pipeline.CacheStatusMiss, info)
 		return
+	}
+
+	// cache_credentialed (D101): the credential bypass was SKIPPED above. The per-user routes
+	// still need the ORIGINAL client cookies to authenticate, but the request's DECISION phases
+	// — EvalResponse and its cache_ttl / Vary / scope matchers — MUST evaluate the NORMALIZED
+	// request, exactly like the edge worker (edge/runtime/entry.js). We therefore do NOT restore
+	// the cookie onto r.Header / preq.Header (the header EvalResponse reads); instead we carry
+	// the original cookie to ORIGIN ONLY via an origin-bound request-header op, mirroring the
+	// edge's reqHeaderOp. buildOriginHeader applies rd.ReqHeaderOps to the cloned, origin-bound
+	// header on EVERY origin fetch for this request (foreground, coalesced, hit-for-miss, and the
+	// background grace revalidation), so the per-user routes still authenticate while the
+	// decision phases see only the controlled cookies.
+	//
+	// Why this matters: with a cookie normalizer (cookie_allow) AND a cookie-dependent in-scope
+	// cache_ttl signal selector, restoring the original cookie onto preq.Header before
+	// EvalResponse made a response-phase matcher fire on a cookie the normalizer stripped — so a
+	// per-user body was stored under the SHARED key and served cross-user (a server-only
+	// over-cache the edge never had). Forwarding origin-only via the header op closes that gap.
+	//
+	// SAFE: the cache key is already fixed (rd.CacheKey, built from the normalized request) and
+	// the entry stays under that SHARED, credential-free key — the forwarded cookie reaches only
+	// the origin/peer, never the key. The op is prepended so an explicit `header_up Cookie` rule
+	// still wins (the previous restoreClientCookie was likewise overridden by rd.ReqHeaderOps).
+	// The cluster owner-routing peer hop is handled separately (it copies r.Header, not
+	// rd.ReqHeaderOps): origClientCookie is threaded into proxyToPeer below.
+	if credentialed {
+		rd.ReqHeaderOps = prependCookieOp(rd.ReqHeaderOps, origClientCookie)
 	}
 
 	key := rd.CacheKey
@@ -397,7 +560,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Returns true when it fully handled the request. Gated by site.Cluster != nil —
 	// a non-clustered cadish never enters here (zero cost). Read-through (#7) is NOT
 	// here: it runs via the origin chain on a local miss.
-	if site.Cluster != nil && h.clusterRoute(rec, r, site, preq.Path, info) {
+	if site.Cluster != nil && h.clusterRoute(rec, r, site, preq.Path, info, credentialed, origClientCookie) {
 		info.tr.note("CLUSTER", "routed to peer owner")
 		return
 	}
@@ -420,7 +583,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// only affects what we store, which the safe-method/cacheability gates handle.)
 	// The check is a cheap header-presence scan: a request with neither header pays
 	// almost nothing on the hot HIT path.
-	if clientForcesRevalidate(r.Header) {
+	//
+	// `client_cache_control ignore` (site-level) opts OUT of honoring this: the server
+	// then serves the fresh/stale entry as normal and the client cannot force a MISS —
+	// the equivalent of Varnish's `unset req.http.Cache-Control`, closing the cache-bust
+	// / DoS vector of a browser hard-refresh (max-age=0) forcing a MISS on every reload.
+	// When the flag is set the header scan is SKIPPED ENTIRELY (short-circuit, zero cost);
+	// when unset (the default) behavior is byte-for-byte unchanged. This ONLY suppresses
+	// the CLIENT-forced revalidation — normal TTL/grace revalidation below and all
+	// Set-Cookie / credential / no-store / unsafe-method safety are untouched.
+	if !site.Pipeline.IgnoreClientRevalidation() && clientForcesRevalidate(r.Header) {
 		info.tr.lookup("CLIENT no-cache -> REVALIDATE (origin)")
 		h.serveMiss(rec, r, site, preq, rd, key, info)
 		return
@@ -446,7 +618,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// nothing.
 	if !isSafeMethod(r.Method) {
 		info.tr.lookup("UNSAFE METHOD -> ORIGIN (not served from cache)")
-		getKey := h.siblingGetKey(site, preq, key)
+		getKey := h.siblingGetKey(site, preq, key, origCookie)
+		// SPEC-PASS-FORWARDS-COOKIES (Finding 2): this uncached unsafe-method write runs
+		// off the cache (never stored — doStore is gated on isSafeMethod), so the
+		// COOKIE-NORM / cookie_allow strip that normalized r.Header's Cookie for the cache
+		// KEY has no caching benefit here and only harms the backend — a PUT/POST carrying
+		// a normalized identity cookie would otherwise arrive anonymous. Restore the
+		// ORIGINAL client cookie before the origin fetch, mirroring the pass branch above.
+		// siblingGetKey above is unaffected (it snapshots cookies via its own cloned
+		// header). SAFE: the response is never stored, so the per-user cookie cannot
+		// contaminate a shared cache entry.
+		restoreClientCookie(r.Header, origClientCookie)
 		h.serveMiss(rec, r, site, preq, rd, key, info)
 		// A 4xx/5xx is NOT a success and must not invalidate (the write didn't land);
 		// only a 2xx/3xx does. rec.status holds the status actually written to the client.
@@ -566,11 +748,21 @@ func (h *Handler) serveFromCache(rec *statusRecorder, r *http.Request, site *bou
 	// otherwise present). storedAt takes a shared RLock and is a no-op miss for an
 	// evicted/HFM key.
 	now := h.now()
-	hdr.Set("Date", now.UTC().Format(http.TimeFormat))
+	hdr.Set("Date", h.httpDate(now))
 	if st, ok := h.fresh.storedAt(key); ok {
 		if age := int64(now.Sub(st).Seconds()); age >= 0 {
 			hdr.Set("Age", strconv.FormatInt(age, 10))
 		}
+	}
+	// Replay cadish's OWN freshness (R13): serveFromCache copies no origin headers, so
+	// without this a HIT would carry a Last-Modified but no Cache-Control and a downstream
+	// cache would apply heuristic freshness (possibly beyond the operator's TTL). Emit the
+	// operator-authoritative max-age so HIT and MISS advertise the SAME freshness. Done
+	// BEFORE applyDeliver so an explicit `header Cache-Control …` directive overrides it.
+	if lt, ok := h.fresh.lifetime(key); ok {
+		// ForcedPrivate: a cache_unsafe-forced store of a private/no-store/no-cache origin
+		// response must advertise `private, max-age=N` downstream, never `public` (R13/D96).
+		setSharedFreshness(hdr, lt, reader.Meta.ForcedPrivate)
 	}
 	transforms, enc := h.applyDeliver(hdr, site, preq, status, key)
 	info.tr.deliver(transforms)
@@ -774,7 +966,7 @@ func (h *Handler) serveOrigin(rec *statusRecorder, r *http.Request, site *boundS
 		Method:     r.Method,
 		Key:        oPath,
 		RawQuery:   oQuery, // forward the query so query-varying origins get the right response
-		Header:     buildOriginHeader(r.Header, rd.ReqHeaderOps),
+		Header:     buildOriginHeader(r.Header, rd.ReqHeaderOps, &forwardCtx{remoteAddr: r.RemoteAddr, tls: r.TLS != nil, host: r.Host, trusted: site.TrustedProxies}),
 		ClientHost: pipeline.NormalizeHost(r.Host), // canonical host (matches the cache key) per host_header policy (#11)
 	}
 	// Forward the CLIENT request body to the origin for a write method (POST/PUT/…).
@@ -851,6 +1043,41 @@ func (h *Handler) serveOrigin(rec *statusRecorder, r *http.Request, site *boundS
 
 	hdr := rec.Header()
 	copyOriginHeaders(hdr, resp.Header)
+	// Strip the from_header-family control headers a cache_ttl rule CONSUMED
+	// (X-Cache-Ttl/X-Cache-Grace/X-Cache-Max-Stale, whichever are configured): they are
+	// an internal origin↔cache contract, not for the client (Varnish unsets them). nil
+	// unless a from_header-family rule applied, so the common path pays nothing.
+	for _, name := range sd.StripHeaders {
+		hdr.Del(name)
+	}
+	// cache_credentialed (D101): on a positive-signal store the in-scope cache_ttl signal
+	// FORCE-OVERRODE the response's per-user markers (the VCL `unset set-cookie; unset
+	// Cache-Control; set ttl`, and the old `strip_cookies @v3_readmodel`). Strip them from the
+	// DELIVERED response:
+	//   - Set-Cookie: ALWAYS stripped on this store path — the absolute codebase-wide invariant
+	//     "a Set-Cookie VALUE is NEVER written into a cached object" stays intact. The STORED
+	//     object never carries Set-Cookie regardless (serveFromCache reconstructs HIT headers
+	//     from ObjectMeta, which has no Set-Cookie field), so a later HIT serves none; deleting
+	//     it here makes the MISS delivery match (no per-user cookie handed to this — or, via the
+	//     shared entry, any other — user). This bounds the operator-bug case: even if a per-user
+	//     route erroneously emits X-Cache-Ttl, its session/tracking cookie is never stored.
+	//   - Pragma: deleted here (Cache-Control + Expires are rewritten/removed by
+	//     setSharedFreshness below) so cadish never replays a `no-store`/`Pragma: no-cache`/
+	//     past-`Expires` it itself just cached.
+	// Gated on doStore so a non-stored response (no positive signal) is untouched.
+	if doStore && sd.CredentialedStore {
+		hdr.Del("Set-Cookie")
+		hdr.Del("Pragma")
+	}
+	// When cadish STORES this response, advertise cadish's authoritative freshness
+	// downstream (R13) so a MISS emits the SAME Cache-Control a later HIT will — and a
+	// downstream cache never over-caches a stored object beyond the operator's TTL via the
+	// origin's (now-overridden) max-age or heuristic freshness. Only for stored responses:
+	// a pass / hit-for-miss / uncacheable response keeps the origin's Cache-Control verbatim.
+	// Set BEFORE applyDeliver so an explicit `header Cache-Control …` directive wins.
+	if doStore {
+		setSharedFreshness(hdr, sd.TTL, sd.ForcedPrivate)
+	}
 	transforms, enc := h.applyDeliver(hdr, site, preq, status, key)
 	info.tr.deliver(transforms) // DELIVER: body transforms applied
 	if resp.ContentLength >= 0 {
@@ -871,6 +1098,7 @@ func (h *Handler) serveOrigin(rec *statusRecorder, r *http.Request, site *boundS
 		ContentEncoding: resp.Header.Get("Content-Encoding"), // replayed on HIT (else corrupt body)
 		Vary:            resp.Header.Get("Vary"),             // replayed on HIT (downstream variant safety)
 		Tier:            sd.StoreTier,                        // `storage <sel> -> ram|disk` placement
+		ForcedPrivate:   sd.ForcedPrivate,                    // HIT advertises private (not public) downstream (R13/D96)
 	}
 	isHead := r.Method == http.MethodHead
 	isRange := r.Header.Get("Range") != "" || resp.StatusCode == http.StatusPartialContent
@@ -991,6 +1219,24 @@ func (h *Handler) serveOrigin(rec *statusRecorder, r *http.Request, site *boundS
 // was committed — the signal the coalescer uses to let waiters read it from
 // cache.
 func (h *Handler) handleOriginError(rec *statusRecorder, r *http.Request, site *boundSite, preq *pipeline.Request, key string, store bool, err error, info *reqInfo) bool {
+	// An HTTP origin attaches the LIVE non-2xx body + headers to a *StatusError so we
+	// can stream the origin's real error response (auth challenge, JSON envelope,
+	// maintenance page) verbatim instead of the bare synthetic. We OWN that body and
+	// MUST close it on EVERY return path that does NOT stream it — registered HERE, at
+	// the very top, so it also covers the MAX_STALE early return below (which serves a
+	// stale cached copy and returns before reaching any body handling). The terminal
+	// streamer takes ownership by nil-ing Body before the defer runs, so streaming is
+	// NOT double-closed; CloseBody is idempotent and a no-op on a nil Body. Body is nil
+	// for an origin with no streamable body (s3origin, a transport-level status), where
+	// we fall back to the synthetic status.
+	var se *origin.StatusError
+	errors.As(err, &se)
+	defer func() {
+		if se != nil {
+			se.CloseBody()
+		}
+	}()
+
 	// MAX_STALE (D60), the FIRST fallback on origin error: if a stored copy exists
 	// and is still within its max_stale window, serve it stale rather than erroring.
 	// This outranks the cacheable negative cache (D15) and `respond on_error` (D57)
@@ -1035,11 +1281,23 @@ func (h *Handler) handleOriginError(rec *statusRecorder, r *http.Request, site *
 	}
 
 	var sd pipeline.ResponseDecision
-	if hasStatus && key != "" {
-		// An origin error path carries only a status, not response headers (the
-		// origin contract drains non-2xx bodies), so a set_cookie/content_type
-		// matcher has nothing to resolve against here — pass nil.
-		sd = site.Pipeline.EvalResponse(preq, code, nil)
+	if hasStatus {
+		// An HTTP origin now surfaces the real non-2xx response HEADERS on the
+		// *StatusError, so a set_cookie/content_type matcher (and the cookie-safety
+		// rule) can resolve against them. nil for an origin with no captured headers
+		// (s3origin, transport status, ErrNotFound) — EvalResponse tolerates nil.
+		// Evaluated regardless of key: the 2xx pass path (serveOrigin) runs EvalResponse
+		// unconditionally and strips the from_header-consumed control headers even with
+		// key == "" (a `pass` route), so a streamed origin error on a pass must resolve
+		// the same StripHeaders to strip them identically (without this, key == "" left
+		// sd zero and leaked X-Cache-Ttl/-Grace/-Max-Stale on the pass error path). The
+		// negative-cache STORE and hit-for-miss uses of sd below stay gated on key != "",
+		// so computing sd here never stores or HFM-marks a keyless pass.
+		var errHdr http.Header
+		if se != nil {
+			errHdr = se.Header
+		}
+		sd = site.Pipeline.EvalResponse(preq, code, errHdr)
 	}
 
 	// Negative caching: a cacheable negative status is a valid origin answer we
@@ -1086,8 +1344,73 @@ func (h *Handler) handleOriginError(rec *statusRecorder, r *http.Request, site *
 			return false
 		}
 	}
+	// Deliver the origin's REAL error response verbatim (status + headers + body)
+	// when the origin captured one — covering the pass / uncacheable path AND the
+	// hit-for-miss path (HFM marker already set above; nothing is stored here, so a
+	// passed/uncached error can never poison the cache). This replaces the bare
+	// `origin error` terminal; the synthetic below remains only for a genuine
+	// transport failure or no-backend (st == 0), where there is no upstream body.
+	if se != nil && se.Body != nil {
+		h.streamOriginError(rec, r, site, preq, key, se, sd.StripHeaders)
+		return false
+	}
 	writeStatus(rec, code, "origin error")
 	return false
+}
+
+// streamOriginError writes an upstream non-2xx response to the client VERBATIM:
+// the origin's status, its real error headers (Content-Type, WWW-Authenticate,
+// Retry-After, …), and its body streamed straight through (never buffered —
+// mirroring the 2xx streaming bound via the idle-timeout reader, so a large error
+// page cannot pin memory). It TAKES ownership of se.Body (nil-ing it) and closes it
+// via the idle reader, so the caller's deferred CloseBody is a no-op. A passed /
+// uncached error is never stored, so streaming it carries zero cache-poisoning risk
+// (any Set-Cookie reaches only this client and is never cached). HEAD writes the
+// status + headers with no body.
+//
+// DELIVER-PHASE PARITY (matches the edge worker's handleOriginResponseError): the
+// response-phase ops — `strip_cookies` (a load-bearing safety directive: an operator
+// who configured it must NOT see Set-Cookie leak on an origin-error response),
+// response `header` ops, CORS, and the cache-status header — are applied via
+// applyDeliver AFTER copyOriginHeaders and BEFORE WriteHeader, exactly as the 2xx
+// pass path (serveOrigin) does. The ONE deliberate exception is a body `replace`
+// transform: this path STREAMS the error body and cannot buffer-and-replace without
+// breaking the streaming model, so applyDeliver's returned body transforms are
+// intentionally ignored here (header ops only). This is the ONLY place applyDeliver
+// runs for the streamed-error terminal — handleOriginError does not apply it on the
+// way in — so deliver ops are applied exactly once.
+//
+// stripHeaders is the from_header-family control headers a cache_ttl rule CONSUMED
+// (X-Cache-Ttl/X-Cache-Grace/X-Cache-Max-Stale): an internal origin↔cache contract that
+// must never reach the client. They are removed BEFORE applyDeliver, mirroring the 2xx
+// path (serveOrigin), so the forwarded error response strips them identically and an
+// origin that emits them on an error can never leak them.
+func (h *Handler) streamOriginError(rec *statusRecorder, r *http.Request, site *boundSite, preq *pipeline.Request, key string, se *origin.StatusError, stripHeaders []string) {
+	body := se.Body
+	se.Body = nil // ownership transferred to the idle reader below
+	hdr := rec.Header()
+	copyOriginHeaders(hdr, se.Header)
+	// Strip the from_header-consumed control headers (nil unless a from_header rule
+	// applied), identical to the 2xx path and BEFORE applyDeliver so an explicit
+	// response `header` op could still re-add one deliberately.
+	for _, name := range stripHeaders {
+		hdr.Del(name)
+	}
+	// Apply response-phase ops to the forwarded error response (strip_cookies,
+	// respHeaderOps, CORS, cache-status). Body `replace` transforms returned here are
+	// intentionally NOT applied: the error body is streamed, never buffered, so a
+	// post-cache body replace cannot run without breaking the streaming model.
+	_, _ = h.applyDeliver(hdr, site, preq, pipeline.CacheStatusMiss, key)
+	if se.ContentLength >= 0 {
+		hdr.Set("Content-Length", strconv.FormatInt(se.ContentLength, 10))
+	}
+	ir := newIdleTimeoutReader(h.sweeper, body, h.idleTimeout, h.log, "")
+	defer ir.Close()
+	rec.WriteHeader(se.Status)
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = io.Copy(rec, ir)
 }
 
 // writeOnError writes the configured `respond on_error` synthetic (D57): the
@@ -1108,11 +1431,14 @@ func (h *Handler) writeOnError(rec *statusRecorder, r *http.Request, oe *pipelin
 
 // storeAndServeNegative writes a bodyless negative cache entry (recording the
 // failing status) under key, sets its freshness from the response decision, and
-// serves the status to this client. The origin already discarded the negative
-// body (the origin contract drains non-2xx bodies), so the cached entry — and
-// the served response — is bodyless; this matches how a deleted object's 404 is
-// represented. Returning true tells the coalescer the entry is in cache so
-// waiters read it instead of re-hitting origin.
+// serves the status to this client. This path stores a BODYLESS negative entry —
+// full-body negative caching is the 404/410 *Response path in serveOrigin; a
+// status that reaches here as a *StatusError (e.g. a user-configured `cache_ttl
+// status 500`) is stored bodyless and its captured upstream body is released by
+// handleOriginError's deferred CloseBody. The cached entry — and the served
+// response — is bodyless; this matches how a deleted object's 404 is represented.
+// Returning true tells the coalescer the entry is in cache so waiters read it
+// instead of re-hitting origin.
 func (h *Handler) storeAndServeNegative(rec *statusRecorder, r *http.Request, site *boundSite, preq *pipeline.Request, key string, code int, sd pipeline.ResponseDecision) bool {
 	committed := false
 	meta := cache.ObjectMeta{Key: key, Status: code, Size: 0}
@@ -1165,28 +1491,53 @@ func (h *Handler) triggerBgFetch(site *boundSite, r *http.Request, preq *pipelin
 	// Detach from the client's request context: the client already got its stale
 	// response; the revalidation must outlive that request.
 	clone := *preq
+	// Forward-mode cookie carry (Finding 5): a `derives_from … forward` cookie lives in
+	// the request header (kept by StripDerivedCookies), NOT in rd.ReqHeaderOps. The
+	// foreground fetch forwards it via buildOriginHeader(r.Header, …); the background
+	// revalidation seeds from an EMPTY base, so without this snapshot it would DROP the
+	// forward cookie and refresh the personalized {TOKEN} entry with anonymous content.
+	// preq's Cookie here is post-strip (strip-mode cookies already removed, forward-mode
+	// kept), so this carries ONLY the forward-mode (and cookie_allow-kept) cookies — never
+	// a strip-mode one — and does not touch the cache key.
+	fwdCookie := preq.Header.Get("Cookie")
 	go func() {
 		defer func() { <-h.bgSem }()
 		defer h.bg.end(key)
-		h.revalidate(site, &clone, rd, key)
+		h.revalidate(site, &clone, rd, key, fwdCookie)
 	}()
 }
 
 // revalidate performs the background origin fetch + cache store for a stale key.
-func (h *Handler) revalidate(site *boundSite, preq *pipeline.Request, rd pipeline.RequestDecision, key string) {
+// fwdCookie carries the foreground-forwarded (post-strip, forward-mode) Cookie so the
+// detached refresh forwards the same identity the foreground fetch would (Finding 5);
+// it is "" when no forward cookie applies.
+func (h *Handler) revalidate(site *boundSite, preq *pipeline.Request, rd pipeline.RequestDecision, key, fwdCookie string) {
 	o := site.originFor(rd.Upstream)
 	if o == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), h.bgTimeout)
 	defer cancel()
-	// The client's headers are gone by now; seed origin headers from the request-
-	// phase header ops alone. preq.Host survives on the clone, so a preserve
-	// host_header policy still forwards the original Host on this revalidation (#11).
-	// Mirror the foreground origin path/query rewrite on the background
+	// The client's headers are gone by now; seed origin headers from the request-phase
+	// header ops, plus the carried forward-mode Cookie (Finding 5) so a forward axis
+	// refreshes with the user's cookie, not anonymous content. preq.Host survives on the
+	// clone, so a preserve host_header policy still forwards the original Host on this
+	// revalidation (#11). Mirror the foreground origin path/query rewrite on the background
 	// revalidation so the refreshed object is fetched from the same upstream URL.
+	base := http.Header{}
+	if fwdCookie != "" {
+		base.Set("Cookie", fwdCookie)
+	}
+	// Stamp a verified X-Forwarded-For for the detached refresh too (R05): the client
+	// socket is gone, so the verified value is preq.ClientIP — the trusted-proxy-resolved
+	// real client that triggered the foreground request (treated as the peer, trusted nil
+	// ⇒ overwrite). nil when there is no resolved client IP (then no XFF is stamped).
+	var fwd *forwardCtx
+	if preq.ClientIP != "" {
+		fwd = &forwardCtx{remoteAddr: net.JoinHostPort(preq.ClientIP, "0"), tls: preq.TLS, host: preq.Host}
+	}
 	oPath, oQuery := originTarget(preq.Path, rawQueryOf(preq), rd.Rewrite)
-	oreq := &origin.Request{Method: http.MethodGet, Key: oPath, RawQuery: oQuery, Header: buildOriginHeader(http.Header{}, rd.ReqHeaderOps), ClientHost: pipeline.NormalizeHost(preq.Host)}
+	oreq := &origin.Request{Method: http.MethodGet, Key: oPath, RawQuery: oQuery, Header: buildOriginHeader(base, rd.ReqHeaderOps, fwd), ClientHost: pipeline.NormalizeHost(preq.Host)}
 	resp, err := o.Fetch(ctx, oreq)
 	if err != nil {
 		notFound := errors.Is(err, origin.ErrNotFound)
@@ -1303,6 +1654,10 @@ func buildPipelineRequest(r *http.Request) *pipeline.Request {
 		Query:    query,
 		Header:   r.Header,
 		ClientIP: clientIP(r),
+		// TLS reports whether cadish terminated TLS for this connection (backs the
+		// {proto}/{scheme} dynamic-header token). r.TLS is non-nil only on the HTTPS
+		// listener; a plain :80 request leaves it nil ⇒ {proto} resolves to "http".
+		TLS: r.TLS != nil,
 	}
 }
 
@@ -1458,9 +1813,23 @@ func stripControlBytes(s string) string {
 // method-less (a `cache_key path` — the GET and the POST share one key, the very case
 // that motivates §4.4) and a harmless no-op otherwise (the method-bearing unsafe key
 // names no stored object). Returns "" only when there is no key to invalidate.
-func (h *Handler) siblingGetKey(site *boundSite, preq *pipeline.Request, unsafeKey string) string {
+func (h *Handler) siblingGetKey(site *boundSite, preq *pipeline.Request, unsafeKey, origCookie string) string {
 	getReq := *preq // shallow copy; key building only reads its fields
 	getReq.Method = http.MethodGet
+	// Restore the ORIGINAL Cookie the caller snapshotted before the COOKIE-NORM strip
+	// (Finding 4) on a CLONE of the header, so an unscoped derives_from axis re-derives
+	// the SAME token the real GET keyed on — and we forget the key the GET actually
+	// stored under. Cloning keeps the live preq.Header (already stripped for the origin
+	// fetch) untouched.
+	getReq.Header = preq.Header.Clone()
+	if getReq.Header == nil {
+		getReq.Header = http.Header{}
+	}
+	if origCookie != "" {
+		getReq.Header.Set("Cookie", origCookie)
+	} else {
+		getReq.Header.Del("Cookie")
+	}
 	if k := site.Pipeline.EvalRequest(&getReq).CacheKey; k != "" {
 		return k
 	}
@@ -1591,10 +1960,24 @@ func connectionTokens(src http.Header) map[string]bool {
 	if len(vs) == 0 {
 		return nil
 	}
-	conn := map[string]bool{}
+	// Tokenize the comma list manually (no strings.Split allocation) and lazily build the
+	// map only once a non-empty token is seen — presized to 1 for the common single-token
+	// "keep-alive"/"close" case. A Connection header of only whitespace yields nil, which
+	// the consumer's `conn[k]` membership test reads as absent, identical to the old empty
+	// map.
+	var conn map[string]bool
 	for _, v := range vs {
-		for _, tok := range strings.Split(v, ",") {
+		for v != "" {
+			tok := v
+			if i := strings.IndexByte(v, ','); i >= 0 {
+				tok, v = v[:i], v[i+1:]
+			} else {
+				v = ""
+			}
 			if tok = textproto.TrimString(tok); tok != "" {
+				if conn == nil {
+					conn = make(map[string]bool, 1)
+				}
 				conn[http.CanonicalHeaderKey(tok)] = true
 			}
 		}
@@ -1602,24 +1985,180 @@ func connectionTokens(src http.Header) map[string]bool {
 	return conn
 }
 
+// forwardCtx carries the per-request inputs the WS-B origin-forwarding helper needs to
+// stamp TRUSTWORTHY X-Forwarded-* headers on an origin-bound request (R05). nil disables
+// the stamping (the headers are copied through unchanged).
+type forwardCtx struct {
+	remoteAddr string         // immediate socket peer (host:port) — the verified XFF source
+	tls        bool           // true when cadish terminated TLS for the inbound request
+	host       string         // inbound client Host — for X-Forwarded-Host
+	trusted    []netip.Prefix // the site's trust_proxy set
+}
+
 // buildOriginHeader clones the client headers that should be forwarded to the
-// origin (dropping hop-by-hop + Host), then applies the request-phase header ops.
-func buildOriginHeader(client http.Header, ops []pipeline.HeaderOp) http.Header {
+// origin (dropping hop-by-hop + Host), normalizes the forwarded-header family to
+// trustworthy values when fwd is set, then applies the request-phase header ops (so an
+// explicit `header_up X-Forwarded-*` still wins).
+func buildOriginHeader(client http.Header, ops []pipeline.HeaderOp, fwd *forwardCtx) http.Header {
 	// Connection-named hop-by-hop headers come from the CLIENT's Connection list,
 	// read before the copy below drops the Connection header itself (it is in
 	// hopByHop). A client must not smuggle a Connection-listed header to the origin.
 	conn := connectionTokens(client)
-	out := http.Header{}
+	// Presize to the source header count (R30): the default-sized map otherwise rehashes
+	// as headers are added on every fetch. client comes from net/http (r.Header) or a
+	// header built via http.Header.Set, so its KEYS ARE ALREADY CANONICAL — skip the
+	// per-key http.CanonicalHeaderKey + http.Header.Add re-canonicalization and assign the
+	// (copied) value slice directly. The copy is required: out is mutated below
+	// (applyForwardedHeaders / applyHeaderOps may Add to a name), so it must not alias
+	// client's backing arrays.
+	out := make(http.Header, len(client))
 	for k, vs := range client {
-		ck := http.CanonicalHeaderKey(k)
-		if hopByHop[ck] || conn[ck] || ck == "Host" {
+		if hopByHop[k] || conn[k] || k == "Host" {
 			continue
 		}
-		for _, v := range vs {
-			out.Add(k, v)
-		}
+		cp := make([]string, len(vs))
+		copy(cp, vs)
+		out[k] = cp
+	}
+	if fwd != nil {
+		// The origin path stamps the verified peer onto X-Forwarded-For itself
+		// (appendPeer=true); the WS-upgrade path delegates that append to
+		// httputil.ReverseProxy and calls applyForwardedHeaders directly with false.
+		applyForwardedHeaders(out, client, fwd, true)
 	}
 	applyHeaderOps(out, ops)
+	return out
+}
+
+// applyForwardedHeaders rewrites the X-Forwarded-* family on out (the origin-bound
+// header) so the origin sees a TRUSTWORTHY client identity rather than client-spoofable
+// values — the WS-B trust-boundary policy applied to origin forwarding (R05, ADR D95).
+// Without it cadish copied the client's X-Forwarded-For / X-Real-IP / Forwarded verbatim
+// and never injected a verified XFF, so a direct client could spoof its source IP to an
+// XFF-trusting origin (bypass allowlists / rate-limits, poison logs).
+//
+//   - X-Forwarded-For: from an UNTRUSTED/direct peer the inbound chain is spoofable, so
+//     it is REPLACED with the verified socket-peer IP. From a TRUSTED proxy the inbound
+//     chain is kept and the socket peer is APPENDED (standard reverse-proxy semantics),
+//     so the origin sees the full verifiable chain.
+//   - X-Real-IP: set to the verified client (the socket peer, or the trusted-proxy-aware
+//     real client behind a trusted proxy) — never a spoofed value.
+//   - X-Forwarded-Proto: from an untrusted peer, set to cadish's own inbound scheme
+//     (https iff cadish terminated TLS); from a trusted proxy, the value it set is kept
+//     (else filled from the inbound scheme).
+//   - X-Forwarded-Host: from an untrusted peer, set to the inbound Host; from a trusted
+//     proxy, its value is kept (else filled).
+//   - Forwarded (RFC 7239): cadish never produces a trustworthy one and does not parse
+//     it, so a client-supplied value is dropped from an untrusted peer.
+//
+// appendPeer says who stamps the verified socket peer onto X-Forwarded-For. The origin
+// fetch path (buildOriginHeader) owns the whole header and passes true: this helper does
+// the full XFF construction (overwrite=peer when untrusted, chain+peer when trusted). The
+// WS-upgrade path passes false because httputil.ReverseProxy appends the verified peer
+// itself AFTER the Director (it reads the inbound req.RemoteAddr); there this helper only
+// makes the value that PRECEDES that append trustworthy — untrusted ⇒ DROP the spoofable
+// inbound XFF so the proxy stamps the peer alone; trusted ⇒ leave the vetted inbound chain
+// in place so the proxy appends the peer to it. X-Real-IP / proto / host / Forwarded are
+// handled identically in both modes.
+func applyForwardedHeaders(out, client http.Header, fwd *forwardCtx, appendPeer bool) {
+	scheme := "http"
+	if fwd.tls {
+		scheme = "https"
+	}
+	host := pipeline.NormalizeHost(fwd.host)
+	peer := geo.ClientIP(fwd.remoteAddr, nil, nil) // socket peer IP; no XFF/trust consulted
+
+	if geo.PeerTrusted(fwd.remoteAddr, fwd.trusted) {
+		if appendPeer && peer.IsValid() {
+			vals := client.Values("X-Forwarded-For")
+			chain := make([]string, 0, len(vals)+1)
+			chain = append(chain, vals...)
+			chain = append(chain, peer.String())
+			out.Set("X-Forwarded-For", strings.Join(chain, ", "))
+		}
+		// When !appendPeer the downstream ReverseProxy appends the peer to the vetted
+		// inbound chain already present on out — leave X-Forwarded-For untouched.
+		if out.Get("X-Forwarded-Proto") == "" {
+			out.Set("X-Forwarded-Proto", scheme)
+		}
+		if host != "" && out.Get("X-Forwarded-Host") == "" {
+			out.Set("X-Forwarded-Host", host)
+		}
+		if rc := geo.ClientIP(fwd.remoteAddr, client, fwd.trusted); rc.IsValid() {
+			out.Set("X-Real-IP", rc.String())
+		}
+		return
+	}
+	// Untrusted/direct peer: every client X-Forwarded-* is spoofable.
+	if appendPeer {
+		if peer.IsValid() {
+			out.Set("X-Forwarded-For", peer.String()) // overwrite the spoofable chain
+			out.Set("X-Real-IP", peer.String())
+		} else {
+			out.Del("X-Forwarded-For")
+			out.Del("X-Real-IP")
+		}
+	} else {
+		// Drop the spoofable inbound XFF; the downstream ReverseProxy stamps the verified
+		// peer alone (so the origin never sees the forged leftmost entry).
+		out.Del("X-Forwarded-For")
+		if peer.IsValid() {
+			out.Set("X-Real-IP", peer.String())
+		} else {
+			out.Del("X-Real-IP")
+		}
+	}
+	out.Set("X-Forwarded-Proto", scheme)
+	if host != "" {
+		out.Set("X-Forwarded-Host", host)
+	}
+	out.Del("Forwarded")
+}
+
+// restoreClientCookie puts the pre-filter client Cookie back onto an OUTBOUND,
+// origin-bound header for an explicit `pass`, a credential bypass, the WebSocket-upgrade
+// tunnel, OR a `cache_credentialed` (D101) origin-authoritative request. The RECV pipeline
+// strips r.Header's Cookie for cookie_allow / derives_from, which is a pure CACHE-KEY
+// normalization. For an UNCACHED path (pass / bypass / tunnel) that strip yields no caching
+// benefit and only harms the backend: a `pass`ed /me or a socket handshake would arrive
+// anonymous and the upstream would read a logged-in user as GUEST — and restoring is SAFE
+// because a passed response is NEVER stored. For a `cache_credentialed` request the path IS
+// cached, but the cache key was ALREADY built (rd.CacheKey) from the normalized request and
+// the entry stays under that SHARED, credential-free key; restoring the cookie here only
+// reaches the ORIGIN (for the per-user routes to authenticate) and never enters the key, so
+// it likewise cannot contaminate a shared entry — cacheability is decided origin-
+// authoritatively by EvalResponse (a positive in-scope signal is the sole storage gate and
+// strips Set-Cookie before store). A client that sent no Cookie had nothing stripped (orig == ""), so none is
+// synthesized — any residual stripped value is removed so the origin sees the original
+// cookieless request.
+func restoreClientCookie(h http.Header, orig string) {
+	if orig != "" {
+		h.Set("Cookie", orig)
+	} else {
+		h.Del("Cookie")
+	}
+}
+
+// prependCookieOp returns ops with an ORIGIN-ONLY Cookie request-header op prepended that
+// forwards the ORIGINAL client Cookie (cache_credentialed / D101): an OpSet when the client
+// sent a cookie, an OpRemove when it did not (so a stripped value never leaks to the origin
+// for a cookieless client). buildOriginHeader applies these ops to the origin-bound header
+// AFTER copying the (normalized) request header, so the original cookie reaches ONLY the
+// origin while EvalResponse + the response-phase matchers keep seeing the normalized request —
+// mirroring the edge worker's reqHeaderOp model. It is PREPENDED so a later explicit
+// `header_up Cookie` rule still overrides it (matching the pre-fix restoreClientCookie, which
+// rd.ReqHeaderOps likewise applied over). A fresh slice is returned so the pipeline-built ops
+// backing array is never mutated.
+func prependCookieOp(ops []pipeline.HeaderOp, orig string) []pipeline.HeaderOp {
+	var cookieOp pipeline.HeaderOp
+	if orig != "" {
+		cookieOp = pipeline.HeaderOp{Op: pipeline.OpSet, Name: "Cookie", Value: orig}
+	} else {
+		cookieOp = pipeline.HeaderOp{Op: pipeline.OpRemove, Name: "Cookie"}
+	}
+	out := make([]pipeline.HeaderOp, 0, len(ops)+1)
+	out = append(out, cookieOp)
+	out = append(out, ops...)
 	return out
 }
 
@@ -1629,13 +2168,14 @@ func copyOriginHeaders(hdr, src http.Header) {
 	// an origin cannot leak a connection-scoped header to the client.
 	conn := connectionTokens(src)
 	for k, vs := range src {
-		ck := http.CanonicalHeaderKey(k)
-		if hopByHop[ck] || conn[ck] {
+		// src is an origin response header from net/http, so its keys are already
+		// canonical (R30): skip the per-key http.CanonicalHeaderKey + http.Header.Add
+		// re-canonicalization. append into hdr[k] allocates hdr's OWN backing array (so
+		// src is never aliased) while copying only the immutable string values.
+		if hopByHop[k] || conn[k] {
 			continue
 		}
-		for _, v := range vs {
-			hdr.Add(k, v)
-		}
+		hdr[k] = append(hdr[k], vs...)
 	}
 }
 
@@ -1794,10 +2334,60 @@ func isSafeMethod(m string) bool {
 	return m == "" || m == http.MethodGet || m == http.MethodHead
 }
 
+// httpDate returns the RFC 7231 "Date" header string for now, memoized at one-second
+// granularity. http.TimeFormat (RFC 1123 GMT) carries 1s resolution, so every call within
+// the same unix second yields the byte-identical string — caching by now.Unix() is exact,
+// not approximate. The fast path is a single lock-free atomic load + int compare, skipping
+// time.Time.Format and its allocation on the hot HIT path; on a second rollover one (or, in
+// a benign data race, a few) caller reformats and re-stores the same value. now is the
+// handler clock, so an injected/frozen test clock keeps this deterministic.
+func (h *Handler) httpDate(now time.Time) string {
+	sec := now.Unix()
+	if dc := h.httpDateCache.Load(); dc != nil && dc.sec == sec {
+		return dc.str
+	}
+	s := now.UTC().Format(http.TimeFormat)
+	h.httpDateCache.Store(&httpDate{sec: sec, str: s})
+	return s
+}
+
 func setIfNonEmpty(hdr http.Header, name, value string) {
 	if value != "" {
 		hdr.Set(name, value)
 	}
+}
+
+// setSharedFreshness writes the operator-authoritative downstream freshness for a
+// cadish-cached object (R13). cadish is authoritative over the origin's freshness
+// (its `cache_ttl` overrides the origin's `max-age`/`s-maxage`), so a response cadish
+// STORES must advertise cadish's own remaining freshness — the SAME signal whether the
+// object is served as a MISS (just stored) or a later HIT — rather than dropping it on
+// a HIT (which would leave a bare Last-Modified that triggers downstream RFC 9111
+// §4.2.2 heuristic freshness possibly exceeding the operator's TTL). It emits
+// `Cache-Control: public, max-age=<ttl-seconds>` (the FULL assigned TTL; paired with
+// the Age header a downstream cache derives the correct remaining lifetime) and drops
+// the absolute `Expires` so the two freshness mechanisms cannot disagree. It is set
+// BEFORE the deliver phase so an explicit operator `header Cache-Control …` directive
+// still overrides it. A non-positive ttl emits `max-age=0` (revalidate downstream).
+//
+// When private is true the object was a cache_unsafe-forced store of a response the origin
+// marked private/no-store/no-cache (R13/D96): cadish caches it at its OWN tier but must NOT
+// tell downstream SHARED caches (CDN/edge/other users) it is `public`, so it emits
+// `private, max-age=N` — `private` keeps shared caches from storing the confidential
+// response while max-age still bounds the (private) browser cache and stops heuristic
+// freshness. cadish's own caching is driven by its freshness index, not this header, so it
+// is unaffected.
+func setSharedFreshness(hdr http.Header, ttl time.Duration, private bool) {
+	secs := int64(ttl / time.Second)
+	if secs < 0 {
+		secs = 0
+	}
+	scope := "public"
+	if private {
+		scope = "private"
+	}
+	hdr.Set("Cache-Control", scope+", max-age="+strconv.FormatInt(secs, 10))
+	hdr.Del("Expires")
 }
 
 // audit emits one security-audit record for an ENFORCED or MONITORED gate action,

@@ -171,11 +171,15 @@ func (o *Origin) Fetch(ctx context.Context, in *origin.Request) (*origin.Respons
 		hdr.Set("Content-Range", cr)
 		status = http.StatusPartialContent
 	}
-	clen := aws.ToInt64(out.ContentLength)
-	if clen > 0 {
+	// S3 always returns Content-Length on a GetObject 200/206, so a non-nil pointer
+	// is the authoritative length — INCLUDING a 0-byte object. Collapsing 0 to -1
+	// ("unknown") would drop the downstream Content-Length: 0 and cache the empty
+	// object with an unknown Size; only a missing length (nil) is -1. Use the pointer
+	// presence, not the value sign, to discriminate known-zero from unknown.
+	clen := int64(-1)
+	if out.ContentLength != nil && *out.ContentLength >= 0 {
+		clen = *out.ContentLength
 		hdr.Set("Content-Length", strconv.FormatInt(clen, 10))
-	} else {
-		clen = -1
 	}
 
 	return &origin.Response{

@@ -328,14 +328,17 @@ func TestOnErrorNotCached(t *testing.T) {
 	}
 }
 
-// TestNoOnErrorBareFallbackUnchanged: with NO `respond on_error`, a hard origin
-// failure still produces the bare fallback (502 origin error), unchanged (spec
-// test 10, zero-cost regression).
-func TestNoOnErrorBareFallbackUnchanged(t *testing.T) {
+// TestNoOnErrorUpstream5xxBodyDelivered: with NO `respond on_error`, a real upstream
+// 5xx now delivers the origin's REAL status + body + headers verbatim (the bare
+// `origin error` synthetic is reserved for a transport failure, where there is no
+// upstream body — see TestTransportErrorBareFallback). PRESERVE-ORIGIN-ERROR-BODY.
+func TestNoOnErrorUpstream5xxBodyDelivered(t *testing.T) {
 	origin := newCountingOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, `{"error":"upstream boom"}`)
 	})
-	// Cache only a 200, so the uncacheable 502 reaches the bare fallback (not the
+	// Cache only a 200, so the uncacheable 502 reaches the terminal (not the
 	// negative cache), and there is no `respond on_error` to intercept it.
 	body := `test.local {
 	cache { ram 64MiB }
@@ -347,9 +350,12 @@ func TestNoOnErrorBareFallbackUnchanged(t *testing.T) {
 	h, _ := buildHandler(t, nil, body, origin.srv.URL)
 	rec := do(h, "GET", "http://test.local/x", nil)
 	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("code = %d, want 502 (bare fallback, no on_error configured)", rec.Code)
+		t.Fatalf("code = %d, want 502 (real upstream status delivered verbatim)", rec.Code)
 	}
-	if rec.Body.String() != "origin error" {
-		t.Fatalf("body = %q, want the bare \"origin error\" fallback", rec.Body.String())
+	if rec.Body.String() != `{"error":"upstream boom"}` {
+		t.Fatalf("body = %q, want the upstream JSON body verbatim (not \"origin error\")", rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json (origin error headers delivered)", got)
 	}
 }

@@ -187,40 +187,48 @@ func TestEdgeBuildStrictFailsOnValueExposure(t *testing.T) {
 	}
 }
 
-// TestEdgeBuildStrictFailsOnEnvSecretHeaderValue (Fix 1, security completeness): an
-// UNQUOTED `{$VAR}` in a `header` value is env-expanded to the secret BEFORE projection,
-// baking it into the public worker IR. -strict must trip on it (the leak guard now scans
-// header op values, not only matcher values). The QUOTED form `"{$VAR}"` stays the
-// literal text `{$VAR}` (ships no secret) and stays strict-clean.
+// TestEdgeBuildStrictFailsOnEnvSecretHeaderValue (Fix 1, security completeness; updated
+// for R07/D94): a `{$VAR}` in a `header` value is env-expanded to the secret BEFORE
+// projection, baking it into the public worker IR. -strict must trip on it (the leak
+// guard scans header op values, not only matcher values). Since R07 the QUOTED form
+// `"{$VAR}"` ALSO expands — quoting no longer keeps it server-side — so it trips -strict
+// too. An ESCAPED `\{$VAR}` keeps the literal text (ships no secret) and stays clean.
 func TestEdgeBuildStrictFailsOnEnvSecretHeaderValue(t *testing.T) {
 	t.Setenv("CADISH_TEST_ORIGIN_SECRET", "topsecret-zz1199")
+	var out, errOut bytes.Buffer
 
-	// Unquoted placeholder -> expanded -> secret in the IR -> strict fails.
-	const leaky = `example.com {
+	for _, name := range []string{"unquoted", "quoted"} {
+		src := `example.com {
     header X-Internal-Auth {$CADISH_TEST_ORIGIN_SECRET}
     cache_ttl default ttl 1m
 }`
-	cfg := writeCadishfile(t, leaky)
-	var out, errOut bytes.Buffer
-	if code := runEdgeBuild(cfg, "-", "", true, false, &out, &errOut); code != 1 {
-		t.Errorf("strict exit = %d, want 1 (env secret in header value); stderr=%s", code, errOut.String())
-	}
-	if strings.Contains(out.String(), "topsecret-zz1199") {
-		// Sanity: the secret really did get baked into the IR (the leak this guards).
-	} else {
-		t.Errorf("expected the env secret to have been expanded into the IR JSON; out=%s", out.String())
+		if name == "quoted" {
+			src = `example.com {
+    header X-Internal-Auth "{$CADISH_TEST_ORIGIN_SECRET}"
+    cache_ttl default ttl 1m
+}`
+		}
+		cfg := writeCadishfile(t, src)
+		out.Reset()
+		errOut.Reset()
+		if code := runEdgeBuild(cfg, "-", "", true, false, &out, &errOut); code != 1 {
+			t.Errorf("%s: strict exit = %d, want 1 (env secret in header value); stderr=%s", name, code, errOut.String())
+		}
+		if !strings.Contains(out.String(), "topsecret-zz1199") {
+			t.Errorf("%s: expected the env secret to have been expanded into the IR JSON; out=%s", name, out.String())
+		}
 	}
 
-	// Quoted placeholder -> stays literal `{$VAR}` -> no secret -> strict-clean.
+	// Escaped placeholder -> stays literal `{$VAR}` -> no secret -> strict-clean.
 	const safe = `example.com {
-    header X-Internal-Auth "{$CADISH_TEST_ORIGIN_SECRET}"
+    header X-Internal-Auth \{$CADISH_TEST_ORIGIN_SECRET}
     cache_ttl default ttl 1m
 }`
 	cfg2 := writeCadishfile(t, safe)
 	out.Reset()
 	errOut.Reset()
 	if code := runEdgeBuild(cfg2, "-", "", true, false, &out, &errOut); code != 0 {
-		t.Errorf("strict exit = %d, want 0 for quoted placeholder; stderr=%s", code, errOut.String())
+		t.Errorf("strict exit = %d, want 0 for escaped placeholder; stderr=%s", code, errOut.String())
 	}
 }
 
@@ -294,6 +302,69 @@ func TestEdgeDeployRequiresOrigin(t *testing.T) {
 	}
 }
 
+// TestAbortEdgeDeployUnsafe is the hermetic core of the deploy safety gate: a
+// non-zero ForcedPass (silent site-wide fail-open) or ValueExposed (a secret baked
+// into the public bundle) must abort the upload; a clean report must not.
+func TestAbortEdgeDeployUnsafe(t *testing.T) {
+	cases := []struct {
+		name string
+		rep  edgeir.CoverageReport
+		want bool
+		msg  string
+	}{
+		{"clean", edgeir.CoverageReport{EdgeNative: 3}, false, ""},
+		{"forced-pass", edgeir.CoverageReport{ForcedPass: 1}, true, "fail-open pass"},
+		{"value-exposed", edgeir.CoverageReport{ValueExposed: 1}, true, "PUBLIC worker bundle"},
+		{"security-gate-only-not-blocking", edgeir.CoverageReport{SecurityGate: 1}, false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var errOut bytes.Buffer
+			got := abortEdgeDeployUnsafe("example.com", tc.rep, &errOut)
+			if got != tc.want {
+				t.Fatalf("abort = %v, want %v (stderr=%s)", got, tc.want, errOut.String())
+			}
+			if tc.msg != "" && !strings.Contains(errOut.String(), tc.msg) {
+				t.Errorf("stderr missing %q: %s", tc.msg, errOut.String())
+			}
+		})
+	}
+}
+
+// edgeDeploySecretSrc has an `edge {}` block (so deploy resolves a target) AND a
+// header matcher carrying a literal value — a potential baked-in secret that ships
+// into the PUBLIC worker bundle (ValueExposed > 0).
+const edgeDeploySecretSrc = `example.com {
+    edge {
+        account acc-123
+        zone    example.com
+        worker  cadish-edge-example
+    }
+    @auth header X-Internal-Auth s3cr3t
+    pass @auth
+    cache_ttl default ttl 1m
+}`
+
+// TestEdgeDeployRefusesSecretBundle (CRITICAL) proves `edge deploy` enforces the
+// build safety gate BEFORE uploading: a config whose bundle would leak a literal
+// into the public worker is refused (exit 1, with the gate's message — NOT a
+// network error), so no script is ever PUT to Cloudflare. With token + origin set,
+// the gate firing first is also what keeps this test from making a real CF call.
+func TestEdgeDeployRefusesSecretBundle(t *testing.T) {
+	t.Setenv("CF_API_TOKEN", "tok")
+	cfg := writeCadishfile(t, edgeDeploySecretSrc)
+	var out, errOut bytes.Buffer
+	if code := runEdgeDeploy(cfg, "https://origin.example.com", &out, &errOut); code != 1 {
+		t.Fatalf("exit = %d, want 1 (deploy must refuse a secret-bearing bundle); stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "PUBLIC worker bundle") {
+		t.Errorf("expected the secret-in-bundle refusal, got: %s", errOut.String())
+	}
+	if strings.Contains(out.String(), "deployed worker") {
+		t.Errorf("must not report a successful deploy: %s", out.String())
+	}
+}
+
 func TestEdgeEnableRequiresToken(t *testing.T) {
 	t.Setenv("CF_API_TOKEN", "")
 	cfg := writeCadishfile(t, edgeDeploySrc)
@@ -341,5 +412,100 @@ func TestDeployConfigForNoEdgeBlock(t *testing.T) {
 	}
 	if _, err := deployConfigFor(pipelines[0], "https://o"); err == nil {
 		t.Error("expected an error for a site with no edge {} block")
+	}
+}
+
+// TestEdgeBuildFailsOnIPScopedSelectingDirective (R02): a `pass` (or cache_key / route)
+// scoped by an `ip` matcher cannot be honored at the edge — the projector forces a site-wide
+// fail-open pass. The build must fail NON-ZERO even WITHOUT -strict so the operator does not
+// silently ship a worker that caches nothing for the whole site.
+func TestEdgeBuildFailsOnIPScopedSelectingDirective(t *testing.T) {
+	const src = `example.com {
+    @internal ip 10.0.0.0/8
+    pass @internal
+    cache_key host path
+    cache_ttl default ttl 1h
+}`
+	cfg := writeCadishfile(t, src)
+	var out, errOut bytes.Buffer
+	if code := runEdgeBuild(cfg, "-", "", false /* NOT strict */, false, &out, &errOut); code != 1 {
+		t.Fatalf("non-strict exit = %d, want 1 (R02 ip-scoped pass must fail the build); stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "cannot evaluate") {
+		t.Errorf("build error should explain the edge cannot evaluate the matcher: %s", errOut.String())
+	}
+}
+
+// TestEdgeBuildFailsOnUntranslatableRegexScopedPass (R16): a `pass` scoped by an untranslatable
+// RE2 regex (e.g. ungreedy `(?U)`) reaches the SAME fail-open path from an ordinary path_regex,
+// not just Gateway. The build must fail NON-ZERO even WITHOUT -strict.
+func TestEdgeBuildFailsOnUntranslatableRegexScopedPass(t *testing.T) {
+	const src = `example.com {
+    @ungreedy path_regex (?U)^/(live|stream)
+    pass @ungreedy
+    cache_key host path
+    cache_ttl default ttl 1h
+}`
+	cfg := writeCadishfile(t, src)
+	var out, errOut bytes.Buffer
+	if code := runEdgeBuild(cfg, "-", "", false /* NOT strict */, false, &out, &errOut); code != 1 {
+		t.Fatalf("non-strict exit = %d, want 1 (R16 untranslatable-regex-scoped pass must fail the build); stderr=%s", code, errOut.String())
+	}
+}
+
+// TestEdgeBuildFailsOnUntranslatableRedirectRegex (R16): a `redirect` whose OWN path regex
+// uses an untranslatable RE2 construct (e.g. ungreedy `(?U)`) delegates the redirect chain to
+// the Cadish server behind — silently coarsening the operator's redirect intent. That is a
+// ForcedPass the build gate must fail loud on: `cadish edge build` must exit NON-ZERO even
+// WITHOUT -strict (mirroring the redirect-SCOPE-fail-closed and pass cases).
+func TestEdgeBuildFailsOnUntranslatableRedirectRegex(t *testing.T) {
+	const src = `example.com {
+    redirect (?U)^/old$ 301 /new
+    cache_key host path
+    cache_ttl default ttl 1h
+}`
+	cfg := writeCadishfile(t, src)
+	var out, errOut bytes.Buffer
+	if code := runEdgeBuild(cfg, "-", "", false /* NOT strict */, false, &out, &errOut); code != 1 {
+		t.Fatalf("non-strict exit = %d, want 1 (R16 untranslatable redirect regex delegates the chain → forced-pass must fail the build); stderr=%s", code, errOut.String())
+	}
+}
+
+// TestEdgeBuildInlineIPNoPanic (R02): an INLINE `ip` matcher must not panic `cadish edge build`
+// (it previously crashed in edgeView). It now fails the build cleanly (exit 1, fail-open).
+func TestEdgeBuildInlineIPNoPanic(t *testing.T) {
+	const src = `example.com {
+    pass ip 10.0.0.0/8
+    cache_key host path
+    cache_ttl default ttl 1h
+}`
+	cfg := writeCadishfile(t, src)
+	var out, errOut bytes.Buffer
+	code := runEdgeBuild(cfg, "-", "", false, false, &out, &errOut) // must not panic
+	if code != 1 {
+		t.Fatalf("inline-ip build exit = %d, want 1; stderr=%s", code, errOut.String())
+	}
+}
+
+// TestEdgeBuildSecurityOnlyIPDoesNotForceFail (R02): an `ip` matcher used ONLY by the security
+// gate is delegated (fails -strict) but does NOT force a non-strict failure — no SELECTING
+// directive references it, so a plain build of such a site still succeeds.
+func TestEdgeBuildSecurityOnlyIPDoesNotForceFail(t *testing.T) {
+	const src = `example.com {
+    @office ip 203.0.113.43/32
+    allow @office
+    cache_key host path
+    cache_ttl default ttl 1h
+}`
+	cfg := writeCadishfile(t, src)
+	var out, errOut bytes.Buffer
+	if code := runEdgeBuild(cfg, "-", "", false /* NOT strict */, false, &out, &errOut); code != 0 {
+		t.Fatalf("non-strict exit = %d, want 0 (security-only ip must NOT force-fail the build); stderr=%s", code, errOut.String())
+	}
+	// But -strict still trips (the security gate / ip matcher is delegated).
+	out.Reset()
+	errOut.Reset()
+	if code := runEdgeBuild(cfg, "-", "", true, false, &out, &errOut); code != 1 {
+		t.Errorf("strict exit = %d, want 1 (delegated ip / security gate); stderr=%s", code, errOut.String())
 	}
 }

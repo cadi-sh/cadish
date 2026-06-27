@@ -3,8 +3,15 @@ package tlsacme
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"testing"
 )
+
+// trustLoopback is the trust_proxy set used by the loop-guard tests: it covers the
+// httptest.NewRequest default RemoteAddr (192.0.2.1:1234) so a request that arrives
+// "from a trusted terminator" honors X-Forwarded-Proto (the legitimate CF deployment),
+// while a request with a RemoteAddr OUTSIDE it is an untrusted/direct client.
+var trustTerminator = []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}
 
 // TestGatedRedirect: in Ingress mode (ForceACME) the :80 handler redirects only hosts
 // that have TLS (or a cadi.sh/ssl-redirect opt-in); a non-TLS host is served over plain
@@ -60,7 +67,7 @@ func TestRedirectLoopGuardXForwardedProto(t *testing.T) {
 	// (post-F11 the bare ACME HostPolicy no longer counts as "has TLS").
 	cert, key := genSelfSigned(t, "tls.example.com")
 	m, err := NewManager([]SiteConfig{
-		{Hosts: []string{"tls.example.com"}, TLS: SiteTLS{Mode: ModeStatic, CertFile: cert, KeyFile: key}},
+		{Hosts: []string{"tls.example.com"}, TLS: SiteTLS{Mode: ModeStatic, CertFile: cert, KeyFile: key}, TrustedProxies: trustTerminator},
 	}, Options{ForceACME: true, ACMEEmail: "ops@example.com", CacheDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
@@ -77,6 +84,17 @@ func TestRedirectLoopGuardXForwardedProto(t *testing.T) {
 	do := func(host, xfproto string) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "http://"+host+"/p", nil)
+		if xfproto != "" {
+			req.Header.Set("X-Forwarded-Proto", xfproto)
+		}
+		h.ServeHTTP(rec, req) // default RemoteAddr 192.0.2.1 ∈ trustTerminator
+		return rec
+	}
+	// Same request but from an UNTRUSTED/direct peer (RemoteAddr outside trust_proxy).
+	doUntrusted := func(host, xfproto string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "http://"+host+"/p", nil)
+		req.RemoteAddr = "203.0.113.7:40000"
 		if xfproto != "" {
 			req.Header.Set("X-Forwarded-Proto", xfproto)
 		}
@@ -108,6 +126,16 @@ func TestRedirectLoopGuardXForwardedProto(t *testing.T) {
 	if rec := do("forced.example.com", "HTTPS, http"); rec.Code != http.StatusOK {
 		t.Errorf("forced host + XFP 'HTTPS, http': status = %d, want 200 (no redirect)", rec.Code)
 	}
+
+	// TRUST BOUNDARY (R15): the SAME XFP:https from an UNTRUSTED/direct peer must NOT
+	// suppress the redirect — otherwise a client adds the header to a plain :80 request
+	// and is served in cleartext. It is 301'd exactly as if the header were absent.
+	if rec := doUntrusted("forced.example.com", "https"); rec.Code != http.StatusMovedPermanently {
+		t.Errorf("forced host + XFP https from UNTRUSTED peer: status = %d, want 301 (header ignored)", rec.Code)
+	}
+	if rec := doUntrusted("tls.example.com", "https"); rec.Code != http.StatusMovedPermanently {
+		t.Errorf("TLS host + XFP https from UNTRUSTED peer: status = %d, want 301 (header ignored)", rec.Code)
+	}
 }
 
 // TestUngatedRedirectAlways: standalone (no ForceACME) keeps the Caddy-style
@@ -128,5 +156,30 @@ func TestUngatedRedirectAlways(t *testing.T) {
 	}
 	if called {
 		t.Error("standalone: fallback was called; want unconditional redirect")
+	}
+}
+
+// TestStandaloneXFPNoTrustStillRedirects (R10b): standalone mode with NO trust_proxy
+// configured ⇒ X-Forwarded-Proto is fully client-controlled. A plain :80 request that
+// adds `X-Forwarded-Proto: https` MUST still be 301'd (the header is ignored) — never
+// served in cleartext via the fallback. This is the standalone facet of R15.
+func TestStandaloneXFPNoTrustStillRedirects(t *testing.T) {
+	m, err := NewManager([]SiteConfig{
+		{Hosts: []string{"a.example.com"}, TLS: SiteTLS{Mode: ModeOff}}, // no TrustedProxies
+	}, Options{CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := false
+	fallback := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { served = true })
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://anything.example.com/", nil)
+	req.Header.Set("X-Forwarded-Proto", "https") // forged by a direct client
+	m.HTTPHandler(fallback).ServeHTTP(rec, req)
+	if rec.Code != http.StatusMovedPermanently {
+		t.Errorf("standalone + forged XFP https: status = %d, want 301 (header ignored)", rec.Code)
+	}
+	if served {
+		t.Error("standalone + forged XFP https: served in cleartext; want 301")
 	}
 }

@@ -18,6 +18,7 @@ const (
 	tokURL
 	tokQuery
 	tokQueryAllow   // query_allow NAME… -> only the listed params (globs ok), canonicalized
+	tokQueryStrip   // query_strip NAME… -> the full canonical query MINUS the listed params (globs ok)
 	tokHeader       // header:NAME -> req.Header.Get(NAME)
 	tokCookie       // cookie:NAME -> the value of request cookie NAME (per-user keying)
 	tokSticky       // {sticky} -> sticky cookie value or ClientIP
@@ -39,6 +40,7 @@ type keyToken struct {
 	clsf    *classifier     // tokClassify: the compiled classifier to resolve
 	tenantR *tenantResolver // tokTenant: request-derived resolver (nil => use arg as a constant)
 	allow   *nameGlobSet    // tokQueryAllow: the param-name allowlist (exact + globs)
+	deny    *nameGlobSet    // tokQueryStrip: the param-name denylist (exact + globs)
 }
 
 // keyTokenSep separates rendered tokens in the composed key. It is the ASCII unit
@@ -52,13 +54,14 @@ const keyTokenSep = "\x1f"
 // args is empty the default key (method host path) is used by the caller.
 func compileCacheKey(args []cadishfile.Arg, pos cadishfile.Pos, normalizers map[string]*normalizer, classifiers map[string]*classifier, tenant string, tenantR *tenantResolver) ([]keyToken, error) {
 	toks := make([]keyToken, 0, len(args))
+	hasAllow, hasStrip := false, false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
-		if a.Raw == "query_allow" {
-			// query_allow NAME… is the only multi-arg token: it greedily consumes the
-			// following param names (exact or `*` glob) up to the next recognized token
-			// keyword/placeholder, so it can sit before other tokens
-			// (`query_allow genre age {publi}`).
+		// query_allow / query_strip are the multi-arg tokens: each greedily consumes the
+		// following param names (exact or `*` glob) up to the next recognized token
+		// keyword/placeholder, so it can sit before other tokens
+		// (`query_allow genre age {publi}` / `query_strip utm_* {publi}`).
+		if a.Raw == "query_allow" || a.Raw == "query_strip" {
 			j := i + 1
 			var names []string
 			for j < len(args) && !isKeyTokenStart(args[j].Raw) {
@@ -66,9 +69,15 @@ func compileCacheKey(args []cadishfile.Arg, pos cadishfile.Pos, normalizers map[
 				j++
 			}
 			if len(names) == 0 {
-				return nil, &CompileError{Pos: pos, Msg: "query_allow needs at least one param name (e.g. `query_allow genre age camLang`)"}
+				return nil, &CompileError{Pos: pos, Msg: a.Raw + " needs at least one param name (e.g. `" + a.Raw + " " + exampleNames(a.Raw) + "`)"}
 			}
-			toks = append(toks, keyToken{kind: tokQueryAllow, allow: newNameGlobSet(names)})
+			if a.Raw == "query_allow" {
+				hasAllow = true
+				toks = append(toks, keyToken{kind: tokQueryAllow, allow: newNameGlobSet(names)})
+			} else {
+				hasStrip = true
+				toks = append(toks, keyToken{kind: tokQueryStrip, deny: newNameGlobSet(names)})
+			}
 			i = j - 1
 			continue
 		}
@@ -78,7 +87,35 @@ func compileCacheKey(args []cadishfile.Arg, pos cadishfile.Pos, normalizers map[
 		}
 		toks = append(toks, t)
 	}
+	// query_allow (keep-listed) and query_strip (drop-listed) are duals; combining them
+	// in ONE recipe is contradictory (an allowlist already drops everything unlisted), so
+	// reject it rather than silently pick one.
+	if hasAllow && hasStrip {
+		return nil, &CompileError{Pos: pos, Msg: "cache_key cannot combine query_allow and query_strip in one recipe — they are mutually exclusive (allowlist xor denylist); pick one"}
+	}
+	// query_strip drops the named params, but a whole-query token (`query`, or `url` which
+	// embeds the query) in the SAME recipe re-emits ALL params verbatim — silently
+	// defeating the strip. Reject the combination, symmetric with the query_allow⊕query_strip
+	// guard above (the same defeat applies to query_allow, but the existing whole-query+allow
+	// case is left to the operator; this closes the strip footgun the finding flagged).
+	if hasStrip {
+		for _, t := range toks {
+			if t.kind == tokURL || t.kind == tokQuery {
+				return nil, &CompileError{Pos: pos, Msg: "cache_key cannot combine query_strip with a whole-`query`/`url` token — the whole-query token re-emits the stripped params, defeating the strip; key the params you want (or drop the `query`/`url` token)"}
+			}
+		}
+	}
 	return toks, nil
+}
+
+// exampleNames returns a short illustrative param list for the `needs a param name`
+// error of query_allow (an allowlist of meaningful params) vs query_strip (a denylist
+// of tracking junk).
+func exampleNames(token string) string {
+	if token == "query_strip" {
+		return "utm_* a_mute gclid"
+	}
+	return "genre age camLang"
 }
 
 // compileCacheKeyRule compiles one `cache_key [SELECTOR] TOKEN…` directive into a
@@ -153,7 +190,7 @@ func looksLikeKeySelector(a cadishfile.Arg) bool {
 // words as token arguments.
 func isKeyTokenStart(raw string) bool {
 	switch raw {
-	case "method", "host", "path", "url", "query", "query_allow":
+	case "method", "host", "path", "url", "query", "query_allow", "query_strip":
 		return true
 	}
 	if strings.HasPrefix(raw, "header:") || strings.HasPrefix(raw, "cookie:") {
@@ -289,14 +326,19 @@ func writeToken(b *strings.Builder, t keyToken, req *Request, stickyCookie strin
 		writeKeyValue(b, req.Path)
 	case tokURL:
 		writeKeyValue(b, req.Path)
-		writeCanonicalQuery(b, req, true, nil) // leading '?' when the query is non-empty
+		writeCanonicalQuery(b, req, true, nil, nil) // leading '?' when the query is non-empty
 	case tokQuery:
-		writeCanonicalQuery(b, req, false, nil)
+		writeCanonicalQuery(b, req, false, nil, nil)
 	case tokQueryAllow:
 		// Keep only the allowlisted params, canonicalized + sorted exactly like the
 		// whole-query token. Unlisted params (utm_*, anything not named) are dropped,
 		// so they cannot fragment the cache key.
-		writeCanonicalQuery(b, req, false, t.allow)
+		writeCanonicalQuery(b, req, false, t.allow, nil)
+	case tokQueryStrip:
+		// Keep the FULL canonical query MINUS the denylisted params (utm_*, gclid, …),
+		// so meaningful params still key but tracking junk cannot fragment the cache.
+		// The dual of query_allow; same canonicalization/encoding.
+		writeCanonicalQuery(b, req, false, nil, t.deny)
 	case tokHeader:
 		writeKeyValue(b, req.headerCombined(t.arg))
 	case tokCookie:
@@ -370,9 +412,12 @@ const (
 // `?a=x%26b=y` (one param a="x&b=y") and `?a=x&b=y` (two params) decode to
 // different url.Values and render to different canonical strings.
 // When allow is non-nil only param names it matches are kept (the rest, including
-// utm_*, are dropped) — this is the `query_allow` token. A nil allow keeps every
-// param (the whole-`query`/`url` tokens).
-func writeCanonicalQuery(b *strings.Builder, req *Request, prefix bool, allow *nameGlobSet) {
+// utm_*, are dropped) — this is the `query_allow` token. When deny is non-nil every
+// param name it matches is dropped and the rest are kept — this is the `query_strip`
+// token (the dual). A nil allow and nil deny keeps every param (the whole-`query`/
+// `url` tokens). allow and deny are mutually exclusive (compile rejects both in one
+// recipe), so at most one is non-nil here.
+func writeCanonicalQuery(b *strings.Builder, req *Request, prefix bool, allow, deny *nameGlobSet) {
 	if len(req.Query) == 0 {
 		return
 	}
@@ -380,6 +425,9 @@ func writeCanonicalQuery(b *strings.Builder, req *Request, prefix bool, allow *n
 	keys := keyArr[:0]
 	for k := range req.Query {
 		if allow != nil && !allow.match(k) {
+			continue
+		}
+		if deny != nil && deny.match(k) {
 			continue
 		}
 		keys = append(keys, k)
@@ -409,10 +457,10 @@ func writeCanonicalQuery(b *strings.Builder, req *Request, prefix bool, allow *n
 }
 
 // nameGlobSet is an OR set of query-param NAME patterns: exact names (a hash-set
-// lookup) plus `*`-glob names (the existing glob engine). It backs both the
-// `query_allow` cache-key token and the `query_present` matcher. A bare `*` keeps
-// (matches) every name. Param names are matched case-sensitively, like url.Values
-// keys.
+// lookup) plus `*`-glob names (the existing glob engine). It backs the
+// `query_allow` / `query_strip` cache-key tokens and the `query_present` matcher. A
+// bare `*` matches every name (keeps all for query_allow, drops all for query_strip).
+// Param names are matched case-sensitively, like url.Values keys.
 type nameGlobSet struct {
 	exact    map[string]struct{}
 	globs    []*glob

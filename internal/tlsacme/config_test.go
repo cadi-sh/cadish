@@ -1,6 +1,7 @@
 package tlsacme
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -67,7 +68,7 @@ func TestParseSiteTLS_Modes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got, _ := parseTLS(t, tt.src)
 			got.HSTS = HSTS{} // compared separately
-			if got != tt.want {
+			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("got %+v, want %+v", got, tt.want)
 			}
 		})
@@ -204,5 +205,39 @@ func TestParseSiteTLS_EmptyBlockWording(t *testing.T) {
 		if hasWarn(errs, "literal token") {
 			t.Errorf("%q: still uses misleading 'literal token' wording: %v", src, errs)
 		}
+	}
+}
+
+// TestParseSiteTLS_HTTPRedirectExcept: the `http_redirect_except /path …` sub-option is
+// parsed into SiteTLS.RedirectExcept WITHOUT setting a TLS mode (it composes with
+// acme/cert), accepts multiple paths, and warns on a path that cannot match a request.
+func TestParseSiteTLS_HTTPRedirectExcept(t *testing.T) {
+	cfg, errs := parseTLS(t, "example.com {\n tls {\n acme me@x.io\n http_redirect_except /aws-health-check /webhook\n }\n}\n")
+	if cfg.Mode != ModeACME || cfg.Email != "me@x.io" {
+		t.Errorf("mode/email = %v/%q, want acme/me@x.io (exemption must not change mode)", cfg.Mode, cfg.Email)
+	}
+	want := []string{"/aws-health-check", "/webhook"}
+	if len(cfg.RedirectExcept) != len(want) {
+		t.Fatalf("RedirectExcept = %v, want %v", cfg.RedirectExcept, want)
+	}
+	for i, p := range want {
+		if cfg.RedirectExcept[i] != p {
+			t.Errorf("RedirectExcept[%d] = %q, want %q", i, cfg.RedirectExcept[i], p)
+		}
+	}
+	if hasWarn(errs, "unknown tls option") {
+		t.Errorf("http_redirect_except wrongly flagged unknown: %v", errs)
+	}
+
+	// A path without a leading "/" can never match a request path → soft warning.
+	_, errs2 := parseTLS(t, "example.com {\n tls {\n acme me@x.io\n http_redirect_except no-slash\n }\n}\n")
+	if !hasWarn(errs2, "must start with `/`") {
+		t.Errorf("expected leading-slash warning; got %v", errs2)
+	}
+
+	// No path at all → soft warning.
+	_, errs3 := parseTLS(t, "example.com {\n tls {\n acme me@x.io\n http_redirect_except\n }\n}\n")
+	if !hasWarn(errs3, "needs at least one path") {
+		t.Errorf("expected empty-args warning; got %v", errs3)
 	}
 }

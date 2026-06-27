@@ -91,6 +91,9 @@ func EdgeBuild(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	if rejectStrayConfigArgs("edge build", fs.Args()) {
+		return 2
+	}
 	return runEdgeBuild(*cfgPath, *out, *bundle, *strict, *asJSON, os.Stdout, os.Stderr)
 }
 
@@ -142,6 +145,24 @@ func runEdgeBuild(cfgPath, out, bundle string, strict, asJSON bool, stdout, stde
 		}
 	} else {
 		writeCoverageText(sites, stderr)
+	}
+
+	// SAFETY GATE (R02/R16) — fails the build NON-ZERO even WITHOUT -strict. A SELECTING
+	// directive (pass / route / redirect / cache_key selector or token / cache_ttl / storage /
+	// edge-tier / upgrade) referenced a matcher the edge cannot evaluate (a server-only
+	// Gateway/lb/`ip` matcher, or an untranslatable RE2 regex), so the projector forced the SAFE
+	// fallback — a site-wide fail-open `pass` or a delegated redirect chain. The runtime is safe,
+	// but the operator's PRECISE intent is silently coarsened (the whole site is passed), so the
+	// build refuses LOUDLY: the operator must consciously keep that directive on the Cadish server
+	// behind rather than discover at runtime that the edge caches nothing. This is the WS-C
+	// "fail loud at build" chokepoint the conformance suite cannot catch by construction.
+	var forced int
+	for _, s := range sites {
+		forced += s.rep.ForcedPass
+	}
+	if forced > 0 {
+		fmt.Fprintf(stderr, "cadish edge build: %d selecting directive(s) (pass/route/redirect/cache_key/cache_ttl/storage/edge-tier/upgrade) reference a matcher the edge cannot evaluate (a server-only Gateway/lb/`ip` matcher or an untranslatable RE2 regex) and were forced to a site-wide fail-open pass or a delegated redirect — the edge cannot honor them; keep those directives on the Cadish server behind (see the FAIL-OPEN warnings above)\n", forced)
+		return 1
 	}
 
 	// Exit code: under -strict any delegated directive is a coverage regression, AND
@@ -365,6 +386,9 @@ func EdgeDeploy(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	if rejectStrayConfigArgs("edge deploy", fs.Args()) {
+		return 2
+	}
 	return runEdgeDeploy(*cfgPath, *origin, os.Stdout, os.Stderr)
 }
 
@@ -394,9 +418,17 @@ func runEdgeDeploy(cfgPath, origin string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "cadish edge deploy: %v\n", err)
 			return 1
 		}
-		ir, _, perr := edgeir.Project(p)
+		ir, rep, perr := edgeir.Project(p)
 		if perr != nil {
 			fmt.Fprintf(stderr, "cadish edge deploy: %v\n", perr)
+			return 1
+		}
+		// SAFETY GATE — `edge deploy` is `build + upload`, so it must honor the SAME
+		// fail-closed gates `edge build` enforces, BEFORE anything is uploaded. Skipping
+		// them here would let `deploy` push a worker that `build` refuses: one that
+		// silently fails open site-wide (ForcedPass) or that bakes a secret into the
+		// PUBLIC bundle (ValueExposed). Refuse to upload such a bundle.
+		if abortEdgeDeployUnsafe(strings.Join(p.EdgeHosts(), ","), rep, stderr) {
 			return 1
 		}
 		src, berr := edgebundle.Bundle(ir)
@@ -413,11 +445,36 @@ func runEdgeDeploy(cfgPath, origin string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// abortEdgeDeployUnsafe applies the `edge build` safety gates to a deploy: it
+// refuses to UPLOAD a bundle the build would have rejected. A non-zero ForcedPass
+// means a selecting directive was silently coarsened to a site-wide fail-open pass
+// (the edge would cache nothing) — `edge build` already fails non-zero on this even
+// without -strict. A non-zero ValueExposed means a matcher/header literal (a
+// potential baked-in secret) would ship in the PUBLIC worker bundle. Either is
+// unsafe to push live, so deploy fails CLOSED here. Returns true (and prints why) to
+// abort. (SecurityGate stays advisory, mirroring `build`: it is enforced on the
+// Cadish server behind the edge, so it is surfaced but not a deploy-blocking gate.)
+func abortEdgeDeployUnsafe(hosts string, rep edgeir.CoverageReport, stderr io.Writer) bool {
+	abort := false
+	if rep.ForcedPass > 0 {
+		fmt.Fprintf(stderr, "cadish edge deploy: %s: refusing to upload — %d selecting directive(s) were forced to a site-wide fail-open pass or a delegated redirect (they reference a matcher the edge cannot evaluate); the edge cannot honor them, so keep those directives on the Cadish server behind (run `cadish edge build` for detail)\n", hosts, rep.ForcedPass)
+		abort = true
+	}
+	if rep.ValueExposed > 0 {
+		fmt.Fprintf(stderr, "cadish edge deploy: %s: refusing to upload — %d literal value(s) would be exposed in the PUBLIC worker bundle (a potential baked-in secret); remove the literal or quote the {$VAR} to keep it server-side (run `cadish edge build -strict` for detail)\n", hosts, rep.ValueExposed)
+		abort = true
+	}
+	return abort
+}
+
 // EdgeManageRoutes attaches (enable) or detaches (disable) the worker routes.
 func EdgeManageRoutes(args []string, action string) int {
 	fs := flag.NewFlagSet("edge "+action, flag.ContinueOnError)
 	cfgPath := fs.String("config", defaultConfigPath, "path to the Cadishfile")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if rejectStrayConfigArgs("edge "+action, fs.Args()) {
 		return 2
 	}
 	return runEdgeManageRoutes(*cfgPath, action, os.Stdout, os.Stderr)
@@ -520,6 +577,9 @@ func writeCoverageText(sites []edgeSite, w io.Writer) {
 		fmt.Fprintf(w, "edge coverage — %s (IR v%d)\n", s.hosts, s.ir.IRVersion)
 		fmt.Fprintf(w, "  edge-native: %d directive(s)\n", s.rep.EdgeNative)
 		fmt.Fprintf(w, "  delegated:   %d directive(s)\n", s.rep.Delegated)
+		if s.rep.ForcedPass > 0 {
+			fmt.Fprintf(w, "  forced-pass: %d selecting directive(s) the edge cannot honor (build FAILS)\n", s.rep.ForcedPass)
+		}
 		// Group delegate reasons by directive for a compact summary.
 		counts := map[string]int{}
 		reasons := map[string]string{}

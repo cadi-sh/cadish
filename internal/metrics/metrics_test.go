@@ -156,3 +156,68 @@ func TestUptimeAndStart(t *testing.T) {
 		t.Fatal("negative uptime")
 	}
 }
+
+// TestLatencyMeanMs: the mean is sum/count converted ns->ms. Ten samples of 10ms
+// must average to 10ms (guards the unit conversion that a dashboard reads).
+func TestLatencyMeanMs(t *testing.T) {
+	m := New()
+	if got := m.Snapshot().LatencyMeanMs(); got != 0 {
+		t.Fatalf("empty mean = %v, want 0", got)
+	}
+	for i := 0; i < 10; i++ {
+		m.RecordLatency(10 * time.Millisecond)
+	}
+	if got := m.Snapshot().LatencyMeanMs(); got < 9.99 || got > 10.01 {
+		t.Errorf("LatencyMeanMs = %v, want ~10", got)
+	}
+}
+
+// TestUpgradeGaugeSymmetry: upgradesActive is a live gauge — each IncUpgrade must
+// be undone one-to-one by DecUpgrade, returning to zero (a leak here would falsely
+// report open WebSocket tunnels forever).
+func TestUpgradeGaugeSymmetry(t *testing.T) {
+	m := New()
+	m.IncUpgrade()
+	m.IncUpgrade()
+	m.IncUpgrade()
+	if got := m.Snapshot().UpgradesActive; got != 3 {
+		t.Fatalf("after 3 Inc, UpgradesActive = %d, want 3", got)
+	}
+	m.DecUpgrade()
+	m.DecUpgrade()
+	m.DecUpgrade()
+	if got := m.Snapshot().UpgradesActive; got != 0 {
+		t.Errorf("after Inc/Dec balance, UpgradesActive = %d, want 0", got)
+	}
+}
+
+// TestRecordRateLimitRouting: each action increments ONLY its own counter, and an
+// unknown action is ignored (no miscounting on the security dashboard).
+func TestRecordRateLimitRouting(t *testing.T) {
+	m := New()
+	m.RecordRateLimit("throttle", "r1")
+	m.RecordRateLimit("monitor", "r1")
+	m.RecordRateLimit("monitor", "r1")
+	m.RecordRateLimit("pass", "r1")
+	m.RecordRateLimit("bogus", "r1") // ignored
+	s := m.Snapshot()
+	if s.RateLimitThrottle != 1 || s.RateLimitMonitor != 2 || s.RateLimitPass != 1 {
+		t.Errorf("rate-limit counters = throttle %d monitor %d pass %d, want 1/2/1",
+			s.RateLimitThrottle, s.RateLimitMonitor, s.RateLimitPass)
+	}
+}
+
+// TestIncInternalError: the internal-error counter increments independently of
+// origin errors (they are distinct failure classes on the dashboard).
+func TestIncInternalError(t *testing.T) {
+	m := New()
+	m.IncInternalError()
+	m.IncInternalError()
+	s := m.Snapshot()
+	if s.InternalErrors != 2 {
+		t.Errorf("InternalErrors = %d, want 2", s.InternalErrors)
+	}
+	if s.OriginErrors != 0 {
+		t.Errorf("OriginErrors = %d, want 0 (must not bleed into origin errors)", s.OriginErrors)
+	}
+}

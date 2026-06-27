@@ -38,4 +38,13 @@ func TestDuplicateCookieNameDefeatsKeyingBypasses(t *testing.T) {
 	if ph.BypassForCredentials(dupe) {
 		t.Error("header:Cookie keys the whole Cookie header (all values) → a duplicate is covered, should not bypass")
 	}
+
+	// A RAW cookie:NAME-keyed cookie sent twice with the SAME value STILL bypasses: the
+	// SPEC-DUP-COOKIE relaxation is scoped to forward-covered cookies (keyed by a DERIVED
+	// axis); a raw value enters the key, which captures only the first occurrence, so the
+	// raw-keyed path keeps refusing regardless of whether the values match. Fail-closed.
+	dupeSame := &Request{Host: "example.com", Path: "/", Header: http.Header{"Cookie": {"uid=alice; uid=alice"}}}
+	if !p.BypassForCredentials(dupeSame) {
+		t.Error("a raw cookie:uid keyed cookie sent twice (even SAME value) must BYPASS — the relaxation is forward-covered only")
+	}
 }

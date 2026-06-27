@@ -23,17 +23,19 @@ const (
 	kindHeaderRegex   // request-phase: matches a named request header's value against an RE2 regex
 	kindMethod
 	kindUpstream
-	kindContentType  // response-phase: matches the response Content-Type
-	kindCookie       // request-phase: matches a named cookie in the Cookie header
-	kindSetCookie    // response-phase: matches a Set-Cookie header in the response
-	kindClassify     // request-phase: matches a classify token value ({TOKEN}==VALUE)
-	kindGeo          // request-phase: matches a resolved geo class at a granularity
-	kindQueryPresent // request-phase: matches if ANY named query param is present (globs)
-	kindQuery        // request-phase: matches a named query param's value (exact, OR set)
-	kindIP           // request-phase: matches the resolved real client IP against IP/CIDRs
-	kindCookieJSON   // request-phase: matches a dotted field inside a JSON cookie value
-	kindHeaderJSON   // request-phase: matches a dotted field inside a JSON header value
-	kindAll          // AND-composite: matches when EVERY referenced sub-matcher matches
+	kindContentType     // response-phase: matches the response Content-Type
+	kindRespHeader      // response-phase: matches a named ORIGIN RESPONSE header's value (exact or `*`-glob)
+	kindCookie          // request-phase: matches a named cookie in the Cookie header
+	kindSetCookie       // response-phase: matches a Set-Cookie header in the response
+	kindClassify        // request-phase: matches a classify token value ({TOKEN}==VALUE)
+	kindGeo             // request-phase: matches a resolved geo class at a granularity
+	kindQueryPresent    // request-phase: matches if ANY named query param is present (globs)
+	kindQuery           // request-phase: matches a named query param's value (exact, OR set)
+	kindIP              // request-phase: matches the resolved real client IP against IP/CIDRs
+	kindCookieJSON      // request-phase: matches a dotted field inside a JSON cookie value
+	kindHeaderJSON      // request-phase: matches a dotted field inside a JSON header value
+	kindAll             // AND-composite: matches when EVERY referenced sub-matcher matches
+	kindUpstreamHealthy // request-phase: matches when ANY named pool has a live backend (server-only)
 )
 
 // geoGranularity selects which resolved geo field a `geo` matcher tests.
@@ -52,7 +54,7 @@ const (
 // directives (pass, purge, route, cache_key, a pre-cache_key header) — the response
 // isn't known in RECV/KEY. The request-matching kinds work in every phase.
 func isResponsePhaseKind(k matcherKind) bool {
-	return k == kindContentType || k == kindSetCookie
+	return k == kindContentType || k == kindSetCookie || k == kindRespHeader
 }
 
 // matcher is a compiled named predicate over a request. Exactly one of the
@@ -74,8 +76,15 @@ type matcher struct {
 	hosts *hostSet       // kindHost
 	re    *regexp.Regexp // kindPathRegex, kindHostRegex, kindHeaderRegex
 
-	headerName   string   // kindHeader, kindHeaderPresent, kindHeaderRegex
+	headerName   string   // kindHeader, kindHeaderPresent, kindHeaderRegex, kindRespHeader
 	headerValues []string // kindHeader: OR of accepted values; empty => presence only
+
+	// kindRespHeader: the named ORIGIN RESPONSE header's accepted value patterns
+	// (exact + `*`-glob, reusing the cache-key name-glob engine). Empty => presence
+	// only (the header is present with any value). The raw patterns are kept in
+	// respValuePatterns so the edge projection can reconstruct them 1:1.
+	respValues        *nameGlobSet
+	respValuePatterns []string
 
 	methods   map[string]struct{} // kindMethod (upper-cased)
 	upstreams map[string]struct{} // kindUpstream
@@ -114,6 +123,13 @@ type matcher struct {
 	// matches when EVERY term matches (XOR its negate flag). Resolved after all plain
 	// matchers are compiled (forward references allowed).
 	subTerms []secTerm
+
+	// kindUpstreamHealthy: the OR set of upstream POOL names the matcher tests for
+	// liveness (ANY: true when ≥1 listed pool has a live backend). The pool names are
+	// EXPLICIT, so the matcher is independent of routing/upstream selection and is
+	// evaluable in RECV before the origin pick. Liveness is resolved through the
+	// server-injected Request.PoolHealthy view (server-only; never projected to edge).
+	healthyPools []string
 }
 
 // matcherType maps a matcher type keyword to its kind. ok is false for unknown
@@ -140,6 +156,8 @@ func matcherType(t string) (matcherKind, bool) {
 		return kindUpstream, true
 	case "content_type":
 		return kindContentType, true
+	case "resp_header":
+		return kindRespHeader, true
 	case "cookie":
 		return kindCookie, true
 	case "cookie_json":
@@ -156,6 +174,8 @@ func matcherType(t string) (matcherKind, bool) {
 		return kindQuery, true
 	case "ip":
 		return kindIP, true
+	case "upstream_healthy":
+		return kindUpstreamHealthy, true
 	default:
 		return 0, false
 	}
@@ -305,6 +325,21 @@ func compileMatcher(name, typ string, args []string, pos cadishfile.Pos) (*match
 		for _, a := range args {
 			m.contentTypes = append(m.contentTypes, strings.ToLower(a))
 		}
+	case kindRespHeader:
+		// `resp_header NAME [VALUE…]` — a RESPONSE-phase matcher over a named origin
+		// response header. NAME is required (case-insensitive, HTTP header semantics).
+		// VALUE(s) are matched exact-or-`*`-glob via the shared name-glob engine (a bare
+		// `*` => presence). With no VALUE it is a presence test. Response-phase only:
+		// usable on cache_ttl/storage (and any response/DELIVER directive), never in a
+		// request-phase context — enforced by isResponsePhaseKind.
+		if len(args) == 0 || args[0] == "" {
+			return nil, &CompileError{Pos: pos, Msg: "resp_header matcher needs a NAME: `resp_header NAME [VALUE]`"}
+		}
+		m.headerName = args[0]
+		m.respValuePatterns = append([]string(nil), args[1:]...)
+		if len(m.respValuePatterns) > 0 {
+			m.respValues = newNameGlobSet(m.respValuePatterns)
+		}
 	case kindSetCookie:
 		// Zero args is valid: it matches any Set-Cookie present. Named args restrict
 		// to Set-Cookie headers that set a cookie of that name (OR).
@@ -366,6 +401,15 @@ func compileMatcher(name, typ string, args []string, pos cadishfile.Pos) (*match
 			return nil, err
 		}
 		return ipm, nil
+	case kindUpstreamHealthy:
+		// `upstream_healthy NAME[ NAME…]` — true when ANY listed upstream pool has a
+		// live backend (lb nbsrv()>0), the AWS health-probe primitive. The pool names
+		// are EXPLICIT (independent of routing), so it evaluates in RECV. At least one
+		// name is required; liveness is resolved at request time via Request.PoolHealthy.
+		if len(args) == 0 {
+			return nil, &CompileError{Pos: pos, Msg: "upstream_healthy matcher needs at least one upstream pool name (e.g. `upstream_healthy cache_pool`)"}
+		}
+		m.healthyPools = append([]string(nil), args...)
 	}
 	return m, nil
 }
@@ -453,6 +497,25 @@ func (m *matcher) match(c *matchContext) bool {
 		}
 		for _, want := range m.contentTypes {
 			if strings.Contains(ct, want) {
+				return true
+			}
+		}
+		return false
+	case kindRespHeader:
+		// Matches a named ORIGIN RESPONSE header. c.respHeader is nil in the
+		// request/origin-error phases, where a resp_header matcher never fires — and
+		// Compile rejects scoping a request-phase directive with one. Header.Values
+		// canonicalizes the key, so the NAME match is case-insensitive. A multi-valued
+		// header matches if ANY value matches (the same OR convention as header_regex).
+		if c.respHeader == nil {
+			return false
+		}
+		vals := c.respHeader.Values(m.headerName)
+		if m.respValues == nil {
+			return len(vals) > 0 // presence: the header exists with any value
+		}
+		for _, v := range vals {
+			if m.respValues.match(v) {
 				return true
 			}
 		}
@@ -601,6 +664,21 @@ func (m *matcher) match(c *matchContext) bool {
 		ip = ip.Unmap()
 		for _, p := range m.ipPrefixes {
 			if p.Contains(ip) {
+				return true
+			}
+		}
+		return false
+	case kindUpstreamHealthy:
+		// ANY semantics: true as soon as ONE listed pool has a live backend (nbsrv()>0).
+		// Liveness comes from the server-injected Request.PoolHealthy view, populated from
+		// config.Pools() ONLY when the pipeline NeedsPoolHealth. A nil view (matcher not
+		// injected, or no pools) fails CLOSED — every pool is treated as down — so a probe
+		// can never spuriously report healthy. The pure pipeline never touches lb.
+		if c.req.PoolHealthy == nil {
+			return false
+		}
+		for _, name := range m.healthyPools {
+			if c.req.PoolHealthy(name) {
 				return true
 			}
 		}

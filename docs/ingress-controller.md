@@ -134,7 +134,9 @@ rate-limit-style policy, but it **may not**
 - define a backend, route, or credential — `upstream`, `cluster`, `origin`, `route`, `to`,
   and `sign` are **rejected** (otherwise a tenant's ConfigMap could proxy an arbitrary
   host — cloud metadata / SSRF — or a Service in another namespace, bypassing the
-  namespace-locked Ingress path).
+  namespace-locked Ingress path). `import` and `geo` are **rejected** too — both resolve a
+  pod-local filesystem path, which would leak controller-pod file contents into the Ingress
+  status.
 
 A fragment that hits either restriction is skipped with a warning Event; the host's routes
 still serve.
@@ -183,10 +185,14 @@ metadata:
 > HTTP to cadish `:80`; an unconditional 301→HTTPS would bounce the client back to the
 > terminator, which forwards plain HTTP again — an infinite loop. cadish breaks it by
 > **not redirecting a request that already arrived over HTTPS**, detected via
-> `X-Forwarded-Proto: https`. The upstream LB therefore **must set `X-Forwarded-Proto`**
-> to the client's scheme **and strip any client-supplied value** (so a client cannot
-> suppress the redirect by forging the header). Cloudflare and standard ingress LBs do
-> this by default.
+> `X-Forwarded-Proto: https`. This loop guard is **trust-gated** (R15): cadish honors
+> `X-Forwarded-Proto` **only from a socket peer in `trust_proxy`**, so a direct client
+> cannot forge the header to be served in cleartext. **Declare the terminator's network
+> in `trust_proxy`** (e.g. Cloudflare's IP ranges) so the legitimate loop guard applies;
+> the LB must also still set `X-Forwarded-Proto` to the client's scheme and strip any
+> client-supplied value. With no `trust_proxy` the header is ignored and every plain
+> `:80` request is redirected (so a `cadi.sh/ssl-redirect` host behind an untrusted-by-
+> cadish terminator would loop — declare the trust_proxy).
 
 (Standalone `cadish run` is unaffected: it keeps automatic-HTTPS, redirecting
 every host.)
@@ -205,7 +211,8 @@ guarantees below, which are correct in **any** trust model.
   in a restricted mode: **no environment substitution** (`{$VAR}` is rejected, so a fragment
   cannot read the controller pod's env / admin token) and a **directive allow-list** that
   rejects backend/route/credential directives (`upstream`, `cluster`, `origin`, `route`,
-  `to`, `sign`). A fragment cannot define an upstream, re-wire routing, or mint credentials.
+  `to`, `sign`, plus `import`/`geo` whose filesystem-path reads would leak pod-local files).
+  A fragment cannot define an upstream, re-wire routing, or mint credentials.
 - **A policy ref is confined to its own namespace.** `cadi.sh/policy: ns/name` must name a
   ConfigMap in the **Ingress's own namespace**; a cross-namespace ref is rejected and the
   controller never reads the foreign ConfigMap.
@@ -293,6 +300,26 @@ Ingresses whose class matches.
   **Kubernetes Ingress** panel on the admin dashboard, refreshed once a second over the
   existing live feed (`/api/ingress` + the SSE stream). Plain `cadish run` has no
   controller, so the panel never appears.
+
+## Warm-readiness probe (`/.cadish/readyz`)
+
+cadish serves a reserved `/.cadish/readyz` endpoint that reports **`503 Service
+Unavailable` until the controller's first reconcile builds the routing table** from synced
+listers, then **`200 OK`**. The controller's `startupProbe` and `readinessProbe` use it
+(`httpGet: /.cadish/readyz`), so Kubernetes does **not** route traffic to a pod whose
+routing table is not yet built — closing the rollout window where a freshly-started pod
+would otherwise return transient **502s** (a TCP probe passes the instant the listener
+binds, *before* `WaitForCacheSync` + the first reconcile). The endpoint is Host-agnostic,
+answers any method, is never cached or logged as traffic, and never reaches an origin. The
+`livenessProbe` deliberately stays **TCP** — liveness must check process-alive, not warm,
+or it would kill a pod that is merely between configs.
+
+The probe targets the plain **`:80`** listener (`port: http`, scheme HTTP). Even when the
+controller terminates TLS, `/.cadish/readyz` is **exempt from the HTTP→HTTPS redirect** on
+`:80`: it is served straight through to the data plane and returns the real `200`/`503`,
+never a `301`. This matters because a Kubernetes `httpGet` probe treats **both 2xx and 3xx
+as success** — if the probe were redirected it would pass regardless of warm state,
+silently defeating the gate. Keep the probe on the HTTP scheme/`:80` port for this reason.
 
 ## CLI flags
 

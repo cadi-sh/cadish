@@ -11,7 +11,7 @@ import { handle } from "./entry.js";
 // Minimal storefront-ish IR: cache_key = url, default ttl 60s/grace 1h, a
 // +cache_status X-Cache header. edge default "local" (L1 only).
 const IR_LOCAL = {
-  irVersion: 4,
+  irVersion: 5,
   site: { hosts: ["example.com"] },
   upstream: {},
   matchers: {},

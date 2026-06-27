@@ -76,12 +76,63 @@ type Request struct {
 	// the resolved country via an in-tree static table (no GeoIP dependency) before
 	// EvalRequest; "" when no geo granularity token/matcher is used.
 	GeoContinent string
+	// TLS reports whether the inbound connection terminated TLS AT cadish (the
+	// server sets it from r.TLS != nil when it builds the Request). It backs the
+	// {proto}/{scheme} dynamic-header token (FWDHDR part b): {proto} resolves to
+	// "https" when TLS is true, else "http" — the HAProxy `X-Forwarded-Proto https
+	// if { ssl_fc }` equivalent. It is purely request-scoped (no cache-key effect).
+	TLS bool
 	// GeoRegion is the resolved region / subdivision class for the {geo.region}
 	// token (e.g. "US-UT"/"US-TX", or "unknown"). The server reads it from a
 	// configurable upstream CDN region header (no bundled GeoIP DB — region
 	// granularity REQUIRES an upstream geo header) before EvalRequest; "" when no
 	// geo granularity token/matcher is used or no region source is configured.
 	GeoRegion string
+	// PoolHealthy reports whether the named upstream POOL currently has at least one
+	// live backend (lb nbsrv()>0). It backs the `upstream_healthy NAME…` matcher (the
+	// AWS /aws-health-check probe). The server injects it from the site's live pools
+	// (config.Pools) ONLY when the compiled pipeline references the matcher — gated by
+	// Pipeline.NeedsPoolHealth — so the fast path is untouched on every other site. It
+	// is nil when not injected, in which case the matcher fails CLOSED (treats every
+	// pool as down). The pure pipeline never imports internal/lb: it sees only this
+	// func, keeping liveness resolution decoupled exactly like geo/device are.
+	PoolHealthy func(name string) bool
+
+	// selKey captures the cache-key recipe SELECTED for this request at EvalRequest
+	// time (the KEY phase), so the cache key, the credential-coverage check
+	// (BypassForCredentials), and the Vary-coverage check (EvalResponse) all reference
+	// the SAME recipe. This is the Finding 1 (round-3) safety fix: a `cache_key`
+	// recipe SELECTOR may read a cookie that is also a `derives_from` axis input, and
+	// StripDerivedCookies removes that cookie AFTER the key is built — so re-running
+	// selectKeyTokens on the now-stripped request (as the later gates used to) could
+	// pick a DIFFERENT recipe than the one that built the stored key, and validate
+	// coverage/Vary against the wrong recipe (a cross-user / cross-variant leak). The
+	// Request is the handle already threaded through every gate, so EvalRequest stashes
+	// the authoritative selection here and resolvedKeyTokens reuses it. EvalRequest
+	// ALWAYS (re)computes and overwrites it, so a value-copied Request (siblingGetKey's
+	// `getReq := *preq`) that then re-runs EvalRequest re-derives correctly rather than
+	// inheriting a stale selection. selKey may be nil (no recipe matched / no cache_key);
+	// callers apply the defaultKeyTokens fallback exactly as before. selKeySet
+	// distinguishes "captured (use it)" from "EvalRequest never ran" (tests/conformance
+	// that call EvalResponse directly) — the latter falls back to a fresh selection, so
+	// existing direct callers are byte-for-byte unchanged.
+	selKey    []keyToken
+	selKeySet bool
+
+	// cookieMemo* lazily caches the lenient parse of THIS request's Cookie header so a
+	// credentialed request parses it once, not 3+ times across buildKey (one per
+	// cookie:NAME token), BypassForCredentials (cookieNames) and keyCoversAllCookies
+	// (R28). The cache is keyed on the JOINED raw Cookie header bytes (cookieMemoRaw):
+	// the server STRIPS cookies from req.Header mid-request (StripDerivedCookies /
+	// cookie_allow, AFTER the key is built but BEFORE the credential check), changing the
+	// header — so a raw-keyed memo re-parses exactly when the bytes change and can never
+	// hand a stale (pre-strip) parse to the post-strip gate (which would be a cross-user
+	// leak). The fields are per-request (a *Request is single-goroutine; a value copy in
+	// siblingGetKey shares the same Cookie map, so its inherited memo matches) — never
+	// shared/global. cookieMemoSet distinguishes "memoized (possibly nil)" from "unset".
+	cookieMemoRaw string
+	cookieMemo    []cookieKV
+	cookieMemoSet bool
 }
 
 // method returns the effective method, upper-cased, defaulting to GET.
@@ -150,7 +201,39 @@ func lenientCookies(h http.Header) []cookieKV {
 	if len(lines) == 0 {
 		return nil
 	}
+	return parseLenientCookies(strings.Join(lines, "; "))
+}
+
+// lenientCookies is the MEMOIZED per-request lenient parse (R28): it caches the parsed
+// cookies keyed on the joined raw Cookie header so the credentialed hot path (buildKey +
+// BypassForCredentials + keyCoversAllCookies) parses once instead of 3+ times. The memo
+// is keyed on the raw bytes, so it re-parses automatically when the server strips cookies
+// mid-request (the memo can never serve a stale pre-strip parse to a post-strip gate). It
+// is identical to the package-level lenientCookies(r.Header) in every result.
+func (r *Request) lenientCookies() []cookieKV {
+	if r.Header == nil {
+		return nil
+	}
+	lines := r.Header["Cookie"]
+	if len(lines) == 0 {
+		return nil
+	}
 	raw := strings.Join(lines, "; ")
+	if r.cookieMemoSet && r.cookieMemoRaw == raw {
+		return r.cookieMemo
+	}
+	parsed := parseLenientCookies(raw)
+	r.cookieMemoRaw = raw
+	r.cookieMemo = parsed
+	r.cookieMemoSet = true
+	return parsed
+}
+
+// parseLenientCookies parses a single already-joined Cookie header string with the lenient
+// rules (split on ';', then on the first '=', trim, strip one surrounding quote pair). It
+// is the shared core of both the package-level reader (for synthetic headers) and the
+// memoized per-request reader.
+func parseLenientCookies(raw string) []cookieKV {
 	var out []cookieKV
 	for _, part := range strings.Split(raw, ";") {
 		part = strings.TrimSpace(part)
@@ -176,7 +259,7 @@ func lenientCookies(h http.Header) []cookieKV {
 // cookie returns the value of the named cookie, or "" if absent — read LENIENTLY (see
 // lenientCookies) so a JSON/quoted cookie value the origin uses is captured in the cache key.
 func (r *Request) cookie(name string) string {
-	for _, c := range lenientCookies(r.Header) {
+	for _, c := range r.lenientCookies() {
 		if c.name == name {
 			return c.value
 		}
@@ -203,7 +286,7 @@ func LenientCookieValue(h http.Header, name string) string {
 // be cached when the key captures every cookie it carries — and the gate must SEE a JSON cookie
 // the origin will use, which the strict net/http parser silently dropped.
 func (r *Request) cookieNames() []string {
-	cs := lenientCookies(r.Header)
+	cs := r.lenientCookies()
 	if len(cs) == 0 {
 		return nil
 	}

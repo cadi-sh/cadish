@@ -51,6 +51,9 @@ var DefaultDirectives = []string{
 	"cluster",
 	"origin",
 	"pass",
+	// `upgrade @scope` enables a WebSocket / `Connection: Upgrade` passthrough tunnel
+	// (mirrors `pass`; implies it). Server-only — never projected to the edge.
+	"upgrade",
 	"cache_key",
 	"cache_ttl",
 	// site-level opt-out of PART of the safe-by-default refusal: when present, cadish caches
@@ -60,6 +63,23 @@ var DefaultDirectives = []string{
 	// cookie-setting origin), and the request credential bypass (Cookie/Authorization) is
 	// independent of it. OFF by default — caching is safe by default.
 	"cache_unsafe",
+	// `cache_credentialed @scope` makes caching ORIGIN-AUTHORITATIVE for the matching
+	// requests: it skips the request-time credential bypass (Cookie/Authorization),
+	// forwards the original cookies to origin for auth, and stores under the SHARED key
+	// only on a POSITIVE in-scope cache_ttl signal (the SOLE storage gate, fail-closed) — the
+	// scoped opt-out that expresses a custom-VCL `return(hash)` on cookie traffic. The signal
+	// FORCE-OVERRIDES + STRIPS the per-user Set-Cookie + weak Cache-Control/Pragma/Expires (the
+	// VCL `unset set-cookie; unset Cache-Control; set ttl`); no signal ⇒ not stored.
+	// `strip_cookies` in the same scope is a compile error. Server+edge serving-tier policy —
+	// the AST learns nothing about it.
+	"cache_credentialed",
+	// site-level opt-out of honoring a request's client-forced revalidation
+	// (`Cache-Control: no-cache`/`max-age=0`, `Pragma: no-cache`; RFC 9111 §5.2.1.4).
+	// `client_cache_control ignore` makes the server serve the fresh/stale entry as
+	// normal instead of forcing a MISS — the equivalent of Varnish's `unset
+	// req.http.Cache-Control`, closing the cache-bust / DoS vector of a browser
+	// hard-refresh. The absent default honors it (unchanged).
+	"client_cache_control",
 	"storage",
 	"lb",
 	"sticky",
@@ -67,6 +87,12 @@ var DefaultDirectives = []string{
 	// per-upstream transport knobs (gap H6): TLS ClientHello server name + connection-reuse
 	"sni",
 	"http_reuse",
+	// per-upstream origin TLS verification (TLSVERIFY): skip-verify / private-CA / pinned ALPN
+	"tls_insecure",
+	"ca_file",
+	"alpn",
+	// per-upstream DNS resolver knob (RESOLVER): re-resolution interval + nameserver(s)
+	"resolve",
 	"header",
 	"strip_cookies",
 	// request-cookie allowlist: keep only the named cookies, strip the rest before the
@@ -90,20 +116,37 @@ var DefaultDirectives = []string{
 	"encode",
 	"classify",
 	"edge",
+	// global `access_log off` option: disable the in-memory access-log hub. Global-only
+	// (parsed from the leading options block); a misplaced occurrence in a site body is
+	// rejected by pipeline.Compile with a positioned global-only placement error
+	// (globalOnlyDirectives), not silently ignored.
 	"access_log",
 	// global `strict_host` option: reject an undeclared Host with 421 instead of the
-	// lenient single-site fallback (Host-confusion / cache-poisoning hardening). Listed
-	// so a stray `strict_host` in a site body is flagged unknown like its global peers.
+	// lenient single-site fallback (Host-confusion / cache-poisoning hardening).
+	// Registered so it parses cleanly as a known directive; a misplaced occurrence in a
+	// site body is rejected by pipeline.Compile with a positioned global-only placement
+	// error (globalOnlyDirectives) — NOT silently ignored, and not flagged as unknown.
 	"strict_host",
-	// global `admin { … }` block: the dashboard/metrics listener (D16). Global-only,
-	// but listed so a stray `admin` in a site body is flagged unknown consistently with
-	// its global peers (access_log/security/proxy_protocol).
+	// global `admin { … }` block: the dashboard/metrics listener (D16). Global-only;
+	// registered so it parses cleanly as a known directive. A misplaced occurrence in a
+	// site body is rejected by pipeline.Compile with a positioned global-only placement
+	// error (globalOnlyDirectives), not silently ignored.
 	"admin",
 	// global `proxy_protocol { trust … }` block: opt-in PROXY-protocol listener
-	// (recover the real client IP behind an L4/TCP-passthrough LB)
+	// (recover the real client IP behind an L4/TCP-passthrough LB). Global-only; a
+	// misplaced occurrence in a site body is rejected by pipeline.Compile with a
+	// positioned global-only placement error (globalOnlyDirectives).
 	"proxy_protocol",
-	// global `security { audit_log … }` block: security observability (WAF v1c, D52)
+	// global `security { audit_log … }` block: security observability (WAF v1c, D52).
+	// Global-only; a misplaced occurrence in a site body is rejected by pipeline.Compile
+	// with a positioned global-only placement error (globalOnlyDirectives).
 	"security",
+	// global `server { maxconn N; read_timeout D; idle_timeout D }` block: the inbound
+	// data-plane connection knobs. A global data-plane block, registered so it parses
+	// cleanly as a known directive; a misplaced occurrence in a site body is rejected by
+	// pipeline.Compile with a positioned global-only placement error (globalOnlyDirectives)
+	// — NOT silently ignored, and not flagged as an unknown directive.
+	"server",
 	// security gate (native primitives, server-only; see internal/pipeline/secgate.go)
 	"allow",
 	"deny",
@@ -134,6 +177,11 @@ var DefaultMatcherTypes = []string{
 	"method",
 	"upstream",
 	"content_type",
+	// RESPONSE-phase matcher over a named origin response header value (exact or
+	// `*`-glob): `cache_ttl resp_header X-Powered-By Express ttl 1m grace 2w` branches
+	// freshness on what the origin returned. Response-phase only (cache_ttl/storage and
+	// the DELIVER directives); a request-phase use is a compile error.
+	"resp_header",
 	"cookie",
 	// structured-value matchers: a bounded dotted field test inside a JSON cookie/
 	// header value (D54). Request-phase; see internal/pipeline/cookie_json.go.
@@ -153,6 +201,11 @@ var DefaultMatcherTypes = []string{
 	// HTTPRoute match (path AND headers AND method AND query) is ONE named matcher — a
 	// single `route @name -> u` plus a correct terminal no-match 404.
 	"all",
+	// liveness probe: `@live upstream_healthy NAME[ NAME…]` matches when ANY named
+	// upstream POOL has a live backend (lb nbsrv()>0). Composes with scoped `respond`
+	// for the AWS /aws-health-check probe (`respond @probe @live 200` / `respond @probe
+	// 503`). SERVER-ONLY — live pool health does not exist at the edge (delegated).
+	"upstream_healthy",
 }
 
 // NewDefaultDirectiveRegistry returns a DirectiveRegistry seeded with

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -84,12 +85,27 @@ type DiskTier struct {
 	// cached NOWHERE. Atomic so Stats() reads it lock-free. A growing value means the
 	// disk tier is too small for the objects being served — worth alerting on (F6).
 	oversizeDiscards int64
+	// noTierDiscards counts objects refused at commit because this tier has a ZERO
+	// (non-positive) budget — i.e. a RAM-only deployment with no disk tier configured.
+	// The automatic size policy (pickTier) routes an unknown-length (chunked/streamed)
+	// or over-the-RAM-threshold response to the disk tier; on a RAM-only box that tier
+	// has no budget, so the object is cached NOWHERE and streams through uncached. This
+	// is a DIFFERENT operator situation from oversizeDiscards (an object too big for a
+	// REAL disk tier — "raise the disk budget"): here the fix is "add a disk tier (or
+	// have the origin send a small Content-Length)", so it is counted/logged separately
+	// rather than mislabeled as oversize. Atomic so Stats() reads it lock-free.
+	noTierDiscards int64
 	// log is an OPTIONAL observability logger. Nil (the default) keeps the tier
 	// silent (the cache package owns no logger); the server attaches one via
-	// SetLogger so a per-shard-cap discard is observable. nextOversizeLog rate-limits
-	// the discard log so a flood of oversized objects cannot spam the log.
-	log             *slog.Logger
+	// SetLogger so a per-shard-cap discard is observable. It is an atomic.Pointer
+	// (R33): SetLogger is re-invoked on every reload (attachStoreLoggers) on a
+	// transplanted store, so a SIGHUP coinciding with an oversize commit (which reads
+	// the logger under a shard lock SetLogger does not hold) would otherwise be a data
+	// race. nextOversizeLog rate-limits the discard log so a flood of oversized objects
+	// cannot spam the log.
+	log             atomic.Pointer[slog.Logger]
 	nextOversizeLog atomic.Int64 // unix-nano; next time an oversize discard may log
+	nextNoTierLog   atomic.Int64 // unix-nano; next time a no-tier (RAM-only) discard may log
 }
 
 type diskEntry struct {
@@ -132,11 +148,38 @@ func NewDiskTier(dir string, maxBytes int64) (*DiskTier, error) {
 			lru:      list.New(),
 		}
 	}
+	// Reap orphaned in-progress temp blobs (R01e): a mid-write crash leaves
+	// os.CreateTemp(blobDir, "wip-*") files that load() never scans, never counts toward
+	// DiskMaxBytes, and that never become a committed (sha256-named) blob — so under a
+	// high write rate they leak NVMe space without bound. Committed blobs are always
+	// renamed off the wip- prefix, so any wip-* file at startup is a dead orphan: remove
+	// them all before loading. Best-effort (a transient unlink error must not block boot).
+	d.reapTempBlobs()
 	if err := d.load(); err != nil {
 		return nil, err
 	}
 	go d.flushLoop()
 	return d, nil
+}
+
+// reapTempBlobs removes any orphaned in-progress temp blob (a file under blobDir whose
+// name carries the os.CreateTemp "wip-" prefix the diskWriter uses). Such a file can only
+// be the residue of a write that crashed before commit renamed it to its sha256 name, so
+// it is never a live blob. Best-effort: a read or unlink error is ignored (boot must not
+// fail on a transient FS hiccup). Runs once at startup before any writer is handed out.
+func (d *DiskTier) reapTempBlobs() {
+	ents, err := os.ReadDir(d.blobDir)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		if strings.HasPrefix(e.Name(), "wip-") {
+			_ = os.Remove(filepath.Join(d.blobDir, e.Name()))
+		}
+	}
 }
 
 // shard returns the shard owning key.
@@ -252,6 +295,23 @@ func (d *DiskTier) load() error {
 		s.curBytes += m.Size
 		atomic.StoreInt64(&s.atomicBytes, s.curBytes)
 	}
+	// Per-shard back-of-LRU eviction after distributing entries (R03e): each entry above
+	// individually fits its shard cap, but their SUM can exceed it when the tier was
+	// reopened smaller or resharded into fewer/larger shards. Without this a cold shard
+	// stays over budget until its next write, and Bytes()/Stats() over-report. Evict the
+	// least-recently-used (the back; load pushes MRU-first) until the shard is within its
+	// cap. Runs once at startup before the flusher/traffic, so no lock is needed, but
+	// removeLocked is reused (it marks the shard dirty so the corrected index is persisted
+	// and drops each evicted blob).
+	for _, s := range d.shards {
+		for s.curBytes > s.maxBytes {
+			back := s.lru.Back()
+			if back == nil {
+				break
+			}
+			d.removeLocked(s, back.Value.(string))
+		}
+	}
 	return nil
 }
 
@@ -309,6 +369,41 @@ func (d *DiskTier) Writer(meta ObjectMeta) (TierWriter, error) {
 	return &diskWriter{tier: d, meta: meta, tmp: tmp}, nil
 }
 
+// Delete removes key from its shard (entry, blob and byte accounting) if present,
+// no-op otherwise. Used for cross-tier dedup by the Store. It marks the shard dirty
+// (via removeLocked) so the corrected index is persisted.
+func (d *DiskTier) Delete(key string) {
+	s := d.shard(key)
+	s.mu.Lock()
+	d.removeLocked(s, key)
+	s.mu.Unlock()
+}
+
+// Reset drops every cached object from the disk tier: it removes all blob files,
+// clears each shard's in-memory state, and persists an EMPTIED index so a later
+// restart reloads nothing. It is the reload path's fail-safe flush when a site's
+// cache-key scheme changed (config.TransplantStoresFrom): a freshly-opened cold store
+// reloads the previous run's on-disk blobs, but those are keyed under the OLD recipe
+// and must not be served for a key that now addresses different content. Callers
+// invoke it on a store that is not yet serving; it is shard-locked regardless so it
+// stays safe against the background flusher.
+func (d *DiskTier) Reset() {
+	for _, s := range d.shards {
+		s.mu.Lock()
+		keys := make([]string, 0, len(s.items))
+		for k := range s.items {
+			keys = append(keys, k)
+		}
+		for _, k := range keys {
+			d.removeLocked(s, k) // removes the blob file, decrements bytes, marks dirty
+		}
+		s.mu.Unlock()
+	}
+	// Persist the emptied index now (the removals marked shards dirty) so a crash or
+	// restart before the next periodic flush does not reload the just-dropped blobs.
+	d.flushIfDirty()
+}
+
 func (d *DiskTier) Len() int {
 	n := 0
 	for _, s := range d.shards {
@@ -344,18 +439,30 @@ func (d *DiskTier) OversizeDiscards() int64 {
 	return atomic.LoadInt64(&d.oversizeDiscards)
 }
 
+// NoTierDiscards returns how many objects were refused at commit because this tier
+// has no budget at all (a RAM-only deployment). A nonzero and growing value means the
+// origin is serving chunked/unknown-length (or over-RAM-threshold) responses that the
+// automatic size policy routes to the absent disk tier, so they are cached NOWHERE —
+// add a `disk` tier (cache { disk … SIZE }) or ensure the origin sends a small
+// Content-Length so the response can live in RAM.
+func (d *DiskTier) NoTierDiscards() int64 {
+	return atomic.LoadInt64(&d.noTierDiscards)
+}
+
 // SetLogger attaches an optional observability logger. Nil keeps the tier silent
 // (the default). Used by the server to surface the per-shard-cap oversize discard
-// (F6) without making the cache package own a logger. Safe to call once at setup,
-// before the tier sees concurrent traffic.
-func (d *DiskTier) SetLogger(log *slog.Logger) { d.log = log }
+// (F6) without making the cache package own a logger. It is an atomic store (R33) so a
+// reload re-attaching the logger (attachStoreLoggers) races neither a concurrent
+// oversize commit's read nor another reload.
+func (d *DiskTier) SetLogger(log *slog.Logger) { d.log.Store(log) }
 
 // logOversizeDiscard emits a rate-limited info log for an object refused because it
 // exceeds its shard's cap. Nil-logger safe (the common path: no logger attached).
 // The rate limit (oversizeLogInterval) is enforced with a single CAS on a unix-nano
 // deadline so a flood of oversized objects logs at most once per interval.
 func (d *DiskTier) logOversizeDiscard(key string, size, shardCap int64) {
-	if d.log == nil {
+	lg := d.log.Load()
+	if lg == nil {
 		return
 	}
 	now := time.Now().UnixNano()
@@ -366,10 +473,35 @@ func (d *DiskTier) logOversizeDiscard(key string, size, shardCap int64) {
 	if !d.nextOversizeLog.CompareAndSwap(next, now+oversizeLogInterval.Nanoseconds()) {
 		return // another goroutine just logged; skip to keep it rate-limited
 	}
-	d.log.Info("disk cache: object exceeds per-shard cap, not cached (streamed through uncached)",
+	lg.Info("disk cache: object exceeds per-shard cap, not cached (streamed through uncached)",
 		"key", key, "size", size, "shard_cap", shardCap, "tier_max", d.maxBytes,
 		"total_oversize_discards", atomic.LoadInt64(&d.oversizeDiscards),
 		"hint", "raise the disk tier budget (cache { disk … SIZE }) or route large objects elsewhere")
+}
+
+// logNoTierDiscard emits a rate-limited info log for an object refused because this
+// tier has no budget (a RAM-only deployment, so the disk tier the size policy routed
+// the object to does not exist). Nil-logger safe; rate-limited with the same single-CAS
+// deadline as the oversize log (its own deadline so the two signals never throttle each
+// other). The message tells the operator the response was cached NOWHERE and how to fix
+// it — distinct from the "object too big for the disk tier" oversize hint.
+func (d *DiskTier) logNoTierDiscard(key string, size int64) {
+	lg := d.log.Load()
+	if lg == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	next := d.nextNoTierLog.Load()
+	if now < next {
+		return
+	}
+	if !d.nextNoTierLog.CompareAndSwap(next, now+oversizeLogInterval.Nanoseconds()) {
+		return // another goroutine just logged; skip to keep it rate-limited
+	}
+	lg.Info("cache: response not cached — RAM-only deployment has no disk tier for this object (streamed through uncached)",
+		"key", key, "size", size,
+		"total_no_tier_discards", atomic.LoadInt64(&d.noTierDiscards),
+		"hint", "this is a RAM-only cache: chunked/unknown-length (or over-threshold) responses need a disk tier — add cache { disk … SIZE }, or ensure the origin sends a small Content-Length so it can live in RAM")
 }
 
 // Close stops the background flusher and writes the index one last time so a
@@ -405,8 +537,10 @@ func (d *DiskTier) removeLocked(s *diskShard, k string) {
 }
 
 // commit moves a finished temp blob into place, evicting the owning shard's LRU
-// entries to fit within that shard's slice of the budget.
-func (d *DiskTier) commit(meta ObjectMeta, tmpPath string, n int64) error {
+// entries to fit within that shard's slice of the budget. It reports whether the object
+// was actually installed (false on an oversize discard) so the cross-tier dedup can tell
+// a real store from a silent discard (R14).
+func (d *DiskTier) commit(meta ObjectMeta, tmpPath string, n int64) (bool, error) {
 	meta.Size = n
 	s := d.shard(meta.Key)
 	s.mu.Lock()
@@ -420,9 +554,24 @@ func (d *DiskTier) commit(meta ObjectMeta, tmpPath string, n int64) error {
 	// silent `return nil`.
 	if n > s.maxBytes {
 		_ = os.Remove(tmpPath)
+		// Distinguish two operator situations that both end in "object cached nowhere":
+		//   - shardCap <= 0: this tier has NO budget at all — a RAM-only deployment. The
+		//     automatic size policy routed an unknown-length/chunked (or over-threshold)
+		//     response here because there is no RAM home for it, and there is no disk tier
+		//     either. The fix is to ADD a disk tier (or get a Content-Length), NOT to raise
+		//     a disk budget that does not exist. Signal it separately so the log/metric is
+		//     accurate (a zero-cap shard only exists when DiskMaxBytes <= 0, so this branch
+		//     has no false positives vs. a real disk-full discard).
+		//   - shardCap > 0: a genuine oversize — the object is bigger than this (configured)
+		//     disk tier's per-shard cap; raise the disk budget (F6).
+		if s.maxBytes <= 0 {
+			atomic.AddInt64(&d.noTierDiscards, 1)
+			d.logNoTierDiscard(meta.Key, n)
+			return false, nil
+		}
 		atomic.AddInt64(&d.oversizeDiscards, 1)
 		d.logOversizeDiscard(meta.Key, n, s.maxBytes)
-		return nil
+		return false, nil
 	}
 
 	// Replace any existing entry for the key.
@@ -441,7 +590,7 @@ func (d *DiskTier) commit(meta ObjectMeta, tmpPath string, n int64) error {
 
 	if err := os.Rename(tmpPath, d.blobPath(meta.Key)); err != nil {
 		_ = os.Remove(tmpPath)
-		return err
+		return false, err
 	}
 	el := s.lru.PushFront(meta.Key)
 	s.items[meta.Key] = &diskEntry{meta: meta, el: el}
@@ -450,15 +599,16 @@ func (d *DiskTier) commit(meta ObjectMeta, tmpPath string, n int64) error {
 	// Mark this shard dirty; the background flusher persists the merged index off the
 	// hot path. A crash before the next flush at most costs a re-fetch of this object.
 	s.dirty = true
-	return nil
+	return true, nil
 }
 
 // diskWriter streams the body to a temp file; Commit renames it into the tier.
 type diskWriter struct {
-	tier *DiskTier
-	meta ObjectMeta
-	tmp  *os.File
-	n    int64
+	tier   *DiskTier
+	meta   ObjectMeta
+	tmp    *os.File
+	n      int64
+	stored bool // Commit actually installed the blob (false on an oversize discard)
 }
 
 func (w *diskWriter) Write(p []byte) (int, error) {
@@ -473,8 +623,14 @@ func (w *diskWriter) Commit() error {
 		_ = os.Remove(name)
 		return err
 	}
-	return w.tier.commit(w.meta, name, w.n)
+	stored, err := w.tier.commit(w.meta, name, w.n)
+	w.stored = stored
+	return err
 }
+
+// Stored reports whether Commit actually installed the blob (false on an oversize
+// discard). See TierWriter.Stored.
+func (w *diskWriter) Stored() bool { return w.stored }
 
 func (w *diskWriter) Abort() error {
 	name := w.tmp.Name()

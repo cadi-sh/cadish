@@ -392,8 +392,29 @@ func TestStressChaosCoalescerLeaderChaos(t *testing.T) {
 	}
 
 	// No goroutine leak across all rounds.
+	//
+	// The lingering goroutines we must NOT count as a leak are HTTP keep-alive
+	// machinery, not anything cadish spawns per round: the httptest origin's
+	// per-connection serve goroutines, and the per-upstream transport's pooled
+	// idle-connection readLoop/writeLoop goroutines (IdleConnTimeout 90s). Under a
+	// leader-failure round the herd de-coalesces — every waiter falls through and
+	// dials origin independently — so a single panic/error round leaves up to `herd`
+	// such connections (plus, for modePanic, that many in-flight conn.serve panic
+	// recoveries). Their count is bounded by `herd`, never by `rounds`; a real
+	// coalescer leak would instead grow with `rounds`. They drain on their own, but
+	// far slower than a naive wall-clock window under -race+CPU contention (and the
+	// 90s idle timeout means pooled conns would otherwise outlive the whole test).
+	//
+	// So before measuring, deterministically tear those connections down:
+	// CloseClientConnections closes every origin-side socket, which both ends the
+	// origin serve goroutines and makes the client transport's readLoops observe EOF
+	// and exit. What remains to drain is only the (fast, CPU-bound) panic-recovery
+	// teardown, for which a generous bounded wait is reliable without weakening what
+	// this asserts: that the coalescer releases every entry and leaks no goroutine.
+	origin.srv.CloseClientConnections()
+
 	leaked := true
-	for i := 0; i < 400; i++ {
+	for i := 0; i < 2000; i++ { // ~10s budget: generous bound, not a tight deadline
 		if runtime.NumGoroutine() <= before+4 { // slack for runtime/test/server bookkeeping
 			leaked = false
 			break
@@ -401,6 +422,9 @@ func TestStressChaosCoalescerLeaderChaos(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	if leaked {
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		os.Stderr.Write(buf[:n])
 		t.Fatalf("goroutine leak after chaos rounds: before=%d now=%d", before, runtime.NumGoroutine())
 	}
 }

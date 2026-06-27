@@ -1,0 +1,104 @@
+{
+  "irVersion": 6,
+  "site": {
+    "hosts": [
+      "qs.example.com"
+    ],
+    "redirectHosts": [
+      "qs.example.com"
+    ],
+    "canonicalHost": "qs.example.com"
+  },
+  "upstream": {},
+  "matchers": {},
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "method"
+      },
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      },
+      {
+        "kind": "query_strip",
+        "deny": [
+          "a_mute",
+          "fbclid",
+          "gclid",
+          "utm_*"
+        ]
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "method"
+          },
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          },
+          {
+            "kind": "query_strip",
+            "deny": [
+              "a_mute",
+              "fbclid",
+              "gclid",
+              "utm_*"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      },
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_key",
+            "name": "X-Cache-Key"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache",
+    "cacheKeyHeader": "X-Cache-Key"
+  },
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

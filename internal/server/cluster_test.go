@@ -62,6 +62,7 @@ func buildClusterNodes(t *testing.T, n int, origin string, mode, fallback string
 		cfgText := fmt.Sprintf(`test.local {
 	cache { ram 64MiB }
 	upstream backend { to %s }
+	trust_proxy 127.0.0.0/8 ::1/128
 	cluster {
 		self   %s
 		peers %s
@@ -276,5 +277,75 @@ func TestCluster_HopGuard_NoReforward(t *testing.T) {
 	}
 	if got := originHits.Load(); got != 1 {
 		t.Errorf("origin hits = %d, want 1 (served locally, not re-forwarded)", got)
+	}
+}
+
+// TestCluster_HopGuard_TrustBoundary (R10): the X-Cadish-Peer loop guard is honored
+// only from a TRUSTED socket peer. The single-node cluster falls through to its origin
+// in both cases (its only peer is itself), so the origin observes the inbound hop
+// header verbatim — a clean probe of the trust-boundary strip:
+//   - a forged hop from an UNTRUSTED/direct peer is stripped (origin sees no hop), so a
+//     client cannot suppress a peer fetch; while
+//   - a real hop from a TRUSTED peer (loopback ∈ trust_proxy) is preserved end-to-end
+//     (legitimate inter-node forwarding still works).
+func TestCluster_HopGuard_TrustBoundary(t *testing.T) {
+	var gotHop atomic.Value // string
+	originSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHop.Store(r.Header.Get("X-Cadish-Peer"))
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer originSrv.Close()
+
+	sh := &settableHandler{}
+	srv := httptest.NewServer(sh)
+	t.Cleanup(srv.Close)
+	cfgText := fmt.Sprintf(`test.local {
+	cache { ram 16MiB }
+	upstream backend { to %s }
+	trust_proxy 127.0.0.0/8 ::1/128
+	cluster {
+		self   %s
+		peers  %s
+		region gra
+		mode   read_through
+	}
+	cache_ttl default ttl 60s
+}
+`, originSrv.URL, srv.URL, srv.URL)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "Cadishfile")
+	if err := os.WriteFile(path, []byte(cfgText), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v\n%s", err, cfgText)
+	}
+	t.Cleanup(func() { _ = cfg.Close() })
+	h := NewHandler(cfg, Options{Logger: discardLogger()})
+	t.Cleanup(h.Shutdown)
+	sh.h.Store(h)
+
+	probe := func(remoteAddr, path string) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "http://test.local"+path, nil)
+		req.RemoteAddr = remoteAddr
+		req.Header.Set("X-Cadish-Peer", "gra")
+		h.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("probe %s: status %d", remoteAddr, rec.Code)
+		}
+	}
+
+	// Forged hop from an untrusted/direct peer → stripped → origin sees no hop header.
+	probe("203.0.113.9:51000", "/a")
+	if got := gotHop.Load(); got != "" {
+		t.Errorf("untrusted peer: origin saw X-Cadish-Peer=%q, want stripped (\"\")", got)
+	}
+	// Real hop from a trusted peer (loopback) → preserved → origin sees it (different
+	// path so it is a fresh miss that reaches the origin again).
+	probe("127.0.0.1:50000", "/b")
+	if got := gotHop.Load(); got != "gra" {
+		t.Errorf("trusted peer: origin saw X-Cadish-Peer=%q, want \"gra\" (preserved)", got)
 	}
 }

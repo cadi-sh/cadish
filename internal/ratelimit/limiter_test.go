@@ -80,6 +80,49 @@ func TestRefillOverTime(t *testing.T) {
 	}
 }
 
+// TestBackwardClockJumpNoOverGrant verifies a BACKWARD clock step (e.g. an NTP
+// correction, or an injected non-monotonic clock) can never refill tokens nor reset
+// a drained bucket: the refill is guarded by `elapsed > 0`, so a negative elapsed is
+// ignored and lastFill is left untouched. In production now() is monotonic so this
+// cannot happen at all, but the guard must keep the limiter fail-closed (throttle,
+// never over-admit) for any non-monotonic clock. The bug this pins out: a negative
+// `now.Sub(lastFill)` multiplied into the bucket would SUBTRACT tokens (or, if the
+// guard were absent and lastFill were updated, a later forward recovery would grant a
+// huge refill) — either way the bucket must stay drained until real forward time
+// passes beyond the original drain instant.
+func TestBackwardClockJumpNoOverGrant(t *testing.T) {
+	clk := newFakeClock()
+	l := NewWithClock(clk.now)
+	defer l.Stop()
+
+	r := rule(10, 1) // 10 r/s, capacity 1
+	key := "ip"
+	if !l.Allow(key, r).OK {
+		t.Fatal("first request must pass")
+	}
+	if l.Allow(key, r).OK {
+		t.Fatal("second immediate request must be throttled (capacity 1)")
+	}
+	// Step the clock BACKWARD by an hour. A naive refill (rate × elapsed) would add a
+	// large NEGATIVE token count; the `elapsed > 0` guard must skip the refill entirely.
+	clk.advance(-time.Hour)
+	if l.Allow(key, r).OK {
+		t.Fatal("after a backward clock jump the drained bucket must STILL be throttled (no over-grant)")
+	}
+	// Recover the clock to the original instant. Because the backward jump left
+	// lastFill untouched (still at the original drain instant), no time has elapsed
+	// since the drain — the bucket is still empty.
+	clk.advance(time.Hour)
+	if l.Allow(key, r).OK {
+		t.Fatal("back at the original instant no real time has elapsed; still throttled")
+	}
+	// Only genuine FORWARD progress past the drain instant refills.
+	clk.advance(100 * time.Millisecond)
+	if !l.Allow(key, r).OK {
+		t.Fatal("after 100ms of real forward time a token must refill")
+	}
+}
+
 // TestCapacityCeiling verifies tokens never accumulate beyond capacity even after a
 // long idle gap (no infinite burst after a quiet period).
 func TestCapacityCeiling(t *testing.T) {

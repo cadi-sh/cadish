@@ -28,7 +28,7 @@ const (
 // leader flag so writeStatus is a no-op on followers.
 func (c *Controller) runStatusWriter(ctx context.Context) {
 	if !c.opts.LeaderElection {
-		c.isLeader.Store(true)
+		c.onAcquiredLeadership()
 		return
 	}
 	lock := &resourcelock.LeaseLock{
@@ -44,7 +44,7 @@ func (c *Controller) runStatusWriter(ctx context.Context) {
 		RetryPeriod:     retryPeriod,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
-				c.isLeader.Store(true)
+				c.onAcquiredLeadership()
 				c.log.Info("gateway: became status-writer leader", "identity", c.identity())
 				<-ctx.Done()
 			},
@@ -54,6 +54,22 @@ func (c *Controller) runStatusWriter(ctx context.Context) {
 			},
 		},
 	})
+}
+
+// onAcquiredLeadership marks this replica the status-writer leader and forces ONE
+// reconcile so the current desired status is published immediately.
+//
+// This closes a startup/failover ordering gap: status is written ONLY from reconcile
+// and only when isLeader is set (writeStatus is a no-op on a follower). The controller's
+// initial reconcile(s) run BEFORE leadership is acquired (leader election runs async in a
+// goroutine), so they write no status; and because the informers resync at 0 there is no
+// periodic reconcile — nothing would re-trigger one after leadership is gained. Without
+// this poke a freshly started (or just-promoted) leader leaves every owned Gateway /
+// HTTPRoute / GatewayClass with NO Accepted/Programmed conditions until the next spec
+// change. The poke is coalesced (1-slot), so a redundant nudge is harmless.
+func (c *Controller) onAcquiredLeadership() {
+	c.isLeader.Store(true)
+	c.poke()
 }
 
 // writeStatus publishes status conditions on the owned GatewayClasses/Gateways and the

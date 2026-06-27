@@ -88,6 +88,39 @@ func TestRedirectScopedReferencesMatcher(t *testing.T) {
 	}
 }
 
+// The combined form `redirect @scope PATH_REGEX CODE TARGET` references its matcher
+// (no unused-matcher warning) AND counts the path regex as one regex eval/request.
+func TestRedirectScopedRegexCombinedCounted(t *testing.T) {
+	src := `site.example {
+	upstream b { to http://x:80 }
+	@es classify {lang}==es
+	classify {lang} {
+		when header Accept-Language es -> es
+		default                        -> en
+	}
+	redirect @es (?i)^(.*)/(couples|parejas)/?$ 301 https://{host}$1/parejas
+	cache_ttl default ttl 5m
+}
+`
+	r, err := CheckSource("t.cadish", []byte(src))
+	if err != nil {
+		t.Fatalf("CheckSource: %v", err)
+	}
+	c := codes(r)
+	if c["unknown-directive"] != 0 {
+		t.Fatalf("unknown-directive = %d, want 0\n%s", c["unknown-directive"], render(t, r))
+	}
+	if c["unused-matcher"] != 0 {
+		t.Fatalf("unused-matcher = %d, want 0 (combined redirect references @es)\n%s", c["unused-matcher"], render(t, r))
+	}
+	if c["undefined-matcher"] != 0 {
+		t.Fatalf("undefined-matcher = %d, want 0\n%s", c["undefined-matcher"], render(t, r))
+	}
+	if r.Sites[0].RegexEvalsPerRequest < 1 {
+		t.Fatalf("regex evals/request = %d, want >= 1 (combined path regex)", r.Sites[0].RegexEvalsPerRequest)
+	}
+}
+
 // An undefined scope on a scoped redirect is flagged.
 func TestRedirectScopedUndefinedFlagged(t *testing.T) {
 	src := `site.example {

@@ -42,6 +42,62 @@ type netResolver struct{ r *net.Resolver }
 // defaultResolver is the process-wide DNS resolver used when none is injected.
 func defaultResolver() Resolver { return netResolver{r: net.DefaultResolver} }
 
+// dnsDialContext dials a DNS nameserver for the custom-nameserver resolver. It is a
+// package var so tests can substitute a deterministic, offline dialer and assert the
+// dial target (the configured nameserver) without touching the network.
+var dnsDialContext = (&net.Dialer{Timeout: 5 * time.Second}).DialContext
+
+// nameserverResolver builds a per-pool Resolver that queries the given DNS servers
+// (ip:port) instead of the system resolv.conf — the inline `resolve nameserver …`
+// knob. It uses Go's built-in resolver (PreferGo) with a custom Dial that ignores the
+// address the stdlib would have used and dials the configured nameservers in order,
+// falling through to the next on a dial error. Runtime-resolved addresses are passed
+// through guardedResolver so a link-local/cloud-metadata answer from an untrusted
+// nameserver cannot become a backend (SSRF defense-in-depth; the parse-time guard only
+// sees literals). servers is non-empty (the caller checks).
+func nameserverResolver(servers []string) Resolver {
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var lastErr error
+			for _, s := range servers {
+				conn, err := dnsDialContext(ctx, network, s)
+				if err == nil {
+					return conn, nil
+				}
+				lastErr = err
+			}
+			return nil, lastErr
+		},
+	}
+	return guardedResolver{inner: netResolver{r: r}}
+}
+
+// guardedResolver drops link-local / cloud-metadata addresses (169.254.0.0/16,
+// fe80::/10, and the AWS IPv6 IMDS endpoint fd00:ec2::254) from another resolver's
+// answers. It now guards BOTH dns:// resolution paths (Finding 3): the custom
+// `resolve nameserver …` resolver AND the default system resolver (New() wraps the
+// process-wide resolver in it). So a runtime-resolved metadata IP — whether served by
+// an untrusted nameserver or the system resolv.conf — can never become a backend. The
+// parse-time guard only sees literals, so this run-time filter is the defense for
+// dynamically resolved answers. A legitimate RFC1918/loopback/ULA backend is untouched.
+type guardedResolver struct{ inner Resolver }
+
+func (g guardedResolver) Resolve(ctx context.Context, host string) ([]string, error) {
+	addrs, err := g.inner.Resolve(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	out := addrs[:0]
+	for _, a := range addrs {
+		if isLinkLocalLiteral(a) {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out, nil
+}
+
 func (n netResolver) Resolve(ctx context.Context, host string) ([]string, error) {
 	addrs, err := n.r.LookupHost(ctx, host)
 	if err != nil {

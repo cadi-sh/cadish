@@ -258,7 +258,7 @@ func TranslateResult(in Inputs) Result {
 				res.ProgrammedListeners[lkey] = true
 				claimListenerHost(listenerHostOwner, &listenerHostOrder, host, gw.Namespace)
 			case gatewayv1.HTTPSProtocolType:
-				programmed, reason, claim := programHTTPSListener(gw, l, host, in, grants, listenerHostOwner)
+				programmed, reason, claim := programHTTPSListener(gw, l, host, in, grants, listenerHostOwner, listenerHostOrder)
 				if !programmed {
 					res.Rejects = append(res.Rejects, Reject{Kind: "Gateway", Object: gwKey, Reason: reason})
 					res.ListenerRejects[lkey] = reason
@@ -408,7 +408,9 @@ func TranslateResult(in Inputs) Result {
 		}
 	}
 
-	res.Sites = renderGatewaySites(byHost)
+	sites, structuralRejects := renderGatewaySites(byHost)
+	res.Sites = sites
+	res.Rejects = append(res.Rejects, structuralRejects...)
 	return res
 }
 
@@ -456,7 +458,50 @@ func routingHostOwner(listenerHostOwner map[string]string, listenerHostOrder []s
 			owner[h] = rt.Namespace
 		}
 	}
+	// Pass 3: a CONCRETE listener hostname seeded in Pass 1 that falls under an OLDER
+	// `*.suffix` wildcard listener in a DIFFERENT namespace is reassigned to the wildcard's
+	// owner. Pass 2 only resolves route-derived hosts (a concrete listener host is already
+	// owned, so it would otherwise bypass the wildcard check) — closing the gap where a
+	// tenant's concrete listener for app.example.com captures routing for a subdomain of
+	// another namespace's older wildcard. Strict oldest-wins: only an OLDER wildcard
+	// (strictly lower first-claim rank) wins, so a younger foreign wildcard cannot steal an
+	// already-established concrete listener host. The literal wildcard itself is skipped.
+	if len(listenerHostOrder) > 0 {
+		rank := make(map[string]int, len(listenerHostOrder))
+		for i, h := range listenerHostOrder {
+			rank[h] = i
+		}
+		for h, ns := range owner {
+			if strings.HasPrefix(h, "*.") {
+				continue
+			}
+			hr, isListener := rank[h]
+			if !isListener {
+				continue // route-derived hosts are resolved in Pass 2
+			}
+			if w, ok := oldestCoveringWildcard(h, listenerHostOrder); ok {
+				if wns := listenerHostOwner[w]; wns != ns && rank[w] < hr {
+					owner[h] = wns
+				}
+			}
+		}
+	}
 	return owner
+}
+
+// oldestCoveringWildcard returns the literal of the OLDEST `*.suffix` wildcard listener that
+// admits the concrete host (listenerHostOrder is oldest-first, so the first match is oldest).
+func oldestCoveringWildcard(host string, listenerHostOrder []string) (string, bool) {
+	for _, lh := range listenerHostOrder {
+		if !strings.HasPrefix(lh, "*.") {
+			continue
+		}
+		suffix := lh[1:]
+		if strings.HasSuffix(host, suffix) && len(host) > len(suffix) {
+			return lh, true
+		}
+	}
+	return "", false
 }
 
 // wildcardListenerOwner returns the namespace of the OLDEST `*.suffix` wildcard listener that
@@ -499,7 +544,7 @@ func claimListenerHost(owner map[string]string, order *[]string, host, ns string
 // hostname (F10), a cross-namespace certificateRef needs a ReferenceGrant, and the listener
 // hostname must not already be owned by another namespace. Returns (programmed, reason,
 // claim).
-func programHTTPSListener(gw *gatewayv1.Gateway, l *gatewayv1.Listener, host string, in Inputs, grants grantIndex, hostOwner map[string]string) (bool, string, byoClaim) {
+func programHTTPSListener(gw *gatewayv1.Gateway, l *gatewayv1.Listener, host string, in Inputs, grants grantIndex, hostOwner map[string]string, hostOrder []string) (bool, string, byoClaim) {
 	var none byoClaim
 	if host == "" {
 		return false, fmt.Sprintf("HTTPS listener %q has no hostname; a terminating listener needs a concrete hostname for its certificate", l.Name), none
@@ -522,6 +567,19 @@ func programHTTPSListener(gw *gatewayv1.Gateway, l *gatewayv1.Listener, host str
 	// namespace's listener already.
 	if ownNs, ok := hostOwner[host]; ok && ownNs != gw.Namespace {
 		return false, fmt.Sprintf("HTTPS listener %q hostname %q is already terminated by namespace %q; refusing a cross-namespace cert claim", l.Name, host, ownNs), none
+	}
+	// Wildcard-cover variant of the same guard: a CONCRETE hostname that falls under an
+	// OLDER `*.suffix` wildcard listener owned by another namespace must also be refused —
+	// an exact-host cert wins over a wildcard at serving time, so without this a tenant could
+	// program a (self-signed) cert for app.example.com and hijack TLS for a concrete
+	// subdomain of another namespace's wildcard. Listeners are processed oldest-first, so any
+	// wildcard already in hostOwner is necessarily older; wildcardListenerOwner returns the
+	// OLDEST covering wildcard's namespace. A same-namespace covering wildcard (the tenant's
+	// own) is allowed.
+	if !strings.HasPrefix(host, "*.") {
+		if wns, ok := wildcardListenerOwner(host, hostOrder, hostOwner); ok && wns != gw.Namespace {
+			return false, fmt.Sprintf("HTTPS listener %q hostname %q falls under a wildcard listener owned by namespace %q; refusing a cross-namespace cert claim", l.Name, host, wns), none
+		}
 	}
 	ref := l.TLS.CertificateRefs[0]
 	if ref.Group != nil && *ref.Group != "" {

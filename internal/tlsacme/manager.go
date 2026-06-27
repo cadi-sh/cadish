@@ -5,11 +5,21 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync/atomic"
 
 	"golang.org/x/crypto/acme"
+
+	"github.com/cadi-sh/cadish/internal/geo"
 )
+
+// readyzPath mirrors the unexported server.readyzPath ("/.cadish/readyz"). tlsacme cannot
+// import internal/server (server imports tlsacme — that would be an import cycle), so the
+// reserved warm-readiness probe path is duplicated here as a single const; keep the two in
+// sync. The :80 redirect handler special-cases it (see redirectOrServe) so the probe is
+// served plain through the data-plane fallback, never 301'd to HTTPS.
+const readyzPath = "/.cadish/readyz"
 
 // Options tunes Manager construction.
 type Options struct {
@@ -51,6 +61,20 @@ type hostState struct {
 	static      *staticSource // static keypairs (may be empty)
 	staticHosts *hostMatcher  // hosts served by a static keypair
 	hsts        []hstsPolicy
+	// exemptPaths are request paths (exact) that the :80 listener must NOT 301 to HTTPS
+	// — they answer on plain :80 via the site pipeline instead (a health-check probe,
+	// webhook, or monitoring endpoint; see SiteTLS.RedirectExcept and ADR D89). It is the
+	// union of every site's `tls { http_redirect_except … }` paths, so it lives in the
+	// swappable host-state and is refreshed on reload. nil/empty ⇒ no exemptions, i.e.
+	// the default redirect-all-on-:80 behavior, byte-for-byte unchanged.
+	exemptPaths map[string]struct{}
+	// trustedProxies is the UNION of every site's `trust_proxy` CIDRs. The :80
+	// HTTP→HTTPS redirect loop guard honors a client `X-Forwarded-Proto: https` ONLY
+	// when the immediate socket peer is in this set (WS-B / R15, ADR D95) — otherwise
+	// the header is client-spoofable and a plain :80 request could be served in
+	// cleartext. Lives in the swappable host-state so a reload refreshes it. nil/empty
+	// ⇒ no trusted proxy ⇒ XFP never suppresses a redirect (always redirect).
+	trustedProxies []netip.Prefix
 }
 
 // Manager is the whole-server TLS coordinator. It aggregates every site's TLS
@@ -141,6 +165,19 @@ func buildHostState(sites []SiteConfig) (*hostState, error) {
 			}
 			st.hsts = append(st.hsts, hstsPolicy{matcher: hm, value: v})
 		}
+		for _, p := range s.TLS.RedirectExcept {
+			if p == "" {
+				continue
+			}
+			if st.exemptPaths == nil {
+				st.exemptPaths = make(map[string]struct{})
+			}
+			st.exemptPaths[p] = struct{}{}
+		}
+		// Union this site's trust_proxy CIDRs into the whole-server set the :80 loop
+		// guard consults (the :80 listener is not per-site). Dedup is unnecessary —
+		// geo.PeerTrusted just scans the slice; a few duplicate prefixes are harmless.
+		st.trustedProxies = append(st.trustedProxies, s.TrustedProxies...)
 	}
 	return st, nil
 }
@@ -362,6 +399,26 @@ func (m *Manager) HTTPHandler(fallback http.Handler) http.Handler {
 // (ungated) mode every host redirects.
 func (m *Manager) redirectOrServe(fallback http.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// RESERVED WARM-READINESS PROBE EXEMPTION (server.readyzPath): /.cadish/readyz MUST
+		// be served on plain :80 — NEVER 301'd to HTTPS. A Kubernetes httpGet probe treats
+		// 2xx AND 3xx as success, so a redirect would make the probe pass REGARDLESS of warm
+		// state, silently defeating the warm-readiness gate for TLS controllers and standalone
+		// TLS servers (the exact rollout 502/404 it exists to prevent). So pass it straight to
+		// the data-plane fallback, which answers the real 200 "ok" / 503 "warming". Checked
+		// BEFORE host normalization so the probe stays Host-agnostic (kubelet sends the pod IP
+		// as Host, but an operator may set httpGet.host to a TLS hostname that would otherwise
+		// 301). Like the ACME-challenge and http_redirect_except exemptions it only ever SKIPS
+		// a redirect, never forces one. See internal/server/handler.go serveReadyz.
+		if r.URL.Path == readyzPath {
+			if fallback != nil {
+				fallback.ServeHTTP(w, r)
+				return
+			}
+			// No data-plane fallback wired (never the case via BuildServers): fail CLOSED so
+			// an un-warmed :80 reports NOT-ready rather than a spurious redirect/200.
+			http.Error(w, "warming", http.StatusServiceUnavailable)
+			return
+		}
 		host := normalizeHost(r.Host)
 		if host == "" {
 			http.Error(w, "missing host", http.StatusBadRequest)
@@ -374,9 +431,20 @@ func (m *Manager) redirectOrServe(fallback http.Handler) http.HandlerFunc {
 		// loop. This is acute for `cadi.sh/ssl-redirect` (forceRedirect) hosts, whose
 		// whole use case is upstream TLS termination. So never redirect a request that
 		// arrived over HTTPS — serve it plain instead. This only ever SKIPS a redirect,
-		// never forces one. The upstream must set X-Forwarded-Proto and strip any
-		// client-supplied value (see docs/tls.md, docs/ingress-controller.md).
-		if m.shouldRedirect(host) && !arrivedOverHTTPS(r) {
+		// never forces one. The X-Forwarded-Proto signal is TRUST-GATED (R15): honored
+		// only when the immediate socket peer is in `trust_proxy`, so a direct client
+		// cannot forge it to be served in cleartext. The upstream must also set
+		// X-Forwarded-Proto and strip any client value (see docs/tls.md,
+		// docs/ingress-controller.md).
+		// PROBE / DATA-PLANE EXEMPTION (D89): a path explicitly listed via
+		// `tls { http_redirect_except … }` answers on plain :80 through the site pipeline
+		// (its RECV `respond`/`redirect` synthetic) instead of being 301'd to HTTPS — so an
+		// L4/DNS health-check probe, webhook, or monitor that hits cadish:80 directly gets
+		// its real 200/503, not a 301. This only ever SKIPS a redirect for an explicitly
+		// named path: it never forces one, never alters the X-Forwarded-Proto loop guard,
+		// and leaves every other path 301'ing exactly as before, so no redirect loop is
+		// introduced. Empty exempt set ⇒ the default redirect-all-on-:80 is unchanged.
+		if m.shouldRedirect(host) && !arrivedOverHTTPS(r, m.trustedProxiesSnapshot()) && !m.redirectExempt(r.URL.Path) {
 			target := "https://" + host + r.URL.RequestURI()
 			http.Redirect(w, r, target, http.StatusMovedPermanently)
 			return
@@ -396,7 +464,20 @@ func (m *Manager) redirectOrServe(fallback http.Handler) http.HandlerFunc {
 // honored. A value may be a comma-separated list (outermost proxy first); any `https`
 // token counts. Matching is case-insensitive. Consulted ONLY to SKIP a redirect (the
 // loop guard) — never to force one.
-func arrivedOverHTTPS(r *http.Request) bool {
+//
+// TRUST BOUNDARY (WS-B / R15, ADR D95): X-Forwarded-Proto is client-spoofable, and the
+// full caching handler is the :80 fallback, so honoring it from ANY peer would let a
+// direct client add `X-Forwarded-Proto: https` to a plain :80 request and be served in
+// cleartext (no HSTS) — defeating automatic-HTTPS. So the header is honored ONLY when
+// the immediate socket peer is a trusted proxy (`trust_proxy`). With no trusted
+// proxies configured the peer is never trusted, so the header is ignored and the
+// request is always redirected (the safe default; this also closes the standalone
+// facet R10b). Behind a trusted terminator (e.g. Cloudflare), declare its network in
+// `trust_proxy` so the legitimate XFP:https loop guard still suppresses the redirect.
+func arrivedOverHTTPS(r *http.Request, trusted []netip.Prefix) bool {
+	if !geo.PeerTrusted(r.RemoteAddr, trusted) {
+		return false
+	}
 	for _, v := range r.Header.Values("X-Forwarded-Proto") {
 		for _, part := range strings.Split(v, ",") {
 			if strings.EqualFold(strings.TrimSpace(part), "https") {
@@ -405,6 +486,15 @@ func arrivedOverHTTPS(r *http.Request) bool {
 		}
 	}
 	return false
+}
+
+// trustedProxiesSnapshot returns the current whole-server trust_proxy set from the
+// swappable host-state (refreshed on reload). nil before the first state is published.
+func (m *Manager) trustedProxiesSnapshot() []netip.Prefix {
+	if st := m.state.Load(); st != nil {
+		return st.trustedProxies
+	}
+	return nil
 }
 
 // shouldRedirect reports whether an HTTP request for host should be 301'd to HTTPS.
@@ -421,6 +511,20 @@ func (m *Manager) shouldRedirect(host string) bool {
 		return true
 	}
 	return false
+}
+
+// redirectExempt reports whether path is on the :80 HTTP→HTTPS redirect exemption set
+// (the union of every site's `tls { http_redirect_except … }` paths). Matching is exact
+// on the request URL path (query string excluded); an unconfigured set ⇒ never exempt, so
+// the default redirect-all-on-:80 is unchanged. It reads the live host-state so a reload
+// that adds/removes an exempt path takes effect immediately on the next :80 request.
+func (m *Manager) redirectExempt(path string) bool {
+	st := m.state.Load()
+	if st == nil || len(st.exemptPaths) == 0 {
+		return false
+	}
+	_, ok := st.exemptPaths[path]
+	return ok
 }
 
 // hostHasTLS reports whether host has a REAL, usable certificate available right now —

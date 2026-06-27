@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/cadi-sh/cadish/internal/cadishfile"
 )
@@ -62,10 +63,14 @@ func (p *Pipeline) resolveUpstream(req *Request) string {
 // EvalRequest evaluates the RECV + KEY phases and returns the request decision.
 // It is safe for concurrent use.
 func (p *Pipeline) EvalRequest(req *Request) RequestDecision {
+	up := p.resolveUpstream(req)
 	var stack [memoStack]int8
-	ctx := &matchContext{req: req, upstream: p.resolveUpstream(req), memo: newMemo(stack[:], p.numMatchers)}
+	ctx := &matchContext{req: req, upstream: up, memo: newMemo(stack[:], p.numMatchers)}
 	var dec RequestDecision
-	dec.Upstream = ctx.upstream
+	// Assign Upstream from the local, NOT via ctx.upstream: reading a field through the
+	// ctx pointer into the returned dec makes escape analysis flow the whole matchContext
+	// (and its stack-backed memo) to the heap, defeating the stack-array memo optimization.
+	dec.Upstream = up
 
 	// respond: a synthetic response short-circuits everything else. Two forms:
 	//   - exact path (`respond PATH STATUS BODY`): fires when req.Path == PATH.
@@ -121,6 +126,18 @@ func (p *Pipeline) EvalRequest(req *Request) RequestDecision {
 		}
 	}
 
+	// upgrade: a matching `upgrade @scope` rule marks the request as a
+	// connection-upgrade tunnel candidate and IMPLIES pass (a tunnel never touches the
+	// cache). The server still requires a genuine upgrade request before it actually
+	// hijacks; a non-upgrade request on an upgrade route falls through as a plain pass.
+	for _, sc := range p.upgradeRules {
+		if ctx.scopeMatches(sc) {
+			dec.Upgrade = true
+			dec.Pass = true
+			break
+		}
+	}
+
 	// request-phase header edits.
 	dec.ReqHeaderOps = applyHeaderRules(p.reqHeaderRules, ctx, CacheStatusUnknown, false, p.classifiers)
 
@@ -134,8 +151,58 @@ func (p *Pipeline) EvalRequest(req *Request) RequestDecision {
 	// through the same memoized context as the rest of the request phase. The recipe
 	// is chosen first-match-wins from the scoped cache_key rules (one unscoped rule,
 	// or none, is the common case and costs nothing extra).
-	dec.CacheKey = buildKey(p.selectKeyTokens(ctx), req, p.stickyCookie, ctx)
+	toks := p.selectKeyTokens(ctx)
+	// Capture the SELECTED recipe on the request (Finding 1): this is the authoritative,
+	// singular selection — computed on the PRE-derives_from-strip request — that every
+	// later gate reuses via resolvedKeyTokens, so coverage and Vary are always judged
+	// against the recipe that BUILT the key, even after StripDerivedCookies mutates the
+	// request. Always overwrite (a value-copied Request re-running EvalRequest re-derives).
+	if req != nil {
+		req.selKey = toks
+		req.selKeySet = true
+	}
+	dec.CacheKey = buildKey(toks, req, p.stickyCookie, ctx)
 	return dec
+}
+
+// resolvedKeyTokens returns the cache-key recipe SELECTED for ctx.req: the authoritative
+// selection captured by EvalRequest (computed on the pre-strip request) when present,
+// otherwise a fresh selectKeyTokens for callers that never ran EvalRequest (direct unit
+// tests / the conformance harness). Reusing the captured selection is the Finding 1
+// safety fix — the cache key, the credential-coverage check, and the Vary decision all
+// reference the same recipe, so a `derives_from` cookie stripped between EvalRequest and
+// a later gate can never flip the selection to a different recipe than the one that built
+// the stored key. The returned slice may be nil (no recipe matched); callers apply the
+// defaultKeyTokens fallback exactly as they do for a fresh selectKeyTokens result.
+func (p *Pipeline) resolvedKeyTokens(ctx *matchContext) []keyToken {
+	if ctx.req != nil && ctx.req.selKeySet {
+		return ctx.req.selKey
+	}
+	return p.selectKeyTokens(ctx)
+}
+
+// recipeTokensForReq returns the cache-key recipe SELECTED for req, with the built-in
+// default applied when no rule matched. It is the credential/derives_from gates' way to
+// read the recipe WITHOUT rebuilding a matchContext (R29): when EvalRequest already
+// captured the selection (the server's hot path — selKeySet) the captured recipe is
+// reused directly, so the redundant resolveUpstream (route-matcher re-evaluation, whose
+// result resolvedKeyTokens then ignores anyway) is skipped entirely. Only a direct caller
+// that never ran EvalRequest (unit tests / the conformance harness) pays the
+// resolveUpstream + selectKeyTokens path — byte-for-byte the previous behavior. The
+// returned slice is the same one resolvedKeyTokens(ctx)+default-fallback produced before.
+func (p *Pipeline) recipeTokensForReq(req *Request) []keyToken {
+	var toks []keyToken
+	if req != nil && req.selKeySet {
+		toks = req.selKey
+	} else {
+		var stack [memoStack]int8
+		ctx := &matchContext{req: req, upstream: p.resolveUpstream(req), memo: newMemo(stack[:], p.numMatchers)}
+		toks = p.selectKeyTokens(ctx)
+	}
+	if len(toks) == 0 {
+		toks = defaultKeyTokens
+	}
+	return toks
 }
 
 // selectKeyTokens picks the cache-key recipe for a request: the first keyRule whose
@@ -190,6 +257,14 @@ func (p *Pipeline) EvalResponse(req *Request, status int, respHeader http.Header
 	var stack [memoStack]int8
 	ctx := &matchContext{req: req, upstream: p.resolveUpstream(req), memo: newMemo(stack[:], p.numMatchers), respHeader: respHeader}
 	var dec ResponseDecision
+	// perResponseSignal records whether the cache_ttl rule that decided Cacheable=true derived
+	// its TTL from a PER-RESPONSE ORIGIN SIGNAL — i.e. the origin affirmatively marked THIS
+	// response cacheable (a `from_header NAME` whose header the origin actually SENT). A STATIC
+	// operator `ttl N` (whether `default` or scoped) is NOT a per-response signal: the operator
+	// fixed the TTL, the origin said nothing about THIS response. This is the SOLE gate that may
+	// authorize a cache_credentialed share (see the credentialed block below) — a static TTL must
+	// never let a per-user body be stored under the shared key.
+	var perResponseSignal bool
 	for _, r := range p.ttlRules {
 		if !r.sel.matches(ctx, status) {
 			continue
@@ -218,15 +293,20 @@ func (p *Pipeline) EvalResponse(req *Request, status int, respHeader http.Header
 				continue
 			}
 			dec.TTL = ttl
-			dec.Grace = r.grace
-			dec.MaxStale = r.maxStale
+			dec.Grace, dec.MaxStale = resolveGraceMaxStale(&r, respHeader)
+			dec.StripHeaders = r.consumedHeaders()
 			dec.Cacheable = true
+			// The origin SENT the header — this IS a per-response origin signal, so it may
+			// authorize a cache_credentialed share.
+			perResponseSignal = true
 			break
 		}
 		dec.TTL = r.ttl
-		dec.Grace = r.grace
-		dec.MaxStale = r.maxStale
+		dec.Grace, dec.MaxStale = resolveGraceMaxStale(&r, respHeader)
+		dec.StripHeaders = r.consumedHeaders()
 		dec.Cacheable = true
+		// STATIC operator TTL (`ttl N`): NOT a per-response origin signal. perResponseSignal
+		// stays false ⇒ this Cacheable response can never authorize a cache_credentialed share.
 		break
 	}
 	// SAFE BY DEFAULT (security review): a cache_ttl rule deciding Cacheable=true is
@@ -242,10 +322,12 @@ func (p *Pipeline) EvalResponse(req *Request, status int, respHeader http.Header
 	// shared cache and is not subject to the cache_unsafe opt-out; the rest of the
 	// shareability refusal is. Both run only on an already-cacheable response.
 	if dec.Cacheable && respHeader != nil {
-		// Vary coverage is judged against the recipe SELECTED for THIS request, not the
-		// global union of every recipe's keyed headers — so a Vary the selected key does
-		// not partition is correctly refused (no variant cross-serving).
-		keyHeaders := keyHeaderNamesForTokens(p.selectKeyTokens(ctx))
+		// Vary coverage is judged against the recipe that BUILT this request's key (the
+		// selection EvalRequest captured — Finding 1), not the global union of every
+		// recipe's keyed headers, and not a fresh re-selection on the post-strip request
+		// (which could pick a DIFFERENT recipe than the stored key's). So a Vary the
+		// stored key does not partition is correctly refused (no variant cross-serving).
+		keyHeaders := keyHeaderNamesForTokens(p.resolvedKeyTokens(ctx))
 		// A `Set-Cookie` response is NEVER cacheable — unconditionally, NOT even under
 		// `cache_unsafe` (like `Vary: *`). A Set-Cookie is a per-user credential the
 		// origin is minting RIGHT NOW; caching it would hand one user's brand-new session
@@ -257,12 +339,54 @@ func (p *Pipeline) EvalResponse(req *Request, status int, respHeader http.Header
 		// per-class operator opt-in — you can't cache a Set-Cookie response by accident.
 		// The rest of the shareability refusal (private/no-store/no-cache/s-maxage=0/
 		// uncovered-Vary) IS overridable by cache_unsafe.
-		setCookieBlocks := hasSetCookie(respHeader) && !p.stripCookiesMatches(ctx)
-		if varyStar(respHeader) || setCookieBlocks || (!p.cacheUnsafe && !p.safelyShareable(respHeader, keyHeaders)) {
-			dec.Cacheable = false
-			dec.TTL = 0
-			dec.Grace = 0
-			dec.MaxStale = 0
+		// cache_credentialed (D101): in an ORIGIN-AUTHORITATIVE scope caching matches the
+		// custom VCL EXACTLY — a credentialed store requires a PER-RESPONSE ORIGIN CACHE SIGNAL
+		// (perResponseSignal), fail-closed, and it does NOT consult cache_unsafe (Guard B):
+		//   (1) The in-scope cache_ttl rule that decided dec.Cacheable derived its TTL from a
+		//       per-response origin signal — `from_header X-Cache-Ttl` whose header the origin
+		//       SENT (or, if such a rule kind is ever added, an origin Cache-Control max-age/
+		//       s-maxage). The origin affirmatively marked THIS response cacheable ⇒ STORE under
+		//       the SHARED key, and the signal FORCE-OVERRIDES and STRIPS both the per-user
+		//       `Set-Cookie` AND the weak refusals the shared readmodel bodies carry (Cache-
+		//       Control no-store/private/no-cache, Pragma: no-cache, a past Expires) — the VCL
+		//       `if (X-Cache-Ttl) { unset set-cookie; unset Cache-Control; set ttl }`. The server
+		//       strips them from BOTH the stored entry AND the delivered response (see
+		//       CredentialedStore), so the shared entry carries no per-user credential and cadish
+		//       never replays a no-store it just cached. We do NOT refuse on Set-Cookie or on an
+		//       uncovered/`*` Vary: the affirmative signal is the operator's explicit "this is
+		//       shared, drop the cookie" opt-in (faithful to Varnish, NOT stricter). NOT marked
+		//       ForcedPrivate — a deliberate opt-in to SHARE.
+		//   (2) else — no per-response signal — we FALL THROUGH to the normal shareability
+		//       refusal below. A STATIC operator `ttl N` (default or scoped) makes dec.Cacheable
+		//       true but is NOT a per-response signal: it does NOT authorize a credentialed share.
+		//       Without this gate, a co-existing `cache_ttl default ttl 60s` would mark a per-user
+		//       `favorites` response (Set-Cookie, no X-Cache-Ttl) Cacheable, store it under the
+		//       SHARED key with Set-Cookie stripped, and leak one user's private body to another
+		//       (a confirmed cross-user leak). The per-response signal — not merely dec.Cacheable
+		//       — is the sole storage gate, so a per-user route that merely omits the marking is
+		//       never shared-cached. THIS is the fail-closed property (same trust model as the
+		//       custom VCL: a per-user route that erroneously emits X-Cache-Ttl is an operator
+		//       bug, exactly as in Varnish).
+		if req != nil && perResponseSignal && p.cacheCredentialedMatches(ctx) {
+			// Positive in-scope signal (dec.Cacheable) is the gate; store and strip Set-Cookie +
+			// the weak controls on store+deliver. cache_unsafe is never consulted here (Guard B).
+			dec.CredentialedStore = true
+		} else {
+			setCookieBlocks := hasSetCookie(respHeader) && !p.stripCookiesMatches(ctx)
+			shareable := p.safelyShareable(respHeader, keyHeaders)
+			if varyStar(respHeader) || setCookieBlocks || (!p.cacheUnsafe && !shareable) {
+				dec.Cacheable = false
+				dec.TTL = 0
+				dec.Grace = 0
+				dec.MaxStale = 0
+			} else if p.cacheUnsafe && !shareable {
+				// The store survives ONLY because cache_unsafe overrode an unshareable origin
+				// Cache-Control (private/no-store/no-cache/s-maxage=0). Cache it (the operator's
+				// opt-in) but flag it so the server advertises `private, max-age=N` downstream
+				// rather than promoting it to `public` (R13/D96) — shared caches must still
+				// refuse a response the origin marked confidential.
+				dec.ForcedPrivate = true
+			}
 		}
 	}
 	for _, r := range p.storageRules {
@@ -272,6 +396,33 @@ func (p *Pipeline) EvalResponse(req *Request, status int, respHeader http.Header
 		}
 	}
 	return dec
+}
+
+// resolveGraceMaxStale computes the effective grace and max_stale windows for a TTL
+// rule. Each is sourced from its configured origin response header when present and
+// parseable (reusing headerTTL — same seconds-as-int convention, non-positive
+// rejection, and one-year clamp as the header TTL), otherwise falling back to the
+// rule's literal `grace` / `max_stale`. The max_stale >= grace invariant is enforced
+// against the RESOLVED values: an effective max_stale below the effective grace is
+// IGNORED (no error-fallback window) rather than erroring at runtime, since grace
+// already serves that span.
+func resolveGraceMaxStale(r *ttlRule, respHeader http.Header) (grace, maxStale time.Duration) {
+	grace = r.grace
+	if r.graceFromHeader != "" {
+		if g, ok := headerTTL(respHeader, r.graceFromHeader); ok {
+			grace = g
+		}
+	}
+	maxStale = r.maxStale
+	if r.maxStaleFromHeader != "" {
+		if ms, ok := headerTTL(respHeader, r.maxStaleFromHeader); ok {
+			maxStale = ms
+		}
+	}
+	if maxStale > 0 && maxStale < grace {
+		maxStale = 0
+	}
+	return grace, maxStale
 }
 
 // isUncacheableError reports whether a status is an error that a SHARED cache must not
@@ -305,8 +456,13 @@ func (p *Pipeline) FilterRequestCookies(raw string) (string, bool) {
 	cs := lenientCookies(http.Header{"Cookie": {raw}})
 	var b strings.Builder
 	for _, c := range cs {
-		if !p.cookieAllow.match(c.name) {
-			continue // not allow-listed → stripped
+		// A `derives_from` cookie whose classify token is in some cache_key recipe must
+		// SURVIVE the allow-list strip so the classifier reads the ORIGINAL value and the
+		// key is built from it; StripDerivedCookies then removes it post-key (and
+		// reconciles it to this same allow-list rule when its token is NOT in the selected
+		// recipe). So keep it here even when it is not allow-listed.
+		if !p.cookieAllow.match(c.name) && !p.derivedSurviveCookies[c.name] {
+			continue // not allow-listed and not a surviving axis input → stripped
 		}
 		if b.Len() > 0 {
 			b.WriteString("; ")
@@ -316,6 +472,163 @@ func (p *Pipeline) FilterRequestCookies(raw string) (string, bool) {
 		b.WriteString(c.value)
 	}
 	return b.String(), true
+}
+
+// HasDerivesFrom reports whether ANY classify token that feeds a cache_key recipe
+// declares `derives_from cookie …`. The server gates the post-key cookie strip on this
+// so a site without the feature pays exactly one nil check and the request path is
+// byte-for-byte unchanged (COOKIE-NORM is opt-in, zero-cost when unused).
+func (p *Pipeline) HasDerivesFrom() bool { return len(p.derivedSurviveCookies) > 0 }
+
+// SelectedDerivedStripCookies returns the sorted set of request cookies the ACTIVE
+// `derives_from` axes consume for THIS request — i.e. the cookies declared by every
+// classify {TOKEN} present in the recipe SELECTED for the request (the per-request
+// gate). These are the cookies Varnish would `unset` after deriving its VARY-* axes:
+// they were read to build the key and must now leave the request before the origin
+// fetch. Empty when no derives_from token is in the selected recipe. Pure (no mutation)
+// so the edge/conformance can compute the identical set.
+func (p *Pipeline) SelectedDerivedStripCookies(req *Request) []string {
+	if len(p.derivedSurviveCookies) == 0 {
+		return nil
+	}
+	// Reuse the recipe EvalRequest captured when available (Finding 1) so the strip set is
+	// derived from the SAME recipe that built the key, WITHOUT recomputing routing (R29);
+	// recipeTokensForReq falls back to a fresh selection for direct callers. The cookie is
+	// still present at strip time, so a fresh selection would pick the same recipe anyway —
+	// this keeps the single-authoritative-selection invariant.
+	toks := p.recipeTokensForReq(req)
+	var names []string
+	seen := map[string]bool{}
+	for _, t := range toks {
+		if t.kind != tokClassify || t.clsf == nil {
+			continue
+		}
+		for _, c := range t.clsf.derivesFrom {
+			// A `forward` (alias `keep`) cookie is NOT stripped — it is forwarded to origin
+			// unchanged and covered by {TOKEN}. Only strip-mode cookies leave here.
+			if t.clsf.isForwardCookie(c) {
+				continue
+			}
+			if !seen[c] {
+				seen[c] = true
+				names = append(names, c)
+			}
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// SelectedDerivedForwardCookies returns the sorted set of request cookies the ACTIVE
+// `derives_from … forward` axes FORWARD to origin for THIS request — i.e. the forward-mode
+// cookies declared by every classify {TOKEN} present in the recipe SELECTED for the request.
+// These are read to derive + key but, unlike strip-mode cookies, are KEPT in the request
+// (forwarded to origin) and treated as COVERED by {TOKEN} in the credential bypass — the
+// loud opt-in for cookie-reading backends. Empty when no forward axis is in the selected
+// recipe. Pure (no mutation) so the edge/conformance compute the identical set. The gate is
+// the SAME as strip-mode (token in the selected recipe): a forward cookie whose axis is NOT
+// selected is NOT returned here, so it is never covered — it bypasses like any kept cookie.
+func (p *Pipeline) SelectedDerivedForwardCookies(req *Request) []string {
+	if len(p.derivedSurviveCookies) == 0 {
+		return nil
+	}
+	// Reuse the captured recipe WITHOUT recomputing routing (R29); recipeTokensForReq
+	// falls back to a fresh selection for direct callers.
+	toks := p.recipeTokensForReq(req)
+	var names []string
+	seen := map[string]bool{}
+	for _, t := range toks {
+		if t.kind != tokClassify || t.clsf == nil {
+			continue
+		}
+		for _, c := range t.clsf.derivesForward {
+			if !seen[c] {
+				seen[c] = true
+				names = append(names, c)
+			}
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// StripDerivedCookies removes, from req's Cookie header, the cookies consumed by the
+// ACTIVE `derives_from` axes (those whose token is in the SELECTED cache_key recipe) —
+// the derive→strip half of the Varnish cardinality collapse. The server calls it AFTER
+// the cache key is captured but BEFORE the credential check and the origin fetch, so:
+//
+//   - the key (incl. {TOKEN}) was already built from the ORIGINAL cookie value, and
+//   - the credential bypass (BypassForCredentials) and the origin both see the request
+//     with the per-user cookie GONE — so the origin reply is anonymous w.r.t. the axis
+//     and is safely stored under the collapsed (shared) key. This is the SINGLE
+//     fail-closed mechanism: nothing teaches the coverage check to treat the token as
+//     covering the cookie; the cookie is simply absent, so no bypass fires for it.
+//
+// It also RECONCILES the survive-set: a `derives_from` cookie that was force-kept
+// through cookie_allow (so the classifier could read it) but whose token is NOT in the
+// selected recipe is stripped iff cookie_allow would have stripped it — restoring
+// exactly the behavior a site without the feature would have for that request (the
+// gate). It returns whether it modified the Cookie header (for trace/fast-path).
+func (p *Pipeline) StripDerivedCookies(req *Request) bool {
+	if len(p.derivedSurviveCookies) == 0 || req == nil || req.Header == nil {
+		return false
+	}
+	active := map[string]bool{}
+	for _, c := range p.SelectedDerivedStripCookies(req) {
+		active[c] = true
+	}
+	// Active forward-mode cookies (token in the selected recipe) are FORWARDED, never
+	// stripped — they were read + keyed but the operator opted them into reaching origin.
+	activeForward := map[string]bool{}
+	for _, c := range p.SelectedDerivedForwardCookies(req) {
+		activeForward[c] = true
+	}
+	cs := req.lenientCookies()
+	if len(cs) == 0 {
+		return false
+	}
+	// Decide per cookie whether it must be removed. Only survive-set cookies (the ones
+	// force-kept for derivation) are subject to this; every other cookie is left exactly
+	// as cookie_allow / the raw request left it.
+	remove := func(name string) bool {
+		if !p.derivedSurviveCookies[name] {
+			return false // not an axis input we force-kept → untouched
+		}
+		if activeForward[name] {
+			return false // active FORWARD axis input → keep (forwarded to origin, covered)
+		}
+		if active[name] {
+			return true // active strip axis input → derive-then-strip
+		}
+		// Force-kept but its token is not in the selected recipe: reconcile to
+		// cookie_allow's rule (strip iff cookie_allow would have, i.e. not allow-listed).
+		// With no cookie_allow it was never force-stripped today, so keep it (and let the
+		// credential bypass handle it) — fail-closed, never a silent shared store.
+		return p.cookieAllow != nil && !p.cookieAllow.match(name)
+	}
+	changed := false
+	var b strings.Builder
+	for _, c := range cs {
+		if remove(c.name) {
+			changed = true
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("; ")
+		}
+		b.WriteString(c.name)
+		b.WriteByte('=')
+		b.WriteString(c.value)
+	}
+	if !changed {
+		return false // no axis input present → leave the header (and its formatting) alone
+	}
+	if b.Len() == 0 {
+		req.Header.Del("Cookie")
+	} else {
+		req.Header.Set("Cookie", b.String())
+	}
+	return true
 }
 
 // BypassForCredentials reports whether a request must bypass the SHARED cache because
@@ -381,14 +694,14 @@ func (p *Pipeline) BypassForCredentials(req *Request) bool {
 	if !p.keyCanCoverCred {
 		return true // no recipe can cover ANY credential → a credentialed request never caches
 	}
-	// Select THIS request's recipe and check it covers every credential it carries (a scoped
-	// cache_key may key by a credential only for some requests).
-	var stack [memoStack]int8
-	ctx := &matchContext{req: req, upstream: p.resolveUpstream(req), memo: newMemo(stack[:], p.numMatchers)}
-	toks := p.selectKeyTokens(ctx)
-	if len(toks) == 0 {
-		toks = defaultKeyTokens
-	}
+	// Check the recipe that BUILT this request's key covers every credential it carries.
+	// resolvedKeyTokens reuses the selection EvalRequest captured (Finding 1) — NOT a fresh
+	// re-selection on the now-derives_from-stripped request, which could pick a different
+	// recipe than the stored key's and validate coverage against the wrong key (a leak). A
+	// scoped cache_key may key by a credential only for some requests, so the recipe must be
+	// the one that owns this request's key. recipeTokensForReq reuses the captured selection
+	// WITHOUT recomputing routing on the hot credentialed path (R29).
+	toks := p.recipeTokensForReq(req)
 	// Authorization coverage is also count-aware (mirroring keyCoversAllCookies): a
 	// `header:Authorization` key token renders only the FIRST field-line (headerGet), while
 	// the origin sees ALL of them — so a request sending Authorization MORE THAN ONCE is not
@@ -402,8 +715,62 @@ func (p *Pipeline) BypassForCredentials(req *Request) bool {
 	// identity cookie (a session named differently than the keyed one, or any second
 	// cookie like `cart_count`/`uid`) would let two users collide on one entry and leak one's
 	// private body to the other. Under cookie_allow this runs over the allow-listed remainder.
-	if hasCookie && !keyCoversAllCookies(toks, req) {
+	//
+	// COOKIE-NORM forward mode: a `derives_from … forward` cookie REMAINS in the request
+	// (unlike strip-mode, which removed it before this check), so without help it would look
+	// like an un-keyed credential and force a bypass. We treat it as COVERED — but ONLY when
+	// its axis is in the SELECTED recipe (SelectedDerivedForwardCookies applies the same gate
+	// as the key), so the cookie is ALWAYS keyed via {TOKEN}: no shared-key leak along the
+	// keyed axis. This is the single re-introduced coverage rule, scoped to a cookie that is
+	// both keyed (by its token) AND explicitly opted into forward. Any OTHER cookie (a second
+	// identity cookie, a forward cookie whose axis is NOT selected) is NOT in this set, so it
+	// still bypasses — fail-closed.
+	var forwardCovered map[string]bool
+	if fc := p.SelectedDerivedForwardCookies(req); len(fc) > 0 {
+		forwardCovered = make(map[string]bool, len(fc))
+		for _, c := range fc {
+			forwardCovered[c] = true
+		}
+	}
+	if hasCookie && !keyCoversAllCookies(toks, req, forwardCovered) {
 		return true
+	}
+	return false
+}
+
+// HasCacheCredentialed reports whether the site declares any `cache_credentialed @scope`
+// directive. The server gates the whole origin-authoritative path on this so a site without
+// it pays exactly one len check and the credential-bypass hot path is byte-for-byte
+// unchanged (the directive is opt-in and zero-cost when unused).
+func (p *Pipeline) HasCacheCredentialed() bool { return len(p.credentialedRules) > 0 }
+
+// CacheCredentialedMatches reports whether req matches a `cache_credentialed @scope`
+// directive — i.e. caching is ORIGIN-AUTHORITATIVE for it (D101). The SERVER calls this at
+// the credential-bypass decision: when true it does NOT call/short-circuit
+// BypassForCredentials (so a Cookie/Authorization request is NOT bypassed) and restores the
+// original cookies onto the OUTBOUND origin request (origin auth, not the cache key — the
+// entry stays under the SHARED key). Mirrors BypassForCredentials' server+edge split: a
+// serving-tier policy toggled by a matcher, NOT baked into EvalRequest's snapshot, so
+// portable rule eval / cache key / matchers are unchanged. Returns false immediately when no
+// directive is declared (zero cost). The matchers are request-phase (response-phase rejected
+// at compile), so a path/host scope evaluates identically here and in EvalResponse.
+func (p *Pipeline) CacheCredentialedMatches(req *Request) bool {
+	if len(p.credentialedRules) == 0 || req == nil {
+		return false
+	}
+	var stack [memoStack]int8
+	ctx := &matchContext{req: req, upstream: p.resolveUpstream(req), memo: newMemo(stack[:], p.numMatchers)}
+	return p.cacheCredentialedMatches(ctx)
+}
+
+// cacheCredentialedMatches is the shared scope evaluation used by CacheCredentialedMatches
+// (server) and EvalResponse (the in-scope precedence). It is an OR over the compiled
+// `cache_credentialed` scopes, evaluated through the caller's memoized context.
+func (p *Pipeline) cacheCredentialedMatches(ctx *matchContext) bool {
+	for _, sc := range p.credentialedRules {
+		if ctx.scopeMatches(sc) {
+			return true
+		}
 	}
 	return false
 }
@@ -425,7 +792,27 @@ func keyCoversAuthorization(toks []keyToken) bool {
 // the request carries is not captured, the response is per-user with respect to that
 // cookie and must not be shared — so the caller bypasses the cache. Cookie names are
 // matched case-sensitively (RFC 6265).
-func keyCoversAllCookies(toks []keyToken, req *Request) bool {
+//
+// forwardCovered names the cookies a `derives_from … forward` axis SELECTED for this
+// request keys via {TOKEN} (the caller computes it under the same recipe gate). Such a
+// cookie is keyed by its normalized axis, so it is treated as covered HERE even though no
+// raw `cookie:NAME` token names it — the loud opt-in for forwarding a cookie to origin
+// under a collapsed key. It is nil/empty on every non-forward request (zero cost).
+//
+// Duplicate occurrences are handled by HOW the cookie is covered (fail-closed except the
+// one proven-safe case):
+//   - RAW `cookie:NAME`-keyed, sent more than once → NOT covered (bypass). The token keys
+//     on net/http's FIRST occurrence while the origin receives ALL, so two users sharing
+//     the first value but differing on a later one collide on one entry → genuine leak.
+//   - FORWARD-covered ONLY (covered solely via a selected `derives_from … forward` token):
+//     the key is a DERIVED `classify` axis, not the raw value, so the keyed axis is
+//     occurrence-independent. Sent more than once it is safely covered IFF every
+//     occurrence's value is byte-identical (the derived axis is the same for all AND the
+//     origin sees N identical values — no divergence). If the occurrences DIFFER, the
+//     classifier may have read a specific one → genuinely ambiguous → bypass.
+//   - BOTH raw-keyed AND forward-covered, sent more than once → the raw-keyed rule WINS
+//     (the raw value enters the key) → bypass. Fail-closed precedence.
+func keyCoversAllCookies(toks []keyToken, req *Request, forwardCovered map[string]bool) bool {
 	keyed := map[string]struct{}{}
 	for _, t := range toks {
 		if t.kind == tokHeader && strings.EqualFold(t.arg, "Cookie") {
@@ -435,25 +822,52 @@ func keyCoversAllCookies(toks []keyToken, req *Request) bool {
 			keyed[t.arg] = struct{}{}
 		}
 	}
-	names := req.cookieNames()
-	if len(names) == 0 {
+	// Read ALL occurrences (name + value) the SAME lenient way the key and origin see them,
+	// so the byte-identical comparison below sees every occurrence's value, not just the
+	// first. order preserves first-seen order for a stable, allocation-light walk.
+	cookies := req.lenientCookies()
+	if len(cookies) == 0 {
 		return false // a non-empty but unparseable Cookie header is not safely covered
 	}
-	// Count occurrences: a `cookie:NAME` token keys on req.cookie(NAME) — net/http's
-	// FIRST occurrence — while the origin receives ALL of them. So a keyed cookie sent
-	// MORE THAN ONCE is NOT safely covered: two users sharing the first value but
-	// differing on a later one would collide on one entry and leak. Require every cookie
-	// to be keyed AND to appear exactly once (whole-header keying above is exempt).
-	counts := make(map[string]int, len(names))
-	for _, n := range names {
-		counts[n]++
-	}
-	for n, c := range counts {
-		if _, ok := keyed[n]; !ok {
-			return false // this cookie is not in the key → cannot safely share
+	values := make(map[string][]string, len(cookies))
+	order := make([]string, 0, len(cookies))
+	for _, c := range cookies {
+		if _, seen := values[c.name]; !seen {
+			order = append(order, c.name)
 		}
-		if c > 1 {
-			return false // keyed but sent multiple times → the key captures only the first value
+		values[c.name] = append(values[c.name], c.value)
+	}
+	for _, n := range order {
+		_, isKeyed := keyed[n]
+		if !isKeyed && !forwardCovered[n] {
+			return false // not in the key and not a forward-covered axis → cannot safely share
+		}
+		vals := values[n]
+		if len(vals) <= 1 {
+			continue // single occurrence → covered (the common path)
+		}
+		if isKeyed {
+			// Raw-keyed (alone or also forward-covered): the raw value enters the key,
+			// which captures only the first occurrence → bypass, fail-closed precedence.
+			return false
+		}
+		// Forward-covered ONLY: safe iff every occurrence is byte-identical (the derived
+		// axis is occurrence-independent and the origin sees N identical values → no
+		// divergence possible). Any differing occurrence → genuinely ambiguous → bypass.
+		if !allEqualStrings(vals) {
+			return false
+		}
+	}
+	return true
+}
+
+// allEqualStrings reports whether every element of vs equals the first (vs is non-empty at
+// the only call site). Used by keyCoversAllCookies to decide whether duplicate
+// forward-covered cookie occurrences carry identical (byte-equal) values.
+func allEqualStrings(vs []string) bool {
+	for _, v := range vs[1:] {
+		if v != vs[0] {
+			return false
 		}
 	}
 	return true
@@ -539,8 +953,15 @@ func varyStar(h http.Header) bool {
 // are honored here — and all of them are overridable site-wide with `cache_unsafe`.
 //
 // `must-revalidate`/`proxy-revalidate` are deliberately NOT treated as uncacheable:
-// they permit caching while FRESH and only forbid serving STALE without revalidation
-// (a grace/stale concern, not a store concern).
+// they permit caching while FRESH and only forbid serving STALE without revalidation.
+// cadish's serve-stale behavior is OPERATOR-AUTHORITATIVE (ADR D97): by DEFAULT no
+// `grace` is configured (`grace 0`), so a stale object is never served — `must-revalidate`
+// is honored as a matter of course (the object revalidates on its next request). A stale
+// object is served ONLY when the operator EXPLICITLY opts into a `grace`/`max_stale`
+// window, and that explicit decision is authoritative over the origin's `must-revalidate`
+// (just as `cache_ttl` overrides the origin's `max-age`). cadish therefore does not store
+// or act on the directive here — recording it to override an explicit operator grace would
+// invert the authority model and let an origin silently defeat the operator's `grace`.
 func hasUncacheableCC(value string) bool {
 	for _, part := range strings.Split(value, ",") {
 		part = strings.TrimSpace(part)
@@ -714,6 +1135,11 @@ func fillHeaderTemplateEnv(env *TemplateEnv, ctx *matchContext) {
 	env.Geo = ctx.req.Geo
 	env.GeoContinent = ctx.req.GeoContinent
 	env.GeoRegion = ctx.req.GeoRegion
+	if ctx.req.TLS {
+		env.Scheme = "https"
+	} else {
+		env.Scheme = "http"
+	}
 }
 
 // resolveHTTPPlaceholder resolves a "{http.NAME}" placeholder against the request
@@ -903,15 +1329,13 @@ func resolveImportFile(full string, stack []string) ([]cadishfile.Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	f, err := cadishfile.Parse(full, data)
+	// Parse the fragment with the site-body grammar (ParseFragment), NOT the
+	// top-level file grammar: a brace-bodied directive (classify {…}, upstream {…},
+	// tls {…}, …) must associate its body into a Directive.Block exactly as it would
+	// inline at the splice point, never be mis-read as a site header and flattened.
+	raw, err := cadishfile.ParseFragment(full, data)
 	if err != nil {
 		return nil, err
-	}
-	// An imported fragment is a bare body (matchers + directives); some files may
-	// also wrap content in sites — include those bodies too.
-	raw := append([]cadishfile.Node(nil), f.Body...)
-	for _, s := range f.Sites {
-		raw = append(raw, s.Body...)
 	}
 	// Recursively resolve any nested imports, tracking this file on the stack so a
 	// self/back-reference is caught as a cycle.

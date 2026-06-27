@@ -53,9 +53,11 @@ rules:
   resources: ["ingresses", "ingressclasses"]
   verbs: ["get", "list", "watch"]
 # The publish Service (leader status writer reads its LoadBalancer address). Cluster-wide.
+# Least privilege: a direct GET of the single publish Service (no Service informer), so
+# `get` alone suffices — no list/watch.
 - apiGroups: [""]
   resources: ["services"]
-  verbs: ["get", "list", "watch"]
+  verbs: ["get"]
 # Write Ingress status.loadBalancer (leader-only writer).
 - apiGroups: ["networking.k8s.io"]
   resources: ["ingresses/status"]

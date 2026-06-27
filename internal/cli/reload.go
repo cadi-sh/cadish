@@ -25,6 +25,14 @@ func Reload(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	// The target is set via -pidfile/-pid, never a positional. flag.Parse stops at the
+	// first non-flag token, so a stray positional (e.g. `cadish reload 1234`, expecting
+	// a bare PID, or trailing junk) would otherwise be SILENTLY ignored and the command
+	// could signal the wrong/no process. Fail loud, like the other subcommands.
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "cadish reload: unexpected argument(s): %v\n(set the target with -pidfile FILE or -pid N)\n", fs.Args())
+		return 2
+	}
 
 	target := *pid
 	if target == 0 {
@@ -38,6 +46,17 @@ func Reload(args []string) int {
 			return 1
 		}
 		target = p
+	}
+
+	// SAFETY: a non-positive PID is never a valid single-process target, and signaling
+	// one is destructive on Unix — os.FindProcess never validates the PID, so a later
+	// Signal becomes kill(target, SIGHUP): kill(-1, …) BROADCASTS the signal to every
+	// process the caller may signal, and kill(0, …) signals the caller's whole process
+	// group. So `cadish reload -pid -1` (or a pidfile whose content resolved to 0/-1)
+	// would SIGHUP-storm the box instead of reloading one server. Refuse loudly.
+	if target <= 0 {
+		fmt.Fprintf(os.Stderr, "cadish reload: refusing to signal non-positive PID %d (a zero/negative PID targets a process group or every process, not one server)\n", target)
+		return 1
 	}
 
 	proc, err := os.FindProcess(target)

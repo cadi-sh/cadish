@@ -157,8 +157,49 @@ func (s *Store) GetTier(key string) (*Reader, string, bool) {
 // Writer returns a TierWriter for meta's tier: an explicit meta.Tier override
 // (from a `storage … -> ram|disk` rule) when set, otherwise automatic size-based
 // routing.
+//
+// CROSS-TIER DEDUP (R14): a key's destination tier is size-dependent, so a re-store of
+// the SAME key can route to a DIFFERENT tier than a prior copy (e.g. first served with a
+// small Content-Length → RAM, later revalidated chunked/unknown-size → disk). GetTier
+// returns the first hit (RAM before disk), so without eviction the stale RAM copy would
+// permanently shadow the fresh disk copy. We therefore wrap the writer so that on a
+// successful Commit the SAME key is deleted from the OTHER tier — guaranteeing a key
+// lives in at most one tier and a GET always returns the most-recently-committed copy.
 func (s *Store) Writer(meta ObjectMeta) (TierWriter, error) {
-	return s.tierFor(meta).Writer(meta)
+	dst := s.tierFor(meta)
+	w, err := dst.Writer(meta)
+	if err != nil {
+		return nil, err
+	}
+	sibling := s.disk
+	if dst == s.disk {
+		sibling = s.ram
+	}
+	return &dedupWriter{TierWriter: w, sibling: sibling, key: meta.Key}, nil
+}
+
+// dedupWriter wraps a tier's writer and, on a successful Commit, deletes the committed
+// key from the sibling tier so the key is never resident in both (R14 cross-tier dedup).
+// Abort is a pass-through (nothing was committed, so the sibling is untouched).
+type dedupWriter struct {
+	TierWriter
+	sibling Tier
+	key     string
+}
+
+func (w *dedupWriter) Commit() error {
+	if err := w.TierWriter.Commit(); err != nil {
+		return err
+	}
+	// Only dedup the sibling when the destination tier ACTUALLY installed the key. A
+	// nil Commit does NOT imply storage: a RAM overflow (per-object cap / global budget
+	// / shard cap) or a disk oversize discard returns nil without storing. Deleting the
+	// sibling then would leave the key resident in NEITHER tier — silently destroying
+	// the only real copy (and its grace / max_stale-on-error fallback). R14.
+	if w.TierWriter.Stored() {
+		w.sibling.Delete(w.key)
+	}
+	return nil
 }
 
 // tierFor resolves the destination tier for a write. An explicit meta.Tier wins
@@ -212,6 +253,12 @@ type Stats struct {
 	DiskMaxBytes            int64
 	DiskPersistErrors       int64
 	DiskOversizeDiscards    int64
+	// DiskNoTierDiscards counts responses cached NOWHERE because this is a RAM-only
+	// deployment (no disk tier) yet the automatic size policy routed a chunked/
+	// unknown-length (or over-threshold) response to the absent disk tier. A growing
+	// value means a dynamic/chunked origin is getting zero caching — add a `disk` tier
+	// or have the origin send a small Content-Length. Distinct from DiskOversizeDiscards.
+	DiskNoTierDiscards int64
 }
 
 func (s *Store) Stats() Stats {
@@ -226,6 +273,7 @@ func (s *Store) Stats() Stats {
 	if d, ok := s.disk.(*DiskTier); ok {
 		st.DiskPersistErrors = d.PersistErrors()
 		st.DiskOversizeDiscards = d.OversizeDiscards()
+		st.DiskNoTierDiscards = d.NoTierDiscards()
 	}
 	return st
 }
@@ -244,6 +292,17 @@ func (s *Store) SetLogger(log *slog.Logger) {
 // reload path) tell whether a temp directory is still in use by a preserved store
 // before removing it.
 func (s *Store) DiskDir() string { return s.cfg.DiskDir }
+
+// Reset drops every cached object from BOTH tiers and persists an emptied disk index,
+// returning the store to a cold state. It is the reload path's fail-safe FLUSH when a
+// site's cache-key scheme changed (config.TransplantStoresFrom): a freshly-opened cold
+// store reloads the previous run's on-disk blobs, which are keyed under the OLD recipe,
+// so reusing them could serve a wrong (cross-content) object for a key that now
+// addresses different content. Call it before the store serves any traffic.
+func (s *Store) Reset() {
+	s.ram.Reset()
+	s.disk.Reset()
+}
 
 // Close flushes both tiers (persisting disk metadata).
 func (s *Store) Close() error {

@@ -1,0 +1,26 @@
+{
+  "name": "11-cookie-norm",
+  "cadishfile": "example.com {\n    @verified   cookie verified-prod 1\n    @registered cookie userType registered\n    classify {ageverify} {\n        derives_from cookie verified-prod userType\n        when @verified   -> 0\n        when @registered -> 1\n        default          -> 2\n    }\n    cookie_allow\n    cache_key default host url {ageverify}\n    cache_ttl default ttl 60s\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/p", "header": { "Cookie": ["verified-prod=1; _ga=GA1.2.3"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/p", "header": { "Cookie": ["userType=registered; _ga=GA9.9"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/p", "header": { "Cookie": ["verified-prod=0; _ga=GA7"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/p" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

@@ -1,0 +1,88 @@
+{
+  "irVersion": 6,
+  "site": {
+    "hosts": [
+      "example.com"
+    ],
+    "redirectHosts": [
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "api": {
+      "kind": "path",
+      "patterns": [
+        "/api/*"
+      ]
+    }
+  },
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "method"
+      },
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "scope",
+        "scope": {
+          "names": [
+            "api"
+          ]
+        },
+        "grace": "30s",
+        "maxStale": "1h0m0s",
+        "fromHeader": "X-Cache-Ttl",
+        "graceFromHeader": "X-Cache-Grace",
+        "maxStaleFromHeader": "X-Cache-Max-Stale",
+        "stripHeaders": [
+          "X-Cache-Ttl",
+          "X-Cache-Grace",
+          "X-Cache-Max-Stale"
+        ]
+      },
+      {
+        "selKind": "default",
+        "ttl": "5s"
+      }
+    ],
+    "storage": [
+      {
+        "selKind": "default",
+        "tier": "ram"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      }
+    ],
+    "hasStripHeaders": true
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache"
+  },
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

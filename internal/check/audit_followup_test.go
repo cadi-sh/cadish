@@ -42,6 +42,25 @@ func TestCatalogSubsetOfRegistry(t *testing.T) {
 	}
 }
 
+// TestEveryRegisteredDirectiveHasPhase is the REVERSE of TestCatalogSubsetOfRegistry:
+// every directive the runtime accepts (cadishfile.DefaultDirectives — the same list
+// pipeline.Compile's knownDirectives is built from) MUST have an explicit
+// directivePhase entry. Without one, phaseOf() silently defaults the directive to
+// PhaseRECV, so `cadish check` reports a WRONG lifecycle phase and per-request cost
+// for a directive `cadish run` actually honors — the "check mis-costs a directive run
+// honors" divergence class. A Setup-phase directive defaulted to RECV would be charged
+// a phantom per-request cost in the cost breakdown. This makes the missing-phase a
+// hard test failure (the operator must classify the new directive's phase explicitly).
+func TestEveryRegisteredDirectiveHasPhase(t *testing.T) {
+	for _, n := range cadishfile.DefaultDirectives {
+		if _, ok := directivePhase[n]; !ok {
+			t.Errorf("registered directive %q has no directivePhase entry — phaseOf() silently "+
+				"defaults it to PhaseRECV, so `cadish check` mis-reports its phase/cost vs what "+
+				"`cadish run` honors. Add an explicit directivePhase entry classifying its lifecycle phase.", n)
+		}
+	}
+}
+
 // wiredDirectives is the curated set of catalogued directives (directivePhase keys)
 // that resolve to REAL behavior somewhere in cadish. "Real behavior" is broader than
 // "consumed by pipeline.Compile": several are config-/server-layer directives wired
@@ -69,6 +88,10 @@ var wiredDirectives = map[string]string{
 	"host_header":    "origin Host header override (transport, config layer)",
 	"sni":            "per-upstream TLS ServerName (http.Transport, config layer)",
 	"http_reuse":     "per-upstream keepalive toggle (http.Transport, config layer)",
+	"tls_insecure":   "per-upstream origin TLS skip-verify (http.Transport, config layer)",
+	"ca_file":        "per-upstream origin TLS RootCAs pool (http.Transport, config layer)",
+	"alpn":           "per-upstream origin TLS ALPN pin (http.Transport, config layer)",
+	"resolve":        "per-upstream DNS resolver: re-resolution interval + nameserver(s) (lb pool, config layer)",
 	"import":         "splice-time include (resolved before Compile)",
 	"device_detect":  "UA classifier (config layer; feeds {device} key token)",
 	"geo":            "geo resolution (config layer; feeds {geo}/geo matcher)",
@@ -82,28 +105,32 @@ var wiredDirectives = map[string]string{
 	"strict_host":    "strict-host site selection (config.StrictHost -> server routing 421)",
 	"security":       "security audit-log sink (server/config layer, D52)",
 	"proxy_protocol": "PROXY-protocol listener (server/config layer)",
+	"server":         "inbound maxconn/read_timeout/idle_timeout knobs (config.ServerConfig -> server listener/timeouts)",
 	// --- request-pipeline directives (consumed by pipeline.Compile's switch) ---
-	"respond":       "compileRespond / compileOnError (RECV / ORIGIN)",
-	"redirect":      "compileRedirect (RECV)",
-	"purge":         "compilePurge (RECV)",
-	"route":         "compileRoute (RECV)",
-	"pass":          "parseScopeAll -> passRules (RECV)",
-	"rewrite":       "compileRewrite (RECV)",
-	"allow":         "compileSecurityRule(secAllow) (RECV security gate)",
-	"deny":          "compileSecurityRule(secDeny) (RECV security gate)",
-	"block":         "compileSecurityRule(secDeny) (RECV security gate)",
-	"monitor":       "compileMonitorToggle -> securityMonitor (setup)",
-	"rate_limit":    "compileRateLimit (RECV security gate)",
-	"cache_key":     "compileCacheKeyRule (KEY)",
-	"cache_ttl":     "compileTTL (ORIGIN/store)",
-	"storage":       "compileStorage (ORIGIN/store)",
-	"cache_unsafe":  "p.cacheUnsafe flag (response-phase safe-default opt-out)",
-	"header":        "compileHeader (req/resp header ops)",
-	"strip_cookies": "parseScopeAll -> stripRules (DELIVER)",
-	"cookie_allow":  "p.cookieAllow nameGlobSet; server FilterRequestCookies strips non-allowed cookies at RECV",
-	"cors":          "compileCORS (DELIVER)",
-	"replace":       "compileReplace -> transformRules (DELIVER body transform)",
-	"encode":        "compileEncode -> encodeRule (DELIVER)",
+	"respond":              "compileRespond / compileOnError (RECV / ORIGIN)",
+	"redirect":             "compileRedirect (RECV)",
+	"purge":                "compilePurge (RECV)",
+	"route":                "compileRoute (RECV)",
+	"pass":                 "parseScopeAll -> passRules (RECV)",
+	"upgrade":              "parseScopeAll -> upgradeRules (RECV); server tunnel in internal/server/upgrade.go",
+	"cache_credentialed":   "parseScopeAll -> credentialedRules (RECV, D101); server skips BypassForCredentials + forwards cookies; EvalResponse origin-authoritative store; edge EdgeIR.CacheCredentialed",
+	"rewrite":              "compileRewrite (RECV)",
+	"allow":                "compileSecurityRule(secAllow) (RECV security gate)",
+	"deny":                 "compileSecurityRule(secDeny) (RECV security gate)",
+	"block":                "compileSecurityRule(secDeny) (RECV security gate)",
+	"monitor":              "compileMonitorToggle -> securityMonitor (setup)",
+	"rate_limit":           "compileRateLimit (RECV security gate)",
+	"cache_key":            "compileCacheKeyRule (KEY)",
+	"cache_ttl":            "compileTTL (ORIGIN/store)",
+	"storage":              "compileStorage (ORIGIN/store)",
+	"cache_unsafe":         "p.cacheUnsafe flag (response-phase safe-default opt-out)",
+	"client_cache_control": "p.ignoreClientRevalidation flag; server gates clientForcesRevalidate at LOOKUP (RFC 9111 §5.2.1.4 opt-out)",
+	"header":               "compileHeader (req/resp header ops)",
+	"strip_cookies":        "parseScopeAll -> stripRules (DELIVER)",
+	"cookie_allow":         "p.cookieAllow nameGlobSet; server FilterRequestCookies strips non-allowed cookies at RECV",
+	"cors":                 "compileCORS (DELIVER)",
+	"replace":              "compileReplace -> transformRules (DELIVER body transform)",
+	"encode":               "compileEncode -> encodeRule (DELIVER)",
 }
 
 // intentionalNoOps is the small, explicit allowlist of catalogued directives that

@@ -1,6 +1,9 @@
 package check
 
 import (
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"net"
 	"os"
@@ -188,6 +191,46 @@ func normalizeSiteAddr(addr string) string {
 	return addr
 }
 
+// detectNoOpTopLevelBody warns when a file has site blocks AND ALSO statements OUTSIDE
+// any site (in f.Body). config.Load splices imports and builds pipelines PER SITE — it
+// never runs a top-level (outside-a-site) statement — so each one is a RUNTIME NO-OP. The
+// most dangerous source is a site-address list that dropped an address into the top-level
+// body (the production-525 silent-drop class): a forgotten comma in
+// `intranet`\n`api.internal {` leaves `intranet` as a no-op top-level directive, so the
+// TLS cert / serving covers one fewer host with NO signal. The dotted/`:port`/`scheme://`
+// first-address shapes are caught as a hard parse error (cadishfile.unseparatedAddrWrap),
+// but a bare single-label first address is shape-indistinguishable from a directive name —
+// the parser cannot reject it without false positives (it would break Format round-trip) —
+// so this warning is where the single-label residual (R12) is surfaced. A bare importable
+// fragment (NO sites) legitimately carries top-level statements (analyzed as "(top-level)"
+// below), so it is NOT flagged.
+func detectNoOpTopLevelBody(f *cadishfile.File, rep *Report) {
+	if len(f.Sites) == 0 {
+		return
+	}
+	for _, n := range f.Body {
+		switch d := n.(type) {
+		case *cadishfile.Directive:
+			// A top-level `import` is a DOCUMENTED no-op that both run (config.Load splices
+			// imports per-site only, never the root body's) and check IGNORE — see
+			// docs/cadishfile-reference.md. Flagging it (and offering the "comma-separate
+			// every address" remedy, which is nonsense for an import) contradicts that
+			// contract, so skip it. The R12 single-label-address residual this warning exists
+			// for is unaffected.
+			if d.Name == "import" {
+				continue
+			}
+			rep.Diagnostics = append(rep.Diagnostics, newDiag(SevWarning, d.Pos, "noop-top-level-statement",
+				"%q is a top-level statement OUTSIDE any site block; with site blocks present cadish runs directives only INSIDE a site, so this never takes effect. If it is a wrapped site address that lost its comma (e.g. `intranet` then `api.internal {`), comma-separate every address; otherwise move it into the relevant site { } block or remove it",
+				d.Name))
+		case *cadishfile.MatcherDef:
+			rep.Diagnostics = append(rep.Diagnostics, newDiag(SevWarning, d.Pos, "noop-top-level-statement",
+				"matcher @%s is defined at top level OUTSIDE any site block and never takes effect (matchers are per-site); move it into the site that uses it",
+				d.Name))
+		}
+	}
+}
+
 // analyzeFile resolves imports then analyzes every site (or the top-level body).
 // sandbox disables all filesystem access: imports produce a diagnostic instead of
 // reading from disk, and geo/maxmind path probes are skipped.
@@ -224,6 +267,7 @@ func analyzeFile(path string, f *cadishfile.File, sandbox bool) *Report {
 	}
 
 	detectDuplicateSites(f.Sites, rep)
+	detectNoOpTopLevelBody(f, rep)
 	for _, s := range f.Sites {
 		sr := analyzeSite(s.Addresses, s.Pos, s.Body, baseDir, sandbox)
 		compileSite(s, sr)
@@ -310,9 +354,164 @@ func validateValues(f *cadishfile.File, rep *Report, baseDir string, sandbox boo
 		scan(s.Body)
 	}
 	tlsConfigWarnings(f, rep)
+	acmeHostIssuabilityWarnings(f, rep)
 	if !sandbox {
 		fileExistenceWarnings(f, rep, baseDir)
+		tlsCertCoverageWarnings(f, rep, baseDir)
+		tlsKeypairWarnings(f, rep, baseDir)
 	}
+}
+
+// tlsCertCoverageWarnings is the loud defense-in-depth for SPEC-MULTILINE-ADDR
+// (§4): when a site pins a STATIC `tls { cert … key … }` keypair and that cert
+// file is present at check time, it warns if any of the site's DECLARED addresses
+// is not covered by the certificate's SANs. The static cert source registers the
+// keypair under every declared host, so a handshake reaches it — but a real client
+// (e.g. Cloudflare validating the SNI) rejects a cert whose SANs omit that host,
+// which is exactly how a truncated/insufficient cert produced a production 525.
+// Surfacing the uncovered host turns that silent TLS mismatch into a visible
+// warning. It is a WARNING, not an error: the cert is a deploy artifact and may be
+// re-issued before run; absence is already covered by fileExistenceWarnings and an
+// unparseable cert is left to the structural pass. Skipped in the sandbox (no fs).
+func tlsCertCoverageWarnings(f *cadishfile.File, rep *Report, baseDir string) {
+	for _, s := range f.Sites {
+		sc, _ := tlsacme.SiteConfigFromSite(s)
+		if sc.TLS.Mode != tlsacme.ModeStatic || sc.TLS.CertFile == "" {
+			continue
+		}
+		data, ok := readMaybeRel(sc.TLS.CertFile, baseDir)
+		if !ok {
+			continue // absence already warned by fileExistenceWarnings
+		}
+		names := certDNSNames(data)
+		if len(names) == 0 {
+			continue // unparseable or SAN-less cert: not this pass's job
+		}
+		covered := make(map[string]struct{}, len(names))
+		for _, n := range names {
+			covered[coverageHost(n)] = struct{}{}
+		}
+		var missing []string
+		for _, addr := range sc.Hosts {
+			h := coverageHost(addr)
+			if h == "" {
+				continue
+			}
+			if _, ok := covered[h]; ok {
+				continue
+			}
+			// A cert wildcard "*.example.com" covers "a.example.com" (one label).
+			if i := strings.IndexByte(h, '.'); i > 0 {
+				if _, ok := covered["*"+h[i:]]; ok {
+					continue
+				}
+			}
+			missing = append(missing, addr)
+		}
+		if len(missing) > 0 {
+			rep.Diagnostics = append(rep.Diagnostics, newDiag(SevWarning, s.Pos, "tls-cert-uncovered-address",
+				"static tls cert %q does not cover declared address(es) %s — a real SNI handshake for those hosts will fail (cert SANs: %s). Re-issue the certificate for every declared address, or move the uncovered hosts to their own site",
+				sc.TLS.CertFile, strings.Join(missing, ", "), strings.Join(names, ", ")))
+		}
+	}
+}
+
+// tlsKeypairWarnings closes a check↔run gap the structural pre-flight leaves open:
+// a static `tls { cert … key … }` site whose cert AND key files are BOTH present
+// but do NOT form a valid keypair — a mismatched pair (old cert + new key mid
+// rotation), or an unparseable/empty/garbage cert or key — passes `cadish check`
+// (ValidateStructure never loads the keypair; the coverage pass reads only the
+// cert) yet FAILS `cadish run` at startup: tlsacme.NewManager → tls.LoadX509KeyPair
+// → "tls: private key does not match public key" aborts NewServer, a boot-time
+// outage on a config that checked clean. When both files are readable, attempt the
+// SAME load run performs and surface a failure as a WARNING (not a hard error): the
+// keypair is a deploy artifact that may be re-issued before run — like the coverage
+// and existence warnings — so this stays advisory but loud, with the exact error
+// run would print. Absence is already handled by fileExistenceWarnings; an
+// already-flagged uncovered-SAN cert can still be a valid pair, so the two passes
+// are independent. Skipped in the sandbox (no filesystem).
+func tlsKeypairWarnings(f *cadishfile.File, rep *Report, baseDir string) {
+	for _, s := range f.Sites {
+		sc, _ := tlsacme.SiteConfigFromSite(s)
+		if sc.TLS.Mode != tlsacme.ModeStatic || sc.TLS.CertFile == "" || sc.TLS.KeyFile == "" {
+			continue
+		}
+		certPEM, ok := readMaybeRel(sc.TLS.CertFile, baseDir)
+		if !ok {
+			continue // absence already warned by fileExistenceWarnings
+		}
+		keyPEM, ok := readMaybeRel(sc.TLS.KeyFile, baseDir)
+		if !ok {
+			continue
+		}
+		if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+			rep.Diagnostics = append(rep.Diagnostics, newDiag(SevWarning, s.Pos, "tls-keypair-invalid",
+				"static tls keypair (cert %q, key %q) fails to load: %v — `cadish run` will refuse to start with this exact error. Re-pair or re-issue the certificate and key",
+				sc.TLS.CertFile, sc.TLS.KeyFile, err))
+		}
+	}
+}
+
+// readMaybeRel reads path as written, or relative to baseDir when path is
+// relative. The second return is false when neither location exists/reads.
+func readMaybeRel(path, baseDir string) ([]byte, bool) {
+	if path == "" {
+		return nil, false
+	}
+	if data, err := os.ReadFile(path); err == nil {
+		return data, true
+	}
+	if !filepath.IsAbs(path) {
+		if data, err := os.ReadFile(filepath.Join(baseDir, path)); err == nil {
+			return data, true
+		}
+	}
+	return nil, false
+}
+
+// certDNSNames parses the first CERTIFICATE block in a PEM bundle and returns its
+// SANs — both the DNS names AND the IP addresses (normalized via ip.String()) a TLS
+// client validates the SNI/IP against (Finding 4: an IP-literal site address carried
+// as a cert IP SAN must count as covered). It returns nil for a non-PEM/garbage
+// input so the caller can skip rather than warn on noise.
+func certDNSNames(pemData []byte) []string {
+	rest := pemData
+	for {
+		var blk *pem.Block
+		blk, rest = pem.Decode(rest)
+		if blk == nil {
+			return nil
+		}
+		if blk.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, err := x509.ParseCertificate(blk.Bytes)
+		if err != nil {
+			return nil
+		}
+		names := make([]string, 0, len(cert.DNSNames)+len(cert.IPAddresses))
+		names = append(names, cert.DNSNames...)
+		for _, ip := range cert.IPAddresses {
+			names = append(names, ip.String())
+		}
+		return names
+	}
+}
+
+// coverageHost normalizes a declared address or cert SAN for coverage comparison:
+// lower-cased, trailing dot stripped, and any trailing ":port" removed (IPv6
+// literals keep their brackets). It mirrors tlsacme host normalization closely
+// enough for the exact/one-label-wildcard comparison this check performs.
+func coverageHost(host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if strings.HasPrefix(host, "[") {
+		if i := strings.IndexByte(host, ']'); i >= 0 {
+			host = host[:i+1]
+		}
+	} else if i := strings.LastIndexByte(host, ':'); i >= 0 {
+		host = host[:i]
+	}
+	return strings.TrimSuffix(host, ".")
 }
 
 // tlsConfigWarnings surfaces the soft semantic warnings tlsacme.SiteConfigFromSite
@@ -389,15 +588,22 @@ func fileExistenceWarnings(f *cadishfile.File, rep *Report, baseDir string) {
 						warn(bd.Args[1].Pos, "geo source "+k+" file", bd.Args[1].Raw)
 					}
 				}
-			case "upstream":
+			case "upstream", "cluster":
 				for _, bn := range d.Block {
 					bd, ok := bn.(*cadishfile.Directive)
-					if !ok || bd.Name != "sign" {
+					if !ok {
 						continue
 					}
-					for i, a := range bd.Args { // sign cloudfront <kp> key <pem> [ttl D]
-						if a.Raw == "key" && i+1 < len(bd.Args) && !present(bd.Args[i+1].Raw) {
-							warn(bd.Args[i+1].Pos, "cloudfront signing key", bd.Args[i+1].Raw)
+					switch bd.Name {
+					case "sign":
+						for i, a := range bd.Args { // sign cloudfront <kp> key <pem> [ttl D]
+							if a.Raw == "key" && i+1 < len(bd.Args) && !present(bd.Args[i+1].Raw) {
+								warn(bd.Args[i+1].Pos, "cloudfront signing key", bd.Args[i+1].Raw)
+							}
+						}
+					case "ca_file": // ca_file <pem>: origin-TLS private CA bundle (deploy precondition)
+						if len(bd.Args) == 1 && !present(bd.Args[0].Raw) {
+							warn(bd.Args[0].Pos, "ca_file", bd.Args[0].Raw)
 						}
 					}
 				}
@@ -540,10 +746,10 @@ var poolDirectives = map[string]bool{
 	// lb pool keys (internal/lb parsePool switch):
 	"to": true, "policy": true, "lb": true, "sticky": true, "shard_by": true,
 	"health": true, "timeout": true, "max_conns": true, "replicas": true,
-	"sni": true, "http_reuse": true,
+	"sni": true, "http_reuse": true, "tls_insecure": true, "alpn": true, "resolve": true,
 	// config-layer pool keys (internal/config origin.go): Host-header policy,
-	// CloudFront signing, and S3-upstream bucket + credentials.
-	"host_header": true, "sign": true,
+	// origin-TLS CA bundle, CloudFront signing, and S3-upstream bucket + credentials.
+	"host_header": true, "ca_file": true, "sign": true,
 	"bucket": true, "access_key": true, "secret_key": true, "region": true, "anonymous": true,
 }
 
@@ -608,6 +814,42 @@ func validateUpstreamBlock(d *cadishfile.Directive, rep *Report) {
 			validateKeyedDurations(bd, rep, d.Name+" sign", "ttl")
 		}
 	}
+
+	// `resolve` (dynamic re-resolution interval / nameservers) only affects dns:// (and
+	// k8s://) targets — it is a silent no-op on a pool whose every `to` is a static
+	// http(s):// address. Flag it so an operator who expects periodic re-resolution of a
+	// static target learns it has no effect (Finding 8).
+	if resolveDir := firstSubDirective(d, "resolve"); resolveDir != nil && !poolHasDynamicTarget(d) {
+		rep.Diagnostics = append(rep.Diagnostics, newDiag(SevWarning, resolveDir.Pos, "resolve-no-effect",
+			"%s: `resolve` has no effect without a `dns://` (or `k8s://`) target — every `to` here is a static address, which is never re-resolved", d.Name))
+	}
+}
+
+// firstSubDirective returns the first inner directive named name in d's block, or nil.
+func firstSubDirective(d *cadishfile.Directive, name string) *cadishfile.Directive {
+	for _, bn := range d.Block {
+		if bd, ok := bn.(*cadishfile.Directive); ok && bd.Name == name {
+			return bd
+		}
+	}
+	return nil
+}
+
+// poolHasDynamicTarget reports whether any `to` target in the pool uses a dynamically
+// re-resolved scheme (dns:// or k8s://) — the only targets the `resolve` knob governs.
+func poolHasDynamicTarget(d *cadishfile.Directive) bool {
+	for _, bn := range d.Block {
+		bd, ok := bn.(*cadishfile.Directive)
+		if !ok || bd.Name != "to" {
+			continue
+		}
+		for _, a := range bd.Args {
+			if strings.HasPrefix(a.Raw, "dns://") || strings.HasPrefix(a.Raw, "k8s://") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // hasEmptyPort reports whether a backend target token has a host authority ending
@@ -892,13 +1134,278 @@ func analyzeSite(addrs []string, pos cadishfile.Pos, body []cadishfile.Node, bas
 
 	detectDeadRules(body, defs, sr)
 	detectSNIWithoutHTTPS(body, sr)
+	detectInsecureOriginTLS(body, sr)
 	detectGeoUnconfigured(body, sr, baseDir, sandbox)
 	detectIPACLWithoutTrustProxy(body, defs, sr)
 	detectUnboundedKeyTokens(body, sr)
+	detectUpstreamHealthyNonPool(body, sr)
+	detectDefaultKeyOmitsQuery(body, sr)
 	detectCookieAllowUnkeyed(body, sr)
+	detectDerivesFromNotStripped(body, sr)
+	detectCookieForwardUncollapsed(body, sr)
+	detectCacheCredentialed(body, sr)
+	detectUnusedNormalizeToken(body, sr)
+	detectUnusedDeviceDetect(body, sr)
 	sr.Suggestions = suggest(body, defs)
 
 	return sr
+}
+
+// detectDefaultKeyOmitsQuery warns when a site CACHES responses (a store-intent
+// `cache_ttl` rule) but defines NO `cache_key` at all, so it falls back to the default
+// key `method host path` — which OMITS the query string. Two requests differing only in
+// the query (`/api?id=1` vs `/api?id=2`) then collide on one cache entry. Varnish hashes
+// the query by default, so a migrating operator silently gets cross-query content (R04).
+//
+// Scope is deliberately the DEFAULT-KEY case only (no `cache_key` directive): an operator
+// who wrote ANY explicit `cache_key` made a choice, so this never second-guesses an
+// explicit key (keeps existing explicit-`cache_key` configs untouched and the warning
+// low-noise — see ADR D93). It is advisory: a site that genuinely does not vary by query
+// (static assets) is safe to leave as-is; the message says so.
+func detectDefaultKeyOmitsQuery(body []cadishfile.Node, sr *SiteReport) {
+	hasCacheKey := false
+	var firstStoreTTL *cadishfile.Directive
+	for _, n := range body {
+		d, ok := n.(*cadishfile.Directive)
+		if !ok {
+			continue
+		}
+		switch d.Name {
+		case "cache_key":
+			hasCacheKey = true
+		case "cache_ttl":
+			if firstStoreTTL == nil && cacheTTLStores(d) {
+				firstStoreTTL = d
+			}
+		}
+	}
+	if hasCacheKey || firstStoreTTL == nil {
+		return
+	}
+	sr.add(SevWarning, firstStoreTTL.Pos, "default-key-omits-query",
+		"this site caches responses (cache_ttl) but defines no cache_key, so the default key is `method host path` — it OMITS the query string, so e.g. /api?id=1 and /api?id=2 share ONE cache entry (collide). Varnish hashes the query by default: if responses vary by query add `cache_key method host path query` (or `query_allow …` to key only some params, `query_strip …` to drop tracking params); if they do not vary by query, this is safe to ignore")
+}
+
+// cacheTTLStores reports whether a `cache_ttl` rule is STORE-intent — it carries a `ttl`
+// or `from_header` action (so a matching response is cached). A `hit_for_miss`-only rule
+// is a deliberate DON'T-store decision and does not count. Mirrors validateDeadStatusRule.
+func cacheTTLStores(d *cadishfile.Directive) bool {
+	for _, a := range d.Args {
+		if a.Raw == "ttl" || a.Raw == "from_header" {
+			return true
+		}
+	}
+	return false
+}
+
+// detectUnusedNormalizeToken warns when a site defines a `normalize NAME { … }` bucket
+// whose {NAME} cache-key token appears in NO cache_key recipe. A user normalizer's ONLY
+// effect is to supply that bounded {NAME} token to a cache_key — it is referenced
+// nowhere else (a header template uses {classify.NAME}/{host}/…, never a bare normalizer
+// token; only cache_key resolves a bare {NAME} to a normalizer — see
+// pipeline.compileKeyToken). So a normalize that is never keyed is DEAD config: the
+// operator built a bucket to make the cache vary on it but, having forgotten the {NAME}
+// token, the cache silently DOES NOT vary on it (it over-collapses across what should be
+// distinct buckets) with no signal. This is the normalizer analog of `unused-matcher`.
+// The fix is to add {NAME} to a cache_key recipe, or drop the normalize block. The
+// synthetic top-level (a bare imported fragment with no sites) is skipped — a library
+// legitimately defines normalizers for its importer to key on.
+func detectUnusedNormalizeToken(body []cadishfile.Node, sr *SiteReport) {
+	if len(sr.Addresses) == 1 && sr.Addresses[0] == "(top-level)" {
+		return
+	}
+	keyed := map[string]bool{} // {NAME} tokens referenced by any cache_key recipe
+	for _, n := range body {
+		d, ok := n.(*cadishfile.Directive)
+		if !ok || d.Name != "cache_key" {
+			continue
+		}
+		for _, a := range d.Args {
+			if name, ok := classifyTokenNameOf(a.Raw); ok {
+				keyed[name] = true
+			}
+		}
+	}
+	for _, n := range body {
+		d, ok := n.(*cadishfile.Directive)
+		if !ok || d.Name != "normalize" || len(d.Args) < 1 {
+			continue
+		}
+		name := d.Args[0].Raw
+		if name == "" || keyed[name] {
+			continue
+		}
+		sr.add(SevWarning, d.Pos, "unused-normalize-token",
+			"normalize %q is defined but its {%s} token is not used in any cache_key recipe — the bucket is computed for nothing, so the cache silently does NOT vary on it (it over-collapses the values you meant to separate). Add {%s} to a `cache_key` recipe (e.g. `cache_key host path {%s}`), or remove the `normalize` block",
+			name, name, name, name)
+	}
+}
+
+// detectUnusedDeviceDetect warns when a site configures `device_detect { … }` but no
+// cache_key recipe keys on the {device} token. Like a normalizer, a device_detect block's
+// ONLY effect is to shape the {device} cache-key token — {device} is not a header/redirect
+// template placeholder (see pipeline.TemplateEnv.named) and there is no `device` matcher
+// type, so it is referenced nowhere else. A device_detect that is never keyed is therefore
+// dead config: the operator customized the device buckets but, having forgotten the
+// {device} token, the cache silently does NOT segment by device class with no signal. The
+// fix is to add {device} to a cache_key recipe, or remove the device_detect block. The
+// synthetic top-level (bare imported fragment) is skipped.
+func detectUnusedDeviceDetect(body []cadishfile.Node, sr *SiteReport) {
+	if len(sr.Addresses) == 1 && sr.Addresses[0] == "(top-level)" {
+		return
+	}
+	var deviceDetect *cadishfile.Directive
+	keyed := false
+	for _, n := range body {
+		d, ok := n.(*cadishfile.Directive)
+		if !ok {
+			continue
+		}
+		switch d.Name {
+		case "device_detect":
+			if deviceDetect == nil {
+				deviceDetect = d
+			}
+		case "cache_key":
+			for _, a := range d.Args {
+				if a.Raw == "{device}" {
+					keyed = true
+				}
+			}
+		}
+	}
+	if deviceDetect == nil || keyed {
+		return
+	}
+	sr.add(SevWarning, deviceDetect.Pos, "unused-device-detect",
+		"device_detect is configured but no cache_key recipe keys on the {device} token — the device classifier is computed for nothing, so the cache silently does NOT segment by device class. Add {device} to a `cache_key` recipe (e.g. `cache_key host path {device}`), or remove the `device_detect` block")
+}
+
+// reservedSpecialUseTLDs is the set of final-label TLDs a public ACME CA will never
+// issue a certificate for: the RFC 6761 special-use names (localhost/test/invalid/
+// example), the RFC 6762 mDNS name (local), and the ICANN-reserved private-use TLD
+// (internal). A host whose final label is one of these can never complete a public
+// HTTP-01 / TLS-ALPN-01 challenge.
+var reservedSpecialUseTLDs = map[string]bool{
+	"localhost": true, "local": true, "test": true,
+	"invalid": true, "example": true, "internal": true,
+}
+
+// acmeHostIssuabilityWarnings flags a site that requests automatic certificates
+// (`tls acme …`) for an address a public ACME CA can NEVER issue for — an IP literal
+// (a client sends no SNI for an IP, so the on-demand issuer has no hostname to
+// validate), a single-label dotless name (the CA/Browser Forum forbids internal/
+// dotless names), or a reserved special-use name/TLD (localhost / .local / .localhost
+// / .test / .invalid / .example / .internal). The site PARSES and CHECKS clean,
+// autocert accepts the host into its issuance policy, and the failure surfaces only as
+// a repeating challenge error at the FIRST TLS handshake — the site silently never
+// serves working TLS, with no config-time signal. Surfacing it here turns that
+// runtime-only outage into a visible, actionable warning. It is a WARNING (the cert is
+// a deploy concern, and a private/split-horizon ACME CA is conceivable), but loud. The
+// check is pure (no filesystem), so it runs in the sandbox too. A leading `*.` wildcard
+// is stripped before the test: autocert issues per concrete subdomain on demand, so
+// `*.example.com` is fine, while `*.local` (every concrete `x.local`) still cannot issue.
+func acmeHostIssuabilityWarnings(f *cadishfile.File, rep *Report) {
+	for _, s := range f.Sites {
+		sc, _ := tlsacme.SiteConfigFromSite(s)
+		if sc.TLS.Mode != tlsacme.ModeACME {
+			continue
+		}
+		for _, addr := range sc.Hosts {
+			if reason := acmeUnissuableReason(addr); reason != "" {
+				rep.Diagnostics = append(rep.Diagnostics, newDiag(SevWarning, s.Pos, "acme-host-unissuable",
+					"site requests automatic TLS (`tls acme`) for %q, but a public ACME CA cannot issue a certificate for it: %s. Use a static `tls { cert … key … }` keypair, set `tls off`, or give the site a public DNS name",
+					addr, reason))
+			}
+		}
+	}
+}
+
+// acmeUnissuableReason returns the reason a public ACME CA cannot issue a certificate
+// for the declared address addr, or "" when addr looks publicly issuable. A leading
+// `*.` wildcard is stripped first (autocert issues per concrete subdomain on demand).
+// Host normalization mirrors coverageHost (lower-cased, :port stripped, [v6] unwrapped).
+func acmeUnissuableReason(addr string) string {
+	h := strings.TrimPrefix(coverageHost(addr), "*.")
+	if h == "" {
+		return ""
+	}
+	if net.ParseIP(strings.Trim(h, "[]")) != nil {
+		return "it is an IP address (clients send no SNI for an IP, so the on-demand issuer has no hostname to validate)"
+	}
+	if !strings.Contains(h, ".") {
+		if reservedSpecialUseTLDs[h] {
+			return "`" + h + "` is a reserved special-use name with no public DNS"
+		}
+		return "it is a single-label (dotless) name, which no public CA will issue for"
+	}
+	if tld := h[strings.LastIndexByte(h, '.')+1:]; reservedSpecialUseTLDs[tld] {
+		return "the reserved special-use TLD ." + tld + " is not publicly resolvable"
+	}
+	return ""
+}
+
+// detectUpstreamHealthyNonPool warns when an `upstream_healthy NAME` matcher
+// references an upstream that does NOT build as an lb pool — a trivial single-backend
+// `upstream NAME { to … }` (httporigin), or an S3 (`bucket`)/CloudFront (`sign`)
+// origin. Such an origin has no health FSM, so the matcher cannot actively track it:
+// at runtime cadish resolves it "assumed healthy" (it exists and is being served).
+// That is the SAFE direction — but it was previously resolved DOWN (R03), making a
+// single-backend health probe (`respond @probe @live 200 / respond @probe 503`) answer
+// 503 forever and inviting an L4/DNS-LB to eject a healthy node. The warning tells the
+// operator the matcher can never report this backend DOWN: add a `health { … }` block
+// (which turns it into a real probed pool) to track it, or expect the term to always
+// match. An UNDECLARED name is a separate hard compile-error
+// (pipeline.validateUpstreamHealthy), not warned here. Pool membership is judged by
+// config.UpstreamCarriesPoolHealth — the same dispatch run uses — so check and run agree.
+func detectUpstreamHealthyNonPool(body []cadishfile.Node, sr *SiteReport) {
+	blocks := map[string]*cadishfile.Directive{} // declared upstream/cluster by name
+	for _, n := range body {
+		d, ok := n.(*cadishfile.Directive)
+		if !ok || (d.Name != "upstream" && d.Name != "cluster") || len(d.Args) < 1 {
+			continue
+		}
+		blocks[d.Args[0].Raw] = d
+	}
+	if len(blocks) == 0 {
+		return
+	}
+	seen := map[string]bool{} // de-dupe so one referenced name warns once per position
+	warnName := func(name string, pos cadishfile.Pos) {
+		d := blocks[name]
+		if d == nil || config.UpstreamCarriesPoolHealth(d) {
+			return
+		}
+		key := name + "@" + pos.String()
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		sr.add(SevWarning, pos, "upstream-healthy-non-pool",
+			"upstream_healthy references %q, which builds as a single static backend (or an s3/sign origin), not a load-balancer pool — it has no active health probe, so the matcher always reports it healthy and can never detect it down. Add a `health { … }` block to upstream %q (which makes it a real pool) to actively probe it, or expect this term to always match",
+			name, name)
+	}
+	for _, n := range body {
+		if m, ok := n.(*cadishfile.MatcherDef); ok && m.Type == "upstream_healthy" {
+			for _, a := range m.Args {
+				warnName(a.Raw, m.Pos)
+			}
+		}
+	}
+	for _, n := range body {
+		d, ok := n.(*cadishfile.Directive)
+		if !ok {
+			continue
+		}
+		for _, in := range directiveUsages(d).inlines {
+			if in.typ != "upstream_healthy" {
+				continue
+			}
+			for _, a := range in.args {
+				warnName(a.Raw, in.pos)
+			}
+		}
+	}
 }
 
 // detectUnboundedKeyTokens warns when a cache_key varies on an UNBOUNDED input —
@@ -959,7 +1466,9 @@ func detectCookieAllowUnkeyed(body []cadishfile.Node, sr *SiteReport) {
 	type recipe struct {
 		cookies map[string]bool // cookie:NAME tokens (RFC 6265: case-sensitive)
 		whole   bool            // header:Cookie keys the entire Cookie header
+		derives map[string]bool // cookies covered by a derives_from classify token in THIS recipe
 	}
+	derivesByToken := classifyDerivesFrom(body) // {ageverify} -> [verified-prod userType]
 	var allows []*cadishfile.Directive
 	var recipes []recipe
 	for _, n := range body {
@@ -971,12 +1480,19 @@ func detectCookieAllowUnkeyed(body []cadishfile.Node, sr *SiteReport) {
 		case "cookie_allow":
 			allows = append(allows, d)
 		case "cache_key":
-			r := recipe{cookies: map[string]bool{}}
+			r := recipe{cookies: map[string]bool{}, derives: map[string]bool{}}
 			for _, a := range d.Args {
 				if strings.HasPrefix(a.Raw, "cookie:") {
 					r.cookies[strings.TrimPrefix(a.Raw, "cookie:")] = true
 				} else if strings.HasPrefix(a.Raw, "header:") && strings.EqualFold(strings.TrimPrefix(a.Raw, "header:"), "Cookie") {
 					r.whole = true
+				} else if tok, ok := classifyTokenNameOf(a.Raw); ok {
+					// A {TOKEN} key token with a derives_from axis covers its declared cookies in
+					// THIS recipe: cadish auto-strips them before origin, so they neither
+					// personalize the reply nor bypass — the COOKIE-NORM coverage.
+					for _, c := range derivesByToken[tok] {
+						r.derives[c] = true
+					}
 				}
 			}
 			recipes = append(recipes, r)
@@ -985,8 +1501,9 @@ func detectCookieAllowUnkeyed(body []cadishfile.Node, sr *SiteReport) {
 	if len(allows) == 0 {
 		return
 	}
-	// covered reports whether EVERY recipe isolates this cookie. A glob name can only be
-	// covered by a whole-header key. With no recipe at all the default key covers nothing.
+	// covered reports whether EVERY recipe isolates this cookie — by a cookie:NAME token, a
+	// whole header:Cookie, or a `derives_from` axis that names it (auto-stripped). A glob
+	// name can only be covered by a whole-header key. No recipe ⇒ the default key covers nothing.
 	covered := func(name string) bool {
 		if len(recipes) == 0 {
 			return false
@@ -996,9 +1513,13 @@ func detectCookieAllowUnkeyed(body []cadishfile.Node, sr *SiteReport) {
 			if r.whole {
 				continue
 			}
-			if isGlob || !r.cookies[name] {
-				return false
+			if isGlob {
+				return false // a glob allow is only coverable by the whole header
 			}
+			if r.cookies[name] || r.derives[name] {
+				continue
+			}
+			return false
 		}
 		return true
 	}
@@ -1011,6 +1532,246 @@ func detectCookieAllowUnkeyed(body []cadishfile.Node, sr *SiteReport) {
 			sr.add(SevWarning, a.Pos, "cookie-allow-unkeyed",
 				"cookie_allow %q is forwarded to the origin but the cache_key does not vary on it, so requests carrying cookie %q BYPASS the cache (never cached — the safe default, no cross-user leak). To actually cache them, add `cookie:%s` to the cache_key (one entry per value) or `header:Cookie` (key every cookie); or drop %q from cookie_allow so it is stripped. Allowlist only cookies you key (or that you accept never caching).",
 				name, name, name, name)
+		}
+	}
+}
+
+// detectCacheCredentialed surfaces the origin-trust posture of every `cache_credentialed
+// @scope` (D101) — like the `cache_unsafe` warning — and flags the obvious misconfiguration
+// where the scope can NEVER store. cache_credentialed makes caching ORIGIN-AUTHORITATIVE for
+// the matching credentialed requests: cross-user confidentiality then rests on the ORIGIN
+// emitting the cache signal (the in-scope `cache_ttl` positive TTL, e.g. `from_header
+// X-Cache-Ttl`) ONLY on genuinely shareable bodies. cadish backstops this fail-closed (the
+// positive signal is the SOLE storage gate — absence ⇒ not stored; and the signal STRIPS
+// Set-Cookie before store, so the shared object never carries a per-user cookie), but a
+// misbehaving origin that stamps the signal on a per-user body would share that body.
+//
+// No-op guard: storage in a cache_credentialed scope happens ONLY on a positive in-scope
+// cache_ttl signal. If the site declares NO positive-store `cache_ttl` rule at all (only
+// `hit_for_miss`, or none), the scope can NEVER store — every matching request still reaches
+// origin every time, so the directive is a no-op (it only disabled the credential bypass).
+func detectCacheCredentialed(body []cadishfile.Node, sr *SiteReport) {
+	var creds []*cadishfile.Directive
+	positiveTTL := false
+	for _, n := range body {
+		d, ok := n.(*cadishfile.Directive)
+		if !ok {
+			continue
+		}
+		switch d.Name {
+		case "cache_credentialed":
+			creds = append(creds, d)
+		case "cache_ttl":
+			// A positive STORE rule names `ttl` or `from_header` (a `hit_for_miss` rule is a
+			// non-store decision and never makes a cache_credentialed scope store).
+			for _, a := range d.Args {
+				if a.Raw == "ttl" || a.Raw == "from_header" {
+					positiveTTL = true
+					break
+				}
+			}
+		}
+	}
+	for _, d := range creds {
+		sr.add(SevWarning, d.Pos, "cache-credentialed-origin-trust",
+			"cache_credentialed makes caching ORIGIN-AUTHORITATIVE for the matching credentialed requests: it skips the credential bypass and stores the response under the SHARED key on a positive in-scope cache_ttl signal (e.g. `from_header X-Cache-Ttl`), which strips Set-Cookie before store (matching the custom VCL). Cross-user confidentiality then rests on the ORIGIN emitting that signal ONLY on shareable bodies — like cache_unsafe, this trusts the origin. cadish backstops it fail-closed (the positive signal is the sole storage gate, so no signal ⇒ not stored, and the stored object never carries a per-user Set-Cookie), but verify the origin never stamps the cache signal on a per-user body.")
+		if !positiveTTL {
+			sr.add(SevWarning, d.Pos, "cache-credentialed-noop",
+				"cache_credentialed can NEVER store here: the site declares no positive-store `cache_ttl` rule (a `ttl …` or `from_header …` rule), so no response ever carries the in-scope positive signal storage requires. Every matching request still reaches origin on every request — the directive only disabled the credential bypass. Add a `cache_ttl @scope from_header X-Cache-Ttl` (or `ttl …`) rule so shareable responses are cached.")
+		}
+	}
+}
+
+// classifyTokenNameOf returns NAME from a `{NAME}` cache_key placeholder, ok=false
+// otherwise. Mirrors pipeline.classifyTokenName for the check's AST walk.
+func classifyTokenNameOf(raw string) (string, bool) {
+	if strings.HasPrefix(raw, "{") && strings.HasSuffix(raw, "}") && len(raw) > 2 {
+		name := raw[1 : len(raw)-1]
+		if name != "" && !strings.ContainsAny(name, "{}") {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// derivesFromCookieNames returns the cookie names a `derives_from cookie NAME… [forward|
+// keep]` row declares and whether the row is forward-mode — mirroring the pipeline's
+// compileDerivesFrom grammar so the check's AST walk agrees with the runtime. The leading
+// `cookie` source keyword is skipped; a trailing `forward`/`keep` modifier (recognized only
+// when a name precedes it) is consumed, not treated as a cookie name.
+func derivesFromCookieNames(bd *cadishfile.Directive) (names []string, forward bool) {
+	if len(bd.Args) < 2 || bd.Args[0].Raw != "cookie" {
+		return nil, false
+	}
+	rest := bd.Args[1:]
+	if len(rest) >= 2 {
+		if last := rest[len(rest)-1].Raw; last == "forward" || last == "keep" {
+			forward = true
+			rest = rest[:len(rest)-1]
+		}
+	}
+	for _, a := range rest {
+		if a.Raw != "" {
+			names = append(names, a.Raw)
+		}
+	}
+	return names, forward
+}
+
+// classifyDerivesFrom walks the site body and returns, for each classify token, the
+// request cookies it declares via `derives_from cookie NAME… [forward|keep]` (BOTH strip
+// and forward cookies — each is covered by {TOKEN} in a recipe). Tokens without a
+// derives_from row are absent. Used by the cookie_allow coverage check and the
+// derives-from-not-stripped warning.
+func classifyDerivesFrom(body []cadishfile.Node) map[string][]string {
+	out := map[string][]string{}
+	for _, n := range body {
+		d, ok := n.(*cadishfile.Directive)
+		if !ok || d.Name != "classify" || len(d.Args) != 1 {
+			continue
+		}
+		tok, ok := classifyTokenNameOf(d.Args[0].Raw)
+		if !ok {
+			continue
+		}
+		for _, bn := range d.Block {
+			bd, ok := bn.(*cadishfile.Directive)
+			if !ok || bd.Name != "derives_from" {
+				continue
+			}
+			names, _ := derivesFromCookieNames(bd)
+			out[tok] = append(out[tok], names...)
+		}
+	}
+	return out
+}
+
+// classifyForwardCookies walks the site body and returns, for each classify token, only the
+// cookies declared with the `forward`/`keep` modifier (`derives_from cookie NAME… forward`).
+// These are forwarded to origin under the collapsed key — the loud-opt-in case
+// (cookie-forward-uncollapsed). Tokens with no forward row are absent.
+func classifyForwardCookies(body []cadishfile.Node) map[string][]string {
+	out := map[string][]string{}
+	for _, n := range body {
+		d, ok := n.(*cadishfile.Directive)
+		if !ok || d.Name != "classify" || len(d.Args) != 1 {
+			continue
+		}
+		tok, ok := classifyTokenNameOf(d.Args[0].Raw)
+		if !ok {
+			continue
+		}
+		for _, bn := range d.Block {
+			bd, ok := bn.(*cadishfile.Directive)
+			if !ok || bd.Name != "derives_from" {
+				continue
+			}
+			if names, forward := derivesFromCookieNames(bd); forward {
+				out[tok] = append(out[tok], names...)
+			}
+		}
+	}
+	return out
+}
+
+// detectDerivesFromNotStripped warns when a classify token declares `derives_from
+// cookie NAME…` but the token appears in NO cache_key recipe. The derive→strip is
+// GATED on the token being in the selected recipe; a token that is never keyed never
+// strips its declared cookies, so those cookies are read but still FORWARDED to the
+// origin — defeating the point and risking per-user personalization on a shared key
+// (the same footgun cookie-allow-unkeyed flags, surfaced at the derives_from site). The
+// fix is to add the token to a cache_key recipe (so it keys + strips) or drop the
+// derives_from row.
+func detectDerivesFromNotStripped(body []cadishfile.Node, sr *SiteReport) {
+	derivesByToken := classifyDerivesFrom(body)
+	if len(derivesByToken) == 0 {
+		return
+	}
+	// Collect every classify token used in a cache_key recipe.
+	inRecipe := map[string]bool{}
+	for _, n := range body {
+		d, ok := n.(*cadishfile.Directive)
+		if !ok || d.Name != "cache_key" {
+			continue
+		}
+		for _, a := range d.Args {
+			if tok, ok := classifyTokenNameOf(a.Raw); ok {
+				inRecipe[tok] = true
+			}
+		}
+	}
+	// Re-walk the classify directives to attach the warning to the derives_from row's Pos.
+	for _, n := range body {
+		d, ok := n.(*cadishfile.Directive)
+		if !ok || d.Name != "classify" || len(d.Args) != 1 {
+			continue
+		}
+		tok, ok := classifyTokenNameOf(d.Args[0].Raw)
+		if !ok || inRecipe[tok] || len(derivesByToken[tok]) == 0 {
+			continue
+		}
+		for _, bn := range d.Block {
+			bd, ok := bn.(*cadishfile.Directive)
+			if !ok || bd.Name != "derives_from" {
+				continue
+			}
+			sr.add(SevWarning, bd.Pos, "derives-from-not-stripped",
+				"classify {%s} declares `derives_from` but {%s} is not used in any cache_key recipe, so its cookies are read but NEVER stripped — they are forwarded to the origin and can personalize the shared response. Add {%s} to a `cache_key` recipe (so cadish keys the normalized axis and strips the raw cookies), or drop the `derives_from` row.",
+				tok, tok, tok)
+		}
+	}
+}
+
+// detectCookieForwardUncollapsed warns when a classify token declares `derives_from cookie
+// NAME… forward` (alias `keep`) AND the token IS used in a cache_key recipe. In forward mode
+// the named cookie is FORWARDED to the origin unchanged while the cache key collapses to the
+// normalized {TOKEN} axis — so the operator is asserting the cookie's ONLY cache-relevant
+// effect is that axis. That is a deliberate, safe-when-true relaxation of the strip default
+// (RUN-26-JUN §A1 ADDENDUM), but it must never be silent: a backend that personalizes on the
+// cookie along a dimension {TOKEN} does not capture would serve a per-user body under the
+// shared key. It is a WARNING (a loud opt-in), modeled on detectInsecureOriginTLS, attached
+// to the `derives_from … forward` row. A forward token that is NOT in any recipe is the
+// different (uncovered) footgun detectDerivesFromNotStripped already flags, so skip it here.
+func detectCookieForwardUncollapsed(body []cadishfile.Node, sr *SiteReport) {
+	forwardByToken := classifyForwardCookies(body)
+	if len(forwardByToken) == 0 {
+		return
+	}
+	inRecipe := map[string]bool{}
+	for _, n := range body {
+		d, ok := n.(*cadishfile.Directive)
+		if !ok || d.Name != "cache_key" {
+			continue
+		}
+		for _, a := range d.Args {
+			if tok, ok := classifyTokenNameOf(a.Raw); ok {
+				inRecipe[tok] = true
+			}
+		}
+	}
+	for _, n := range body {
+		d, ok := n.(*cadishfile.Directive)
+		if !ok || d.Name != "classify" || len(d.Args) != 1 {
+			continue
+		}
+		tok, ok := classifyTokenNameOf(d.Args[0].Raw)
+		if !ok || !inRecipe[tok] || len(forwardByToken[tok]) == 0 {
+			continue
+		}
+		for _, bn := range d.Block {
+			bd, ok := bn.(*cadishfile.Directive)
+			if !ok || bd.Name != "derives_from" {
+				continue
+			}
+			names, forward := derivesFromCookieNames(bd)
+			if !forward {
+				continue
+			}
+			for _, name := range names {
+				sr.add(SevWarning, bd.Pos, "cookie-forward-uncollapsed",
+					"cookie %q is forwarded to origin under a collapsed key — you are asserting its only cache-relevant effect is {%s}. If the origin personalizes on %q along a dimension {%s} does not capture, a per-user body would be served under the shared key. Use bare `derives_from cookie %s` (the safe default: strip it) unless the backend genuinely reads the raw cookie.",
+					name, tok, name, tok, name)
+			}
 		}
 	}
 }
@@ -1056,6 +1817,31 @@ func detectSNIWithoutHTTPS(body []cadishfile.Node, sr *SiteReport) {
 			sr.add(SevWarning, k.Pos, "sni-without-https",
 				"`%s` has no effect without an https:// backend: every `to` in upstream %q is plaintext http://",
 				k.Name, upstreamNameOf(d))
+		}
+	}
+}
+
+// detectInsecureOriginTLS warns when an `upstream`/`cluster` block sets
+// `tls_insecure` — origin TLS verification is disabled (HAProxy `ssl verify none`),
+// which is a real security relaxation (a MITM on the cadish→origin hop is no longer
+// detected). It is a WARNING, not an error: the knob is a legitimate, deliberate
+// escape hatch for a self-signed/internal origin, but it must never be silent. The
+// warning points at the `tls_insecure` directive's own file:line and suggests the
+// secure `ca_file` alternative. Modeled on detectSNIWithoutHTTPS.
+func detectInsecureOriginTLS(body []cadishfile.Node, sr *SiteReport) {
+	for _, n := range body {
+		d, ok := n.(*cadishfile.Directive)
+		if !ok || (d.Name != "upstream" && d.Name != "cluster") {
+			continue
+		}
+		for _, bn := range d.Block {
+			bd, ok := bn.(*cadishfile.Directive)
+			if !ok || bd.Name != "tls_insecure" {
+				continue
+			}
+			sr.add(SevWarning, bd.Pos, "insecure-origin-tls",
+				"`tls_insecure` disables origin TLS verification for upstream %q (a MITM on the cadish→origin hop is undetectable) — prefer `ca_file <path>` to verify against a private CA",
+				upstreamNameOf(d))
 		}
 	}
 }

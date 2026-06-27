@@ -60,9 +60,10 @@ assets.example.com {
 long `ttl` + huge `grace` maximizes hit rate while HTML stays fresh on a 60s ttl.
 `content_type` matches what the origin *actually served* (not the path), so the
 long browser `Cache-Control` only lands on real CSS/JS. `strip_cookies` keeps a
-stray `Set-Cookie` from making a shared asset per-user. Note: `strip_cookies`
-alone does **not** make a `Set-Cookie` response cacheable — it is a delivery-time
-leak guard; caching a cookie-bearing class requires `cache_unsafe`.
+stray `Set-Cookie` from making a shared asset per-user. Note: a `Set-Cookie`
+response is **never** cached by default, and `cache_unsafe` does **not** lift that
+refusal — `strip_cookies` is exactly what makes a cookie-stamping origin cacheable,
+by dropping `Set-Cookie` before the response is stored and delivered.
 
 ## 2. API response cache
 
@@ -100,8 +101,8 @@ store a `5xx` — so the `status not 200 hit_for_miss` rule is now mainly about
 coalescing a flaky origin rather than preventing an outage from being cached. The key
 is scoped by a **coarse** `X-Tenant` header so tenants don't
 share entries — never key on the token itself (that's a per-user key = 0% hit
-rate). `cadish check -strict` flags any raw-header key token (`header:X-Tenant`) with an
-`unbounded-key-token` warning (the default `check` is silent on it): keep the
+rate). `cadish check` flags any raw-header key token (`header:X-Tenant`) with an
+`unbounded-key-token` warning, and `-strict` makes that warning fail the build: keep the
 value low-cardinality, or bucket it into a
 `normalize` enum if a tenant header could ever explode. `cache_ttl` is first-match-wins, so the `status not 200` **hit-for-miss**
 rule sits *above* `default`; a flaky 5xx is remembered as "don't cache" for 5s
@@ -177,9 +178,10 @@ strip_cookies path /
 for their session (cookieless first hits fall back to client IP). Authenticated
 requests pass; anonymous GETs are cached with a **cookie-free key** (putting the
 cookie in the key would give every user their own entry). `strip_cookies` stops a
-cached anonymous page from carrying one user's `Set-Cookie` to the next — but it
-does **not** by itself make a `Set-Cookie` response cacheable; that requires
-`cache_unsafe`.
+cached anonymous page from carrying one user's `Set-Cookie` to the next — and
+because it drops `Set-Cookie` before the response is stored, it is also what makes a
+cookie-stamping response cacheable in the first place (a `Set-Cookie` response is
+never cached otherwise, not even under `cache_unsafe`).
 
 ## 6. Device-varied cache (the VARY-cardinality win)
 
@@ -250,11 +252,11 @@ feedback):
    directive (recipe 4's `storage @vod -> disk` pins VOD to NVMe) and the
    per-extension `cache { tier .ext -> ram|disk }` default are honored. (This
    rough edge is resolved.)
-3. **No cardinality warning for `header:` key tokens.** `cadish check` smartly
-   warns that `{device}`/`{geo}` are bounded, but a `cache_key … header:X` with a
-   high-cardinality header (a token, a raw UA) gets no warning — the exact footgun
-   the report exists to catch. A "this key token looks unbounded" hint would round
-   it out.
+3. **Cardinality warning for `header:`/`cookie:` key tokens — RESOLVED.** `cadish
+   check` now warns (`unbounded-key-token`) when a `cache_key … header:X` (or
+   `cookie:X`) keys on a high-cardinality raw header/cookie — the exact footgun the
+   report exists to catch — alongside the bounded-token suggestions for
+   `{device}`/`{geo}`. `-strict` makes it fail the build.
 
 None of these blocked a recipe; they're polish that would make the config even
 harder to misuse.

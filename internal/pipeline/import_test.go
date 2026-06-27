@@ -90,6 +90,45 @@ func TestSpliceImportNested(t *testing.T) {
 	}
 }
 
+// TestSpliceImportBracedDirective: a fragment containing a brace-bodied directive
+// (classify {…}, upstream {…}, …) is spliced as a single block node — exactly as
+// inline — not flattened into orphaned body statements. The spliced site must
+// Compile, and the classify directive must arrive with its block intact.
+func TestSpliceImportBracedDirective(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "classifiers.cadish",
+		"@verified header X-Verified 1\nclassify {age} {\n  when @verified -> ok\n  default -> open\n}\n")
+	site, err := spliceSrc(t, dir,
+		"x {\n upstream { to http://o }\n import classifiers.cadish\n cache_key {age}\n}\n")
+	if err != nil {
+		t.Fatalf("splice braced: %v", err)
+	}
+	// The classify directive must be spliced as one block node, never flattened: no
+	// orphaned `when`/`default` siblings at the top level.
+	var classify *cadishfile.Directive
+	for _, n := range site.Body {
+		d, ok := n.(*cadishfile.Directive)
+		if !ok {
+			continue
+		}
+		switch d.Name {
+		case "classify":
+			classify = d
+		case "when", "default":
+			t.Errorf("body keyword %q leaked to top level — fragment was flattened", d.Name)
+		}
+	}
+	if classify == nil {
+		t.Fatal("classify directive not spliced from fragment")
+	}
+	if !classify.HasBlock || len(classify.Block) != 2 {
+		t.Errorf("classify block not associated: HasBlock=%v len(Block)=%d", classify.HasBlock, len(classify.Block))
+	}
+	if _, err := Compile(site); err != nil {
+		t.Fatalf("compile spliced braced fragment: %v", err)
+	}
+}
+
 // TestSpliceImportSelfCycle: a file importing itself is a clean import-cycle error,
 // not a silent no-op and not a leaked internal "SpliceImports" message.
 func TestSpliceImportSelfCycle(t *testing.T) {

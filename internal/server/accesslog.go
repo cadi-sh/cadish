@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bufio"
+	"net"
 	"net/http"
 	"time"
 )
@@ -35,6 +37,27 @@ func (s *statusRecorder) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// Hijack forwards to the underlying connection so the connection-upgrade
+// (WebSocket / `Connection: Upgrade`) tunnel can take over the raw conn. It is
+// REQUIRED: statusRecorder embeds the http.ResponseWriter *interface*, which hides
+// the concrete conn's Hijack method, so without this the ReverseProxy's `101`
+// hijack would fail. Every net/http server conn implements http.Hijacker.
+func (s *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := s.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, http.ErrNotSupported
+	}
+	return hj.Hijack()
+}
+
+// Flush forwards to the underlying Flusher so the tunnel's streaming
+// (ReverseProxy FlushInterval = -1) reaches the client through the recorder.
+func (s *statusRecorder) Flush() {
+	if fl, ok := s.ResponseWriter.(http.Flusher); ok {
+		fl.Flush()
+	}
+}
+
 // logRequest records per-request metrics and, when a `cadish logs` consumer is
 // attached, fan-outs one compact access record to the in-memory hub (D44). The
 // access log is NEVER written to disk by the server — viewing/persisting is the
@@ -53,7 +76,12 @@ func (h *Handler) logRequest(r *http.Request, rec *statusRecorder, info *reqInfo
 	// ServeHTTP defer, capturing the final cache outcome and total wall time.
 	h.metrics.IncRequest()
 	h.metrics.RecordCacheStatus(info.cacheStatus)
-	h.metrics.RecordLatency(dur)
+	// A connection-upgrade (WebSocket) tunnel's wall time is the whole conversation,
+	// not a request latency — exclude it from the histogram (the upgrades-active gauge
+	// covers tunnels) so a long-lived WS does not skew p50/p99.
+	if !info.upgraded {
+		h.metrics.RecordLatency(dur)
+	}
 
 	// Zero-cost idle path: with no consumer attached (or `access_log off`), one
 	// atomic load and we are done — no record built, no allocation, no syscall.

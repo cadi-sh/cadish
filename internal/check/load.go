@@ -98,7 +98,12 @@ func (r *resolver) expandOneFile(d *cadishfile.Directive, path string, stack []s
 			return nil
 		}
 	}
-	frag, err := cadishfile.ParseFile(path)
+	// Parse the fragment with the site-body grammar (ParseFragment), NOT the
+	// top-level file grammar, so a brace-bodied directive in the fragment
+	// (classify {…}, upstream {…}, tls {…}, …) associates its body into a
+	// Directive.Block exactly as it would inline at the splice point instead of
+	// being mis-read as a site header and flattened into orphaned statements.
+	body, err := cadishfile.ParseFragmentFile(path)
 	if err != nil {
 		// A cadishfile ParseError already reads as "file:line:col: msg"; an I/O
 		// error (missing file) does not, so anchor it at the import directive.
@@ -108,13 +113,6 @@ func (r *resolver) expandOneFile(d *cadishfile.Directive, path string, stack []s
 			r.err(d.Pos, "missing-import", "cannot import %q: %v", rel, err)
 		}
 		return nil
-	}
-	// A fragment is normally a bare statement list (File.Body). If the imported
-	// file unexpectedly contains site blocks, fold their bodies in too so nothing
-	// is silently dropped.
-	body := frag.Body
-	for _, s := range frag.Sites {
-		body = append(body, s.Body...)
 	}
 	return r.resolveNodes(body, filepath.Dir(path), append(stack, abs))
 }

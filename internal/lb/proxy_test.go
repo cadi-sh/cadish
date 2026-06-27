@@ -21,7 +21,7 @@ func TestUpstreamClients_NoAmbientProxy(t *testing.T) {
 		}
 	})
 	t.Run("health probe client", func(t *testing.T) {
-		c, ok := defaultProbeDoer(Timeouts{}).(*http.Client)
+		c, ok := defaultProbeDoer(Timeouts{}, nil).(*http.Client)
 		if !ok {
 			t.Skipf("probe doer is not *http.Client")
 		}

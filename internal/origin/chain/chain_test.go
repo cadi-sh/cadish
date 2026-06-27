@@ -330,3 +330,43 @@ func TestChain_ContextCancelledBetweenAttempts(t *testing.T) {
 		t.Fatal("Fetch with cancelled ctx = nil err, want context error")
 	}
 }
+
+// statusErrBody builds a *StatusError carrying a close-tracking live body, so a test
+// can assert the chain releases the captured upstream error body it abandons.
+func statusErrBody(code int, b string) (error, *closeTrackingBody) {
+	body := &closeTrackingBody{r: strings.NewReader(b)}
+	return &origin.StatusError{Status: code, Origin: "fake", Body: body, ContentLength: int64(len(b))}, body
+}
+
+// TestChain_NegativeThenErrorClosesErrorBody pins a body-leak guard: when an EARLIER
+// origin yields a held full-body negative (404) and a LATER origin yields a
+// fall-through *StatusError carrying a LIVE body, the chain surfaces the negative as
+// the answer (correct) — but it MUST also Close the abandoned error's captured upstream
+// body. Before the fix the final `return lastNeg` path leaked lastErr's body (an FD /
+// keep-alive connection leak that, under a sustained outage of this shape, marches
+// toward exhaustion).
+func TestChain_NegativeThenErrorClosesErrorBody(t *testing.T) {
+	neg, negBody := negResp(http.StatusNotFound, "404 PAGE")
+	serr, errBody := statusErrBody(http.StatusServiceUnavailable, "503 BODY")
+	primary := &fakeOrigin{resp: neg}  // negative 404: held, falls through
+	fallback := &fakeOrigin{err: serr} // 503 with live body: falls through (5xx)
+
+	c, err := New([]origin.Origin{primary, fallback})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	resp, ferr := c.Fetch(context.Background(), &origin.Request{Key: "k"})
+	if ferr != nil {
+		t.Fatalf("Fetch err = %v, want the held negative 404 surfaced", ferr)
+	}
+	if resp == nil || resp.StatusCode != http.StatusNotFound || !resp.Negative {
+		t.Fatalf("resp = %+v, want the negative 404 surfaced", resp)
+	}
+	if resp.Body != nil {
+		resp.Body.Close()
+	}
+	_ = negBody
+	if !errBody.closed.Load() {
+		t.Fatal("chain LEAKED the abandoned *StatusError body: it surfaced the negative but never closed the held error's captured upstream body")
+	}
+}

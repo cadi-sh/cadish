@@ -22,7 +22,14 @@ import (
 // Loop/storm safety: a request already forwarded to us by a peer (the
 // X-Cadish-Peer hop guard) is NEVER re-routed — it is served locally — so a key
 // can hop at most once.
-func (h *Handler) clusterRoute(rec *statusRecorder, r *http.Request, site *boundSite, ownerKey string, info *reqInfo) bool {
+//
+// credentialed + credCookie carry the cache_credentialed (D101) origin-authoritative state:
+// when credentialed, the request's ORIGINAL (pre-cookie_allow) Cookie is forwarded to the
+// owning peer so the per-user routes authenticate behind it. The local node never restores the
+// cookie onto r.Header (EvalResponse must see the normalized request), and it does NOT run
+// EvalResponse on a routed request, so injecting the original cookie ONLY into the peer-bound
+// request (proxyToPeer) is both necessary and safe.
+func (h *Handler) clusterRoute(rec *statusRecorder, r *http.Request, site *boundSite, ownerKey string, info *reqInfo, credentialed bool, credCookie string) bool {
 	m := site.Cluster
 
 	// A request a peer already forwarded to us: serve it locally, do not re-forward.
@@ -41,7 +48,7 @@ func (h *Handler) clusterRoute(rec *statusRecorder, r *http.Request, site *bound
 		if m.IsSelf(owner) {
 			return false
 		}
-		return h.proxyToPeer(rec, r, m, owner, info)
+		return h.proxyToPeer(rec, r, m, owner, info, credentialed, credCookie)
 	}
 
 	// No healthy owner for this key. Apply the fallback policy.
@@ -55,7 +62,7 @@ func (h *Handler) clusterRoute(rec *statusRecorder, r *http.Request, site *bound
 		// locally. We never chain a second proxy hop (the hop guard would stop the
 		// peer re-forwarding regardless).
 		if owner, ok := m.IntendedOwner(ownerKey); ok && !m.IsSelf(owner) {
-			if h.proxyToPeer(rec, r, m, owner, info) {
+			if h.proxyToPeer(rec, r, m, owner, info, credentialed, credCookie) {
 				return true
 			}
 		}
@@ -69,7 +76,7 @@ func (h *Handler) clusterRoute(rec *statusRecorder, r *http.Request, site *bound
 // re-forward. It returns true when the peer answered (any status, streamed
 // through); false on a connection-class failure, so the caller serves locally
 // instead — a peer outage degrades to local service rather than a 502.
-func (h *Handler) proxyToPeer(rec *statusRecorder, r *http.Request, m *cluster.Membership, peerURL string, info *reqInfo) bool {
+func (h *Handler) proxyToPeer(rec *statusRecorder, r *http.Request, m *cluster.Membership, peerURL string, info *reqInfo, credentialed bool, credCookie string) bool {
 	info.cacheStatus = "CLUSTER"
 	info.upstream = "peer:" + peerURL
 
@@ -86,6 +93,15 @@ func (h *Handler) proxyToPeer(rec *statusRecorder, r *http.Request, m *cluster.M
 		for _, v := range vs {
 			preq.Header.Add(k, v)
 		}
+	}
+	// cache_credentialed (D101): r.Header carries the NORMALIZED (cookie_allow-filtered)
+	// Cookie — the local node keeps it normalized so its own EvalResponse evaluates the
+	// normalized request. The owning peer is a full cadish that re-derives the cache key and
+	// re-runs the response phase from the cookie it receives, so it needs the ORIGINAL cookie
+	// to authenticate the per-user routes. Inject it onto the PEER-bound request only (never
+	// r.Header), mirroring the origin-only header op the foreground/background fetches use.
+	if credentialed {
+		restoreClientCookie(preq.Header, credCookie)
 	}
 	preq.Header.Set(cluster.HopHeader, m.Region())
 

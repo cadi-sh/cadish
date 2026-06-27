@@ -1,0 +1,16 @@
+{
+  "name": "49-pass-scope-failclosed",
+  "cadishfile": "example.com {\n    @ungreedy path_regex (?U)^/(live|stream)\n    pass @ungreedy\n    cache_key host path\n    cache_ttl default ttl 1h\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/live" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/stream/abc" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

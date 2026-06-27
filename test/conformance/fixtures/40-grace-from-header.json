@@ -1,0 +1,55 @@
+{
+  "name": "40-grace-from-header",
+  "cadishfile": "example.com {\n    @api path /api/*\n    cache_ttl @api from_header X-Cache-Ttl grace_from_header X-Cache-Grace max_stale_from_header X-Cache-Max-Stale grace 30s max_stale 1h\n    cache_ttl default ttl 5s\n    storage default -> ram\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/api/all" },
+      "origin": {
+        "status": 200,
+        "header": {
+          "Content-Type": ["text/html"],
+          "X-Cache-Ttl": ["300"],
+          "X-Cache-Grace": ["5m"],
+          "X-Cache-Max-Stale": ["30m"]
+        }
+      },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/api/grace-fallback" },
+      "origin": {
+        "status": 200,
+        "header": {
+          "Content-Type": ["text/html"],
+          "X-Cache-Ttl": ["300"]
+        }
+      },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/api/maxstale-below-grace-ignored" },
+      "origin": {
+        "status": 200,
+        "header": {
+          "Content-Type": ["text/html"],
+          "X-Cache-Ttl": ["300"],
+          "X-Cache-Grace": ["5m"],
+          "X-Cache-Max-Stale": ["1m"]
+        }
+      },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/api/grace-garbage-fallback" },
+      "origin": {
+        "status": 200,
+        "header": {
+          "Content-Type": ["text/html"],
+          "X-Cache-Ttl": ["300"],
+          "X-Cache-Grace": ["not-a-duration"]
+        }
+      },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

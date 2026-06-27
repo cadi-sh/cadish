@@ -100,6 +100,14 @@ var formatCorpus = []string{
 	"frag @m path /a /b\n@n header X Y\n",
 	"x {\na b \\\n   c \\\n   d\n}\n",
 	"x {\n# comment 1\n\n# comment 2\nthing here\n}\n",
+	// Leading empty statement(s) / blank line at the top of a block body: a
+	// leading ";" must not let a following blank line survive one Format pass
+	// (regression guard for the single-pass idempotency fix, see
+	// TestFormatLeadingEmptyStatementStable).
+	"{;\n\n0}",
+	"{\n\n;\n\n0}",
+	"{;;\n\n0}",
+	";\nsite { a b }",
 }
 
 func TestFormatIdempotent(t *testing.T) {
@@ -115,6 +123,60 @@ func TestFormatIdempotent(t *testing.T) {
 		if !bytes.Equal(once, twice) {
 			t.Errorf("corpus[%d] not idempotent\nsrc:   %q\nonce:  %q\ntwice: %q", i, src, once, twice)
 		}
+	}
+}
+
+// TestFormatLeadingEmptyStatementStable pins the single-pass output for inputs
+// that start a block body (or the file) with an empty statement (";") and/or a
+// blank line. The first Format must already be a fixed point: a leading ";" used
+// to clear the "no blank line at the top of a block body" guard, so the blank
+// line it preceded survived ONE pass and was only collapsed on the SECOND,
+// breaking Format(Format(x)) == Format(x). Each `want` here is verified to be its
+// own fixed point.
+func TestFormatLeadingEmptyStatementStable(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "leading ; then blank then directive in block",
+			in:   "{;\n\n0}",
+			want: "{\n    0\n}\n",
+		},
+		{
+			name: "blank then ; then blank in block",
+			in:   "{\n\n;\n\n0}",
+			want: "{\n    0\n}\n",
+		},
+		{
+			name: "two leading semicolons in block",
+			in:   "{;;\n\n0}",
+			want: "{\n    0\n}\n",
+		},
+		{
+			name: "leading ; at top level",
+			in:   ";\nsite { a b }",
+			want: "site {\n    a b\n}\n",
+		},
+		{
+			name: "leading blank line in a site body",
+			in:   "site {\n\n  a b\n}\n",
+			want: "site {\n    a b\n}\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			once := mustFormat(t, tt.in)
+			if once != tt.want {
+				t.Errorf("single-pass output mismatch\n--- got ---\n%q\n--- want ---\n%q", once, tt.want)
+			}
+			// The single pass must already be a fixed point.
+			twice := mustFormat(t, once)
+			if once != twice {
+				t.Errorf("Format not idempotent\nin:    %q\nonce:  %q\ntwice: %q", tt.in, once, twice)
+			}
+		})
 	}
 }
 

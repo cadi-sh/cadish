@@ -9,6 +9,13 @@ import (
 // directivePhase maps a directive keyword to the lifecycle phase it runs in.
 // Setup directives are parse-once and do not contribute to per-request cost.
 var directivePhase = map[string]Phase{
+	// `tls { … }` is parse-once TLS termination config (acme/cert/key/off/hsts and the
+	// `http_redirect_except /path …` :80-redirect exemption). Its sub-options live inside
+	// the block — they are NOT top-level directives, so they are never individually
+	// cataloged or flagged (the walk only inspects top-level nodes); `http_redirect_except`
+	// only shapes the :80 HTTP→HTTPS redirect decision (skip the 301 for named probe/
+	// data-plane paths) and adds NO per-request cost on the served path, so the whole `tls`
+	// block is Setup. See ADR D89.
 	"tls":         PhaseSetup,
 	"cache":       PhaseSetup,
 	"upstream":    PhaseSetup,
@@ -21,8 +28,22 @@ var directivePhase = map[string]Phase{
 	// knobs parsed once at config load — they shape the origin's http.Transport
 	// (TLS ServerName / DisableKeepAlives), never a per-request matcher — so Setup
 	// (zero per-request cost).
-	"sni":           PhaseSetup,
-	"http_reuse":    PhaseSetup,
+	"sni":        PhaseSetup,
+	"http_reuse": PhaseSetup,
+	// TLSVERIFY (per-upstream origin TLS verification): `tls_insecure` (skip
+	// verification = HAProxy `ssl verify none`), `ca_file <path>` (verify against a
+	// private CA), `alpn <proto…>` (pin the origin ALPN). All are parsed once at
+	// config load and shape the origin's http.Transport TLS config — never a
+	// per-request matcher — so they are Setup (zero per-request cost). `tls_insecure`
+	// additionally raises a security warning (see detectInsecureOriginTLS).
+	"tls_insecure": PhaseSetup,
+	"ca_file":      PhaseSetup,
+	"alpn":         PhaseSetup,
+	// `resolve [<interval>] [nameserver <ip:port>…]` (RESOLVER, sound subset) is a
+	// per-upstream DNS knob: it picks the nameserver(s) a dns:// pool queries and the
+	// re-resolution interval. Parsed once at config load and applied to the pool's
+	// resolver + ticker — never a per-request matcher — so Setup (zero per-request cost).
+	"resolve":       PhaseSetup,
 	"import":        PhaseSetup,
 	"device_detect": PhaseSetup,
 	"geo":           PhaseSetup,
@@ -59,12 +80,23 @@ var directivePhase = map[string]Phase{
 	// on accept — it adds no per-request matcher cost (and is OFF by default = the bare
 	// listener, zero cost), so it is Setup.
 	"proxy_protocol": PhaseSetup,
+	// global `server { maxconn N; read_timeout D; idle_timeout D }` block: the inbound
+	// data-plane connection knobs. Read once at startup — it shapes the inbound
+	// http.Server timeouts and installs an optional LimitListener — and adds no
+	// per-request matcher cost (and is OFF by default = the shipped defaults, zero
+	// cost), so it is Setup.
+	"server": PhaseSetup,
 
 	"respond":  PhaseRECV,
 	"redirect": PhaseRECV,
 	"purge":    PhaseRECV,
 	"route":    PhaseRECV,
 	"pass":     PhaseRECV,
+	// `upgrade @scope` enables a WebSocket / `Connection: Upgrade` passthrough tunnel
+	// in RECV (before LOOKUP/ORIGIN). COST: it bypasses the cache entirely (implies
+	// pass) AND opens a long-lived, hijacked bidirectional connection per matching
+	// upgrade request — far more expensive than a normal request, so use a tight scope.
+	"upgrade": PhaseRECV,
 	// `rewrite` edits the origin-bound path/query in RECV (before LOOKUP/ORIGIN).
 	// Its per-request cost is its optional matcher scope plus a cheap string op on
 	// the request line (a regex path replace, a query name scan), never the body.
@@ -102,6 +134,22 @@ var directivePhase = map[string]Phase{
 	// adds no per-request cost (the response-header inspection it disables runs only on
 	// already-cacheable responses), so it is Setup.
 	"cache_unsafe": PhaseSetup,
+	// `cache_credentialed @scope` makes caching ORIGIN-AUTHORITATIVE for the matching
+	// credentialed requests (D101): a RECV-phase decision (it gates the request-time credential
+	// bypass — skip it + forward the original cookies to origin), with the actual store/refuse
+	// precedence applied in EvalResponse. Like `pass` it is a request-phase OR-scope; its
+	// per-request cost is one scope evaluation on a site that declares it (zero otherwise). Its
+	// matcher uses are counted via the `pass`/`strip_cookies`/`upgrade` scope-usage case so a
+	// matcher used only to scope it is not flagged unused.
+	"cache_credentialed": PhaseRECV,
+	// `client_cache_control ignore` is the site-level opt-out of honoring a request's
+	// client-forced revalidation (`Cache-Control: no-cache`/`max-age=0`, `Pragma:
+	// no-cache`; RFC 9111 §5.2.1.4). A parse-once toggle read at compile that flips one
+	// boolean checked on the LOOKUP hot path — when set, the server SKIPS the cheap
+	// client-revalidation header scan entirely (zero per-request cost) and serves the
+	// fresh/stale entry instead of forcing a MISS. It carries no matcher scope, so it is
+	// Setup. (Hot-path note: it gates, and can short-circuit, a per-request header scan.)
+	"client_cache_control": PhaseSetup,
 
 	"header":        PhaseDELIVER,
 	"strip_cookies": PhaseDELIVER,
@@ -201,6 +249,16 @@ func classifyMatcher(typ string, args []cadishfile.Arg) (matcherClass, bool) {
 		// A response-phase substring scan over a short Content-Type — a cheap
 		// compare, like an exact match for cost purposes.
 		return classExact, false
+	case "resp_header":
+		// A response-phase test of a named origin response header value. args[0] is the
+		// header NAME; args[1:] (if any) are exact-or-`*`-glob value patterns. A glob
+		// value scans via the name-glob engine (like `query_present`), so a `*` value makes
+		// it a glob-class evaluation; otherwise it is a cheap exact compare. Never a regex.
+		var values []cadishfile.Arg
+		if len(args) > 1 {
+			values = args[1:]
+		}
+		return globOrExact(anyArgContains(values, "*"))
 	case "set_cookie":
 		// A response-phase scan of the Set-Cookie header(s) for presence or a
 		// named cookie — a cheap compare, like an exact match for cost purposes.
@@ -241,6 +299,11 @@ func classifyMatcher(typ string, args []cadishfile.Arg) (matcherClass, bool) {
 		// AND-composite: the cost is its sub-matchers' costs (charged when THEY are
 		// referenced/counted). The composite itself adds only a cheap conjunction walk,
 		// so it is exact-class here (its sub-matchers carry the real per-class cost).
+		return classExact, false
+	case "upstream_healthy":
+		// A request-phase liveness probe over one or more named pools: an O(1) read of
+		// the maintained health/ejection state (lb nbsrv()>0), no dial, no regex, no body.
+		// A handful of cheap pointer/map reads — charge it like an exact compare.
 		return classExact, false
 	default: // method, upstream, unknown
 		return classExact, false
@@ -345,7 +408,7 @@ func directiveUsages(d *cadishfile.Directive) usages {
 	case "storage":
 		// scope -> TARGET
 		return scopeUsages(argsBefore(d.Args, "->"))
-	case "pass", "strip_cookies":
+	case "pass", "strip_cookies", "upgrade", "cache_credentialed":
 		// the whole arg list is the scope (possibly empty = catch-all)
 		return scopeUsages(d.Args)
 	case "allow", "deny", "block":
@@ -362,9 +425,14 @@ func directiveUsages(d *cadishfile.Directive) usages {
 		// tokens are not matchers.
 		return rateLimitUsages(d.Args)
 	case "cache_ttl":
-		// selector [ttl DUR [grace DUR] [max_stale DUR] | from_header HEADER [grace DUR]
-		// [max_stale DUR] | hit_for_miss DUR]. Only the leading selector is a matcher
-		// usage; grace/max_stale/durations after the action keyword are not matchers.
+		// selector [ttl DUR | from_header HEADER | hit_for_miss DUR] followed (on ttl /
+		// from_header) by an optional tail of grace / max_stale windows — each either a
+		// literal (`grace DUR` / `max_stale DUR`) or origin-header-sourced
+		// (`grace_from_header NAME` / `max_stale_from_header NAME`). grace_from_header /
+		// max_stale_from_header are TAIL sub-keywords of cache_ttl, NOT standalone
+		// directives, so they need no directive registration and do not shift the
+		// selector boundary. Only the leading selector is a matcher usage; the durations /
+		// header names after the action keyword are not matchers.
 		return scopeUsages(argsBeforeAny(d.Args, "ttl", "from_header", "hit_for_miss"))
 	case "cache_key":
 		// cache_key [SELECTOR] TOKEN… (scoped cache_key): an OPTIONAL leading selector
@@ -380,11 +448,14 @@ func directiveUsages(d *cadishfile.Directive) usages {
 		rest := argsAfter(d.Args, "when")
 		return scopeUsages(argsBeforeAny(rest, "regex", "regex-path"))
 	case "redirect":
-		// Three forms, disambiguated by the first arg:
-		//   - `redirect @scope… CODE TARGET` — a leading @matcher is the SCOPED form;
+		// Four forms, disambiguated by the first arg:
+		//   - `redirect @scope… CODE TARGET` — a leading @matcher is a SCOPED form;
 		//     the leading run of refs is the matcher scope (so they count as
-		//     referenced, not unused, and add no regex eval — the scope's own cost is
-		//     charged once via the named-matcher pass).
+		//     referenced, not unused). The scope's own cost is charged once via the
+		//     named-matcher pass.
+		//   - `redirect @scope… PATH_REGEX CODE TARGET` — the combined form: the
+		//     leading refs are the scope AND a path regex follows (≥3 args after the
+		//     refs), so it adds one regex eval/request on top of the scope-match.
 		//   - `redirect PATH_REGEX CODE TARGET` — a non-@, non-digit first arg is the
 		//     implicit path_regex match (one regex eval/request).
 		//   - `redirect CODE map { … }` — Args[0] is the status code; it compiles to
@@ -392,11 +463,15 @@ func directiveUsages(d *cadishfile.Directive) usages {
 		var u usages
 		switch {
 		case len(d.Args) >= 1 && d.Args[0].Kind == cadishfile.ArgMatcherRef:
-			for _, a := range d.Args {
-				if a.Kind != cadishfile.ArgMatcherRef {
-					break
-				}
-				u.refs = append(u.refs, refUse{name: strings.TrimPrefix(a.Raw, "@"), pos: a.Pos})
+			i := 0
+			for i < len(d.Args) && d.Args[i].Kind == cadishfile.ArgMatcherRef {
+				u.refs = append(u.refs, refUse{name: strings.TrimPrefix(d.Args[i].Raw, "@"), pos: d.Args[i].Pos})
+				i++
+			}
+			// Combined form: a path regex precedes `CODE TARGET` (≥3 trailing args), so
+			// it costs one regex eval/request like the bare regex form.
+			if rest := d.Args[i:]; len(rest) >= 3 {
+				u.inlines = append(u.inlines, inlineUse{typ: "path_regex", args: rest[:1], pos: rest[0].Pos})
 			}
 		case len(d.Args) >= 1 && !isAllDigits(d.Args[0].Raw):
 			u.inlines = append(u.inlines, inlineUse{typ: "path_regex", args: d.Args[:1], pos: d.Args[0].Pos})

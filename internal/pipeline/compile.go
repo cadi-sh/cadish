@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -37,9 +38,21 @@ type selector struct {
 	kind  selectorKind
 	codes map[int]struct{}
 	scope *scope
+	// respHeader is an optional RESPONSE-phase `resp_header NAME VALUE` term ANDed in
+	// FRONT of the kind selector (status/scope/default): the rule applies only when the
+	// origin response carries the named header value AND the kind selector matches. It
+	// is nil for every rule that does not name resp_header, so the fast path is
+	// untouched. resp_header is response-phase-only and the cache_ttl/storage selectors
+	// run at EvalResponse, where the origin response is in scope.
+	respHeader *matcher
 }
 
 func (s selector) matches(c *matchContext, status int) bool {
+	// A resp_header term (when present) is ANDed with the rest of the selector. nil for
+	// every non-resp_header rule, so this is a single nil-check on the hot path.
+	if s.respHeader != nil && !c.matches(s.respHeader) {
+		return false
+	}
 	switch s.kind {
 	case selStatusIn:
 		_, ok := s.codes[status]
@@ -125,6 +138,36 @@ type ttlRule struct {
 	// (it falls through to the next cache_ttl rule), so a static `default` rule after
 	// it can supply a fallback.
 	fromHeader string
+	// graceFromHeader / maxStaleFromHeader, when non-empty, name origin RESPONSE
+	// headers whose values are parsed (via the same headerTTL helper as fromHeader) as
+	// the grace / max_stale window per-response (`grace_from_header X-Cache-Grace`,
+	// `max_stale_from_header X-Cache-Max-Stale`). They are valid on the `ttl` and
+	// `from_header` actions (rejected on `hit_for_miss`). Unlike a header TTL, a
+	// missing/unparseable value does NOT make the rule fall through — it falls back to
+	// the literal `grace` / `max_stale` in the SAME rule (matching the VCL
+	// `std.duration(hdr, default)` idiom). When a from_header-family rule APPLIES, the
+	// server strips every configured control header (fromHeader + graceFromHeader +
+	// maxStaleFromHeader) from the delivered response (Varnish's `unset beresp.http.*`).
+	graceFromHeader    string
+	maxStaleFromHeader string
+}
+
+// consumedHeaders returns the from_header-family control header names this rule reads
+// from the origin response (TTL + grace + max_stale, whichever are configured), so the
+// server can strip them from the delivered response. Returns nil when the rule sources
+// nothing from a header (the common case), keeping the response fast path untouched.
+func (r *ttlRule) consumedHeaders() []string {
+	var out []string
+	if r.fromHeader != "" {
+		out = append(out, r.fromHeader)
+	}
+	if r.graceFromHeader != "" {
+		out = append(out, r.graceFromHeader)
+	}
+	if r.maxStaleFromHeader != "" {
+		out = append(out, r.maxStaleFromHeader)
+	}
+	return out
 }
 
 type storageRule struct {
@@ -227,15 +270,31 @@ type Pipeline struct {
 	// ({geo}/{geo.continent}/{geo.region}) or a `geo` matcher — so the server runs
 	// the geo pre-pass. Computed once at the end of Compile; read by UsesGeoToken.
 	usesGeo bool
+	// needsPoolHealth is true iff the site references an `upstream_healthy` matcher
+	// anywhere (named or inline). When true the server injects a per-request pool-health
+	// view (Request.PoolHealthy) from config.Pools() before EvalRequest; when false the
+	// fast path pays nothing. Computed once at the end of Compile; read by NeedsPoolHealth.
+	needsPoolHealth bool
 
-	respondRules   []respondRule
-	onErrorRules   []onErrorRule
-	redirectRules  []redirectRule
-	purgeRules     []purgeRule
-	routeRules     []routeRule
-	passRules      []*scope
-	reqHeaderRules []headerRule
-	rewriteRules   []rewriteRule
+	respondRules  []respondRule
+	onErrorRules  []onErrorRule
+	redirectRules []redirectRule
+	purgeRules    []purgeRule
+	routeRules    []routeRule
+	passRules     []*scope
+	upgradeRules  []*scope
+	// credentialedRules are the compiled `cache_credentialed @scope` directives. A request
+	// matching ANY of them makes caching ORIGIN-AUTHORITATIVE (D101): the SERVER skips
+	// BypassForCredentials (and forwards the original cookies to origin for auth), and
+	// EvalResponse applies the in-scope precedence — a positive in-scope cache_ttl signal is the
+	// SOLE storage gate: it force-stores under the SHARED key and FORCE-OVERRIDES + STRIPS the
+	// per-user Set-Cookie + weak Cache-Control/Pragma/Expires (the VCL exactly), and absence of
+	// the signal does NOT store (fail-closed). Like passRules it is an OR-set of request-phase scopes; empty
+	// on a site without the directive (zero per-request cost). Server+edge serving-tier policy
+	// — never baked into EvalRequest's snapshot (mirrors BypassForCredentials).
+	credentialedRules []*scope
+	reqHeaderRules    []headerRule
+	rewriteRules      []rewriteRule
 
 	// SECURITY GATE (server-only; never projected to the edge — see secgate.go).
 	// allowRules short-circuit the gate; denyRules yield a 403. Both are evaluated
@@ -269,6 +328,16 @@ type Pipeline struct {
 	// covered by the cache key (matching RFC 9111 shared-cache / CDN behavior). When
 	// true, the operator has explicitly accepted that risk and the refusal is disabled.
 	cacheUnsafe bool
+	// ignoreClientRevalidation is the site-level `client_cache_control ignore` opt-out.
+	// When false (the default) the server honors a request `Cache-Control: no-cache` /
+	// `max-age=0` (or HTTP/1.0 `Pragma: no-cache`) by revalidating with origin before
+	// serving a stored response (RFC 9111 §5.2.1.4). When true the server treats that
+	// client-forced revalidation as absent and serves the fresh/stale entry as normal —
+	// the equivalent of Varnish's `unset req.http.Cache-Control`, closing the cache-bust /
+	// DoS vector of a browser hard-refresh forcing a MISS on every reload. It ONLY
+	// suppresses the CLIENT-forced revalidation; normal TTL/grace revalidation and all
+	// Set-Cookie / credential / no-store safety are unchanged.
+	ignoreClientRevalidation bool
 	// keyCanCoverCred is true when SOME cache_key recipe captures a per-user credential
 	// — a `cookie:NAME` token, or a `header:Cookie`/`header:Authorization` token. When
 	// false (the common case), no recipe can ever isolate a credentialed request, so the
@@ -281,6 +350,16 @@ type Pipeline struct {
 	// (operator-controlled) cookies are exempt from the credential bypass. An EMPTY
 	// allowlist (`cookie_allow` with no names) strips ALL cookies.
 	cookieAllow *nameGlobSet
+	// derivedSurviveCookies is the static union of every `derives_from cookie NAME`
+	// declared by a classify token that appears in AT LEAST ONE cache_key recipe. These
+	// cookies must SURVIVE `cookie_allow` stripping so the classifier reads the original
+	// value and the key (incl. {TOKEN}) is built from it; they are then stripped per the
+	// SELECTED recipe by StripDerivedCookies (post-key, pre-credential/origin). It is a
+	// superset of any one request's active set (which is recipe-scoped) — surviving a
+	// cookie that turns out inactive is fail-closed (StripDerivedCookies reconciles it to
+	// cookie_allow's would-be behavior). nil when no derives_from feeds any recipe, so a
+	// site without the feature keeps the fast path byte-for-byte unchanged.
+	derivedSurviveCookies map[string]bool
 
 	respHeaderRules []headerRule
 	stripRules      []*scope
@@ -337,9 +416,43 @@ func (p *Pipeline) UsesGeoToken() bool {
 	return p.usesGeo
 }
 
+// NeedsPoolHealth reports whether the site references an `upstream_healthy` matcher,
+// so the server must inject a per-request pool-health view (Request.PoolHealthy) from
+// config.Pools() before EvalRequest. It is false on every site that does not use the
+// matcher, keeping the request fast path zero-cost (no pool snapshot). Computed once
+// at Compile (computeNeedsPoolHealth).
+func (p *Pipeline) NeedsPoolHealth() bool {
+	return p.needsPoolHealth
+}
+
+// IgnoreClientRevalidation reports whether the site set `client_cache_control ignore`:
+// when true, the server does NOT honor a request `Cache-Control: no-cache` / `max-age=0`
+// (or `Pragma: no-cache`) and serves the fresh/stale entry as normal, instead of forcing
+// a MISS (RFC 9111 §5.2.1.4). False (the default) preserves the standard honor behavior,
+// and lets the server skip the client-revalidation header scan only when set. Computed
+// once at Compile from a SETUP-phase parse-once toggle.
+func (p *Pipeline) IgnoreClientRevalidation() bool {
+	return p.ignoreClientRevalidation
+}
+
 // isGeoKeyToken reports whether a key-token kind reads a server-resolved geo field.
 func isGeoKeyToken(k keyTokenKind) bool {
 	return k == tokGeo || k == tokGeoContinent || k == tokGeoRegion
+}
+
+// globalOnlyDirectives are the options parsed EXCLUSIVELY from the leading global-options
+// block ({ … } at the top of the file) by the config layer's *FromFile constructors
+// (serverConfigFromFile, adminFromFile, accessLogOffFromFile, strictHostFromFile,
+// securityFromFile, proxyProtocolFromFile). They have no per-site meaning, so a copy
+// written inside a SITE body is never read at runtime — silently ignored. Compile rejects
+// them in a site body (Finding 2) so the check≡run invariant holds; see registry.go.
+var globalOnlyDirectives = map[string]bool{
+	"server":         true,
+	"admin":          true,
+	"access_log":     true,
+	"strict_host":    true,
+	"security":       true,
+	"proxy_protocol": true,
 }
 
 // knownDirectives is the set of directive keywords Compile recognizes. Unknown
@@ -559,6 +672,42 @@ func Compile(site *cadishfile.Site) (*Pipeline, error) {
 				return nil, err
 			}
 			p.passRules = append(p.passRules, sc)
+		case "upgrade":
+			// `upgrade @scope` enables a connection-upgrade (WebSocket / `Connection:
+			// Upgrade`) passthrough tunnel for the matching scope. It mirrors `pass`
+			// exactly at compile time (RECV phase, OR-set scope) and IMPLIES pass: the
+			// tunnel is entirely off the caching path. The actual tunnelling is a server
+			// path gated additionally on a genuine upgrade request; pair this with a
+			// `route @scope -> upstream` to choose the upstream to tunnel to.
+			sc, err := parseScopeAll(d.Args, p.matchers, d.Pos)
+			if err != nil {
+				return nil, err
+			}
+			if sc == nil {
+				return nil, &CompileError{Pos: d.Pos, Msg: "upgrade needs a matcher or condition"}
+			}
+			if err := ensureNotResponsePhase(sc, "upgrade", d.Pos); err != nil {
+				return nil, err
+			}
+			p.upgradeRules = append(p.upgradeRules, sc)
+		case "cache_credentialed":
+			// `cache_credentialed @scope`: ORIGIN-AUTHORITATIVE caching of the matching
+			// credentialed requests (D101). Compiled exactly like `pass` (request-phase
+			// OR-set scope) — the AST stays semantics-free; meaning lives here + in
+			// EvalResponse / the server / the edge. A response-phase matcher is rejected:
+			// the directive gates a REQUEST-time decision (the credential bypass), so it
+			// must be evaluable in RECV, before any origin response exists.
+			sc, err := parseScopeAll(d.Args, p.matchers, d.Pos)
+			if err != nil {
+				return nil, err
+			}
+			if sc == nil {
+				return nil, &CompileError{Pos: d.Pos, Msg: "cache_credentialed needs a matcher or condition (it is a SCOPED opt-out of the credential bypass; an unscoped form would make ALL credentialed traffic origin-authoritative, which is never what you want)"}
+			}
+			if err := ensureNotResponsePhase(sc, "cache_credentialed", d.Pos); err != nil {
+				return nil, err
+			}
+			p.credentialedRules = append(p.credentialedRules, sc)
 		case "rewrite":
 			r, err := compileRewrite(d, p.matchers)
 			if err != nil {
@@ -610,6 +759,16 @@ func Compile(site *cadishfile.Site) (*Pipeline, error) {
 				return nil, &CompileError{Pos: d.Pos, Msg: "cache_unsafe takes no arguments"}
 			}
 			p.cacheUnsafe = true
+		case "client_cache_control":
+			// Per-site flag controlling whether the server honors a request's
+			// client-forced-revalidation directive (Cache-Control: no-cache/max-age=0,
+			// Pragma: no-cache). The only accepted value is `ignore` (do NOT honor it);
+			// the absent default honors it (RFC 9111 §5.2.1.4). A SETUP-phase parse-once
+			// toggle — no per-request cost; semantics live here, not in the AST.
+			if len(d.Args) != 1 || d.Args[0].Raw != "ignore" {
+				return nil, &CompileError{Pos: d.Pos, Msg: "client_cache_control takes exactly one value: `ignore` (do not honor a request no-cache/max-age=0/Pragma; the absent default honors it)"}
+			}
+			p.ignoreClientRevalidation = true
 		case "storage":
 			pastKey = true
 			r, err := compileStorage(d, p.matchers)
@@ -643,6 +802,14 @@ func Compile(site *cadishfile.Site) (*Pipeline, error) {
 			r, err := compileCORS(d, p.matchers)
 			if err != nil {
 				return nil, err
+			}
+			// Only one cors per site (docs: "Only one cors and one encode per site").
+			// corsRule is a SINGLE pointer, so a second cors would SILENTLY overwrite the
+			// first — a scoped `cors @api …` quietly lost behind a later `cors @web …`,
+			// with no error and no check warning. Reject the duplicate exactly as encode
+			// does below, so the shadow is a clear compile error in both check and run.
+			if p.corsRule != nil {
+				return nil, &CompileError{Pos: d.Pos, Msg: "only one cors directive allowed per site"}
 			}
 			p.corsRule = r
 		case "replace":
@@ -684,6 +851,16 @@ func Compile(site *cadishfile.Site) (*Pipeline, error) {
 				p.reqHeaderRules = append(p.reqHeaderRules, rule)
 			}
 		default:
+			if globalOnlyDirectives[d.Name] {
+				// Finding 2: a global-only block written inside a SITE body is parsed ONLY
+				// from the leading global-options block by the config layer's *FromFile
+				// constructors — never from the site — so it would be SILENTLY ignored at
+				// runtime (its knobs never apply) while check sees a registered directive and
+				// reports 0 errors. Reject it with a positioned placement error so `cadish
+				// check` and `cadish run` fail identically (both reach Compile) and the
+				// operator moves the block to the top-level { … } options block.
+				return nil, &CompileError{Pos: d.Pos, Msg: quote(d.Name) + " is a global-only block; move it to the top-level { … } options block (it is silently ignored inside a site body)"}
+			}
 			if !knownDirectives[d.Name] {
 				return nil, &CompileError{Pos: d.Pos, Msg: "unknown directive " + quote(d.Name)}
 			}
@@ -691,6 +868,14 @@ func Compile(site *cadishfile.Site) (*Pipeline, error) {
 		}
 	}
 	if err := validateKeyRules(p.keyRules); err != nil {
+		return nil, err
+	}
+	// Cross-check every `upstream_healthy NAME…` argument against the DECLARED pool
+	// names, exactly as `route -> UPSTREAM` and `origin chain` do (Finding I1). A typo'd
+	// name fails closed at runtime (PoolHealthy is false for an unknown pool) → a probe
+	// answers 503 forever and an L4/DNS LB pulls the node. Both `cadish check` and
+	// `cadish run` reach Compile, so both reject it identically.
+	if err := p.validateUpstreamHealthy(upstreamNames); err != nil {
 		return nil, err
 	}
 	// Compile the {device} User-Agent classifier from the site's `device_detect { … }`
@@ -703,8 +888,116 @@ func Compile(site *cadishfile.Site) (*Pipeline, error) {
 	p.deviceClassifier = dc
 	p.indexMatchers()
 	p.usesGeo = p.computeUsesGeo()
+	p.needsPoolHealth = p.computeNeedsPoolHealth()
 	p.keyCanCoverCred = p.computeKeyCanCoverCred()
+	p.derivedSurviveCookies = p.computeDerivedSurviveCookies()
+	if err := p.checkDerivedCookieModeConflict(); err != nil {
+		return nil, err
+	}
+	if err := p.checkCredentialedStripCookiesConflict(); err != nil {
+		return nil, err
+	}
 	return p, nil
+}
+
+// checkCredentialedStripCookiesConflict (Guard A, D101) rejects a `strip_cookies` scope that
+// overlaps a `cache_credentialed` scope. In a cache_credentialed scope the positive in-scope
+// cache_ttl signal already STRIPS Set-Cookie before store (the directive subsumes the old
+// `strip_cookies @v3_readmodel`), so this guard is redundant FOR SAFETY — but the owner keeps
+// it a hard error so an operator cannot believe `strip_cookies` is doing the safety work, or use
+// it to disarm/alter the in-scope behavior. Overlap is detected by SHARED matcher identity: a
+// named `@scope` (or an inline matcher) referenced by BOTH a `strip_cookies` and a
+// `cache_credentialed` directive is the same compiled *matcher pointer. This catches the
+// `strip_cookies @s` + `cache_credentialed @s` case the spec forbids (and the testing-stack
+// `strip_cookies @v3_readmodel` that must be removed when cache_credentialed lands). Mirrors
+// the positioned-error style of checkDerivedCookieModeConflict (Finding 4).
+func (p *Pipeline) checkCredentialedStripCookiesConflict() error {
+	if len(p.credentialedRules) == 0 || len(p.stripRules) == 0 {
+		return nil
+	}
+	credMatchers := map[*matcher]bool{}
+	for _, sc := range p.credentialedRules {
+		if sc == nil {
+			continue
+		}
+		for _, m := range sc.matchers {
+			credMatchers[m] = true
+		}
+	}
+	for _, sc := range p.stripRules {
+		if sc == nil {
+			continue
+		}
+		for _, m := range sc.matchers {
+			if credMatchers[m] {
+				name := m.name
+				ref := "@" + name
+				if name == "" {
+					ref = "an inline matcher"
+				}
+				return &CompileError{Pos: m.pos, Msg: "strip_cookies and cache_credentialed both cover " + ref + " — forbidden: in a cache_credentialed (origin-authoritative, shared-key) scope the positive in-scope cache_ttl signal already strips Set-Cookie before store (the directive subsumes strip_cookies for this scope), so a redundant strip_cookies here only obscures where the safety comes from. Drop the strip_cookies rule for this scope (cache_credentialed decides cacheability + cookie stripping there)"}
+			}
+		}
+	}
+	return nil
+}
+
+// checkDerivedCookieModeConflict (Finding 4) rejects a cookie declared BOTH
+// forward-mode (`derives_from cookie X forward`) and strip-mode (bare `derives_from
+// cookie X`) across two classify tokens that CO-OCCUR in the SAME cache_key recipe.
+// When such tokens are both active for a request, Go keeps+forwards the cookie
+// (StripDerivedCookies lets forward win) while the edge strips it (its derivedStripSet
+// does not subtract the forward list) — a Go≠JS parity break and an operator footgun.
+// Making the config invalid in both check and run renders that divergence unreachable.
+// Scoped to a single recipe: tokens in mutually-exclusive recipes are never both active,
+// so they cannot diverge within one request and must NOT false-error.
+func (p *Pipeline) checkDerivedCookieModeConflict() error {
+	for i := range p.keyRules {
+		forward := map[string]bool{}
+		strip := map[string]cadishfile.Pos{}
+		for _, t := range p.keyRules[i].toks {
+			if t.kind != tokClassify || t.clsf == nil {
+				continue
+			}
+			for _, c := range t.clsf.derivesFrom {
+				if t.clsf.isForwardCookie(c) {
+					forward[c] = true
+				} else if _, seen := strip[c]; !seen {
+					strip[c] = t.clsf.pos
+				}
+			}
+		}
+		for c, pos := range strip {
+			if forward[c] {
+				return &CompileError{Pos: pos, Msg: "cookie " + quote(c) + " is declared both `derives_from cookie " + c + " forward` and `derives_from cookie " + c + "` (strip) within one cache_key recipe — a cookie cannot be both; pick one (`forward` to expose it to origin, or bare for the safe-default strip)"}
+			}
+		}
+	}
+	return nil
+}
+
+// computeDerivedSurviveCookies builds the static set of `derives_from` cookie names
+// that must survive `cookie_allow` because their classify token appears in at least
+// one cache_key recipe (so it CAN be active for some request). A classifier whose
+// token is never keyed contributes nothing — its cookies are read but never stripped
+// (a check warning), and the fast path is untouched. Returns nil when empty so
+// HasDerivesFrom is a cheap nil check.
+func (p *Pipeline) computeDerivedSurviveCookies() map[string]bool {
+	var out map[string]bool
+	for i := range p.keyRules {
+		for _, t := range p.keyRules[i].toks {
+			if t.kind != tokClassify || t.clsf == nil || len(t.clsf.derivesFrom) == 0 {
+				continue
+			}
+			if out == nil {
+				out = map[string]bool{}
+			}
+			for _, c := range t.clsf.derivesFrom {
+				out[c] = true
+			}
+		}
+	}
+	return out
 }
 
 // classifyItem is one deferred classify unit awaiting resolution: either a
@@ -917,13 +1210,24 @@ func tokenCoversAuth(t keyToken) bool {
 	return t.kind == tokHeader && strings.EqualFold(t.arg, "Authorization")
 }
 
+// tokenCoversForwardCookie reports whether a key token is a classify {TOKEN} that declares
+// a `derives_from … forward` cookie. Such a token COVERS that cookie (which the request
+// forwards to origin under the collapsed key), so a recipe containing it CAN isolate a
+// credentialed (forward-cookie-bearing) request — the same role tokenCoversCookie plays for
+// a raw `cookie:NAME` token. Without this, a forward-only config (keyed by {TOKEN}, never a
+// raw cookie token) would make keyCanCoverCred false and BypassForCredentials short-circuit
+// to "always bypass", so forward traffic could never cache.
+func tokenCoversForwardCookie(t keyToken) bool {
+	return t.kind == tokClassify && t.clsf != nil && len(t.clsf.derivesForward) > 0
+}
+
 // computeKeyCanCoverCred reports whether ANY cache_key recipe captures a per-user
 // credential. When false, no recipe can isolate a credentialed request, so the
 // credential safe-default bypasses without selecting a per-request key recipe.
 func (p *Pipeline) computeKeyCanCoverCred() bool {
 	for i := range p.keyRules {
 		for _, t := range p.keyRules[i].toks {
-			if tokenCoversCookie(t) || tokenCoversAuth(t) {
+			if tokenCoversCookie(t) || tokenCoversAuth(t) || tokenCoversForwardCookie(t) {
 				return true
 			}
 		}
@@ -979,6 +1283,120 @@ func (p *Pipeline) computeUsesGeo() bool {
 		}
 	})
 	return geoInScope
+}
+
+// computeNeedsPoolHealth reports whether any `upstream_healthy` matcher is referenced
+// anywhere — a named matcher, an inline scope matcher, a scoped-respond / security
+// term, or a classify `when` row. Either means the server must inject the per-request
+// pool-health view before EvalRequest. Mirrors computeUsesGeo's full walk so an inline
+// or terminal-respond use is not missed.
+func (p *Pipeline) computeNeedsPoolHealth() bool {
+	for _, m := range p.matchers {
+		if m.kind == kindUpstreamHealthy {
+			return true
+		}
+	}
+	found := false
+	p.forEachScope(func(s *scope) {
+		for _, m := range s.matchers {
+			if m.kind == kindUpstreamHealthy {
+				found = true
+			}
+		}
+	})
+	p.forEachSecRule(func(r *secRule) {
+		for _, t := range r.terms {
+			if t.m.kind == kindUpstreamHealthy {
+				found = true
+			}
+		}
+	})
+	// Scoped `respond @scope` rules carry their matchers as conjunction terms (not
+	// scopes), so a matcher used ONLY to scope the AWS probe's `respond @probe @live`
+	// is reachable only here — the canonical use of this matcher.
+	for i := range p.respondRules {
+		for _, t := range p.respondRules[i].terms {
+			if t.m.kind == kindUpstreamHealthy {
+				found = true
+			}
+		}
+	}
+	for _, cl := range p.classifiers {
+		for _, row := range cl.rows {
+			for _, m := range row.conj {
+				if m.kind == kindUpstreamHealthy {
+					found = true
+				}
+			}
+		}
+	}
+	return found
+}
+
+// validateUpstreamHealthy cross-checks every `upstream_healthy NAME…` pool argument
+// against the set of DECLARED upstream/cluster names (Finding I1). Mirrors the FULL
+// matcher walk of computeNeedsPoolHealth so an undeclared name is caught wherever the
+// matcher is used — a named matcher, an inline directive scope, a security term, a
+// terminal `respond @probe @live` term, or a classify `when` row. Each name is checked
+// (ANY semantics: a typo must not hide behind a valid sibling). Like `route -> UPSTREAM`,
+// validation is skipped when NO pools are declared (an upstream-less context), so it
+// never over-rejects; a real probe config always declares the pools it probes.
+func (p *Pipeline) validateUpstreamHealthy(upstreams map[string]bool) error {
+	if len(upstreams) == 0 {
+		return nil
+	}
+	var firstErr error
+	check := func(m *matcher) {
+		if firstErr != nil || m == nil || m.kind != kindUpstreamHealthy {
+			return
+		}
+		for _, name := range m.healthyPools {
+			if !upstreams[name] {
+				firstErr = &CompileError{Pos: m.pos, Msg: "upstream_healthy references " + quote(name) + " which is not a declared upstream/cluster" + declaredPoolHint(upstreams)}
+				return
+			}
+		}
+	}
+	for _, m := range p.matchers {
+		check(m)
+	}
+	p.forEachScope(func(s *scope) {
+		for _, m := range s.matchers {
+			check(m)
+		}
+	})
+	p.forEachSecRule(func(r *secRule) {
+		for _, t := range r.terms {
+			check(t.m)
+		}
+	})
+	for i := range p.respondRules {
+		for _, t := range p.respondRules[i].terms {
+			check(t.m)
+		}
+	}
+	for _, cl := range p.classifiers {
+		for _, row := range cl.rows {
+			for _, m := range row.conj {
+				check(m)
+			}
+		}
+	}
+	return firstErr
+}
+
+// declaredPoolHint lists the declared upstream/cluster pool names (sorted) so an
+// undeclared-pool error can suggest the valid choices.
+func declaredPoolHint(upstreams map[string]bool) string {
+	if len(upstreams) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(upstreams))
+	for n := range upstreams {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return " (declared: " + strings.Join(names, ", ") + ")"
 }
 
 // indexMatchers assigns each distinct matcher referenced by any scope a stable
@@ -1128,6 +1546,13 @@ func (p *Pipeline) forEachScope(fn func(*scope)) {
 	for _, sc := range p.passRules {
 		visit(sc)
 	}
+	// upgrade `@scope` matchers: an INLINE geo/upstream_healthy matcher written directly
+	// in `upgrade @scope` must get a memo slot AND be scanned by the pre-pass (Finding 5),
+	// or computeUsesGeo / computeNeedsPoolHealth would miss it and the matcher fails closed
+	// (the tunnel silently never engages). Same shape as passRules.
+	for _, sc := range p.upgradeRules {
+		visit(sc)
+	}
 	for _, r := range p.reqHeaderRules {
 		visit(r.scope)
 	}
@@ -1217,6 +1642,8 @@ func matcherKindName(k matcherKind) string {
 		return "set_cookie"
 	case kindContentType:
 		return "content_type"
+	case kindRespHeader:
+		return "resp_header"
 	default:
 		return "a response-phase"
 	}
@@ -1453,6 +1880,38 @@ func parseSelector(args []cadishfile.Arg, matchers map[string]*matcher, pos cadi
 	switch {
 	case first.Raw == "default":
 		return selector{kind: selDefault}, 1, nil
+	case first.Raw == "resp_header":
+		// `resp_header NAME VALUE [<status|@scope>]` — a RESPONSE-phase header term,
+		// optionally ANDed with a trailing `status …` or `@scope` selector (the natural
+		// `resp_header X-Powered-By Express status 404 …` combination). NAME + a single
+		// VALUE are consumed (exactly two args) so the boundary with the trailing
+		// selector / TTL action is unambiguous.
+		//
+		// A missing VALUE — either no third token, or a VALUE position occupied by a
+		// cache_ttl/storage action keyword (the user wrote `resp_header X-Foo ttl 1m`,
+		// silently consuming `ttl` as the value) — is a HARD error. We do NOT accept a
+		// bare NAME (that would mis-scope), but we guide the user to the explicit presence
+		// form `resp_header NAME *` (match the header's mere presence).
+		if len(args) < 3 || args[1].Raw == "" || isSelectorTailKeyword(args[2].Raw) {
+			return selector{}, 0, &CompileError{Pos: first.Pos, Msg: "resp_header needs NAME VALUE — use `resp_header NAME *` to match the header's mere presence"}
+		}
+		m, err := compileMatcher("", "resp_header", []string{args[1].Raw, args[2].Raw}, first.Pos)
+		if err != nil {
+			return selector{}, 0, err
+		}
+		i := 3
+		sel := selector{kind: selDefault, respHeader: m}
+		// An optional trailing `status …` or `@scope` is ANDed with the resp_header term.
+		if i < len(args) && (args[i].Raw == "status" || args[i].Kind == cadishfile.ArgMatcherRef) {
+			sub, j, serr := parseSelector(args[i:], matchers, pos)
+			if serr != nil {
+				return selector{}, 0, serr
+			}
+			sub.respHeader = m
+			sel = sub
+			i += j
+		}
+		return sel, i, nil
 	case first.Raw == "status":
 		kind := selStatusIn
 		i := 1
@@ -1483,6 +1942,20 @@ func parseSelector(args []cadishfile.Arg, matchers map[string]*matcher, pos cadi
 	default:
 		return selector{}, 0, &CompileError{Pos: first.Pos, Msg: "unknown selector " + quote(first.Raw) + " (want `status ...`, `@matcher`, or `default`)"}
 	}
+}
+
+// isSelectorTailKeyword reports whether tok is a cache_ttl / storage action or
+// trailing-selector keyword. When such a keyword appears in the resp_header VALUE
+// position (`resp_header X-Foo ttl 1m`), the operator omitted the value — the keyword
+// would otherwise be silently consumed AS the value. Used only to produce the guiding
+// "use `resp_header NAME *`" error, never to accept the input.
+func isSelectorTailKeyword(tok string) bool {
+	switch tok {
+	case "ttl", "from_header", "hit_for_miss", "grace", "grace_from_header",
+		"max_stale", "max_stale_from_header", "status", "->":
+		return true
+	}
+	return false
 }
 
 func compileTTL(d *cadishfile.Directive, matchers map[string]*matcher) (ttlRule, error) {
@@ -1524,10 +1997,15 @@ func compileTTL(d *cadishfile.Directive, matchers map[string]*matcher) (ttlRule,
 		if err != nil {
 			return ttlRule{}, &CompileError{Pos: rest[1].Pos, Msg: err.Error()}
 		}
-		// max_stale is meaningless without a stored object — reject it on hit_for_miss.
+		// max_stale (and its header-sourced sibling) are meaningless without a stored
+		// object — reject them on hit_for_miss. grace_from_header is likewise rejected:
+		// hit_for_miss carries no grace window to source.
 		for _, a := range rest[2:] {
-			if a.Raw == "max_stale" {
+			switch a.Raw {
+			case "max_stale", "max_stale_from_header":
 				return ttlRule{}, &CompileError{Pos: a.Pos, Msg: "max_stale is not valid on hit_for_miss (it needs a stored object to serve)"}
+			case "grace_from_header":
+				return ttlRule{}, &CompileError{Pos: a.Pos, Msg: "grace_from_header is not valid on hit_for_miss (it has no grace window)"}
 			}
 		}
 	default:
@@ -1536,40 +2014,57 @@ func compileTTL(d *cadishfile.Directive, matchers map[string]*matcher) (ttlRule,
 	return r, nil
 }
 
-// parseTTLTail parses the optional `[grace DUR] [max_stale DUR]` tail shared by the
-// `ttl` and `from_header` cache_ttl actions, writing into r. max_stale (D60) is the
-// serve-stale-on-origin-failure window and is accepted only after grace; a max_stale
-// smaller than grace is a compile error (it would be dead — grace already covers that
-// span and is served earlier on the live path). where names the action for errors.
+// parseTTLTail parses the optional grace / max_stale tail shared by the `ttl` and
+// `from_header` cache_ttl actions, writing into r. Each window may be either a literal
+// duration (`grace DUR` / `max_stale DUR`) or sourced from an origin response header
+// (`grace_from_header NAME` / `max_stale_from_header NAME`); the literal stays as the
+// in-rule fallback when the header is absent/unparseable. Each keyword may appear at
+// most once. max_stale (D60) is the serve-stale-on-origin-failure window; a LITERAL
+// max_stale smaller than the LITERAL grace is a compile error (it would be dead — grace
+// already covers that span). When either window is header-sourced the bound is enforced
+// against the RESOLVED values at runtime (EvalResponse) instead. where names the action
+// for errors.
 func parseTTLTail(r *ttlRule, tail []cadishfile.Arg, where string) error {
+	seen := map[string]bool{}
 	i := 0
-	if i < len(tail) && tail[i].Raw == "grace" {
-		if i+1 >= len(tail) {
-			return &CompileError{Pos: tail[i].Pos, Msg: "grace needs a duration"}
+	for i < len(tail) {
+		kw := tail[i].Raw
+		switch kw {
+		case "grace", "max_stale":
+			if i+1 >= len(tail) {
+				return &CompileError{Pos: tail[i].Pos, Msg: kw + " needs a duration"}
+			}
+			d, err := parseDuration(tail[i+1].Raw)
+			if err != nil {
+				return &CompileError{Pos: tail[i+1].Pos, Msg: err.Error()}
+			}
+			if kw == "grace" {
+				r.grace = d
+			} else {
+				r.maxStale = d
+			}
+		case "grace_from_header", "max_stale_from_header":
+			if i+1 >= len(tail) || tail[i+1].Raw == "" {
+				return &CompileError{Pos: tail[i].Pos, Msg: kw + " needs a response-header name"}
+			}
+			if kw == "grace_from_header" {
+				r.graceFromHeader = tail[i+1].Raw
+			} else {
+				r.maxStaleFromHeader = tail[i+1].Raw
+			}
+		default:
+			return &CompileError{Pos: tail[i].Pos, Msg: "expected `grace DUR`, `grace_from_header NAME`, `max_stale DUR`, and/or `max_stale_from_header NAME` " + where + ", got " + quote(kw)}
 		}
-		g, err := parseDuration(tail[i+1].Raw)
-		if err != nil {
-			return &CompileError{Pos: tail[i+1].Pos, Msg: err.Error()}
+		if seen[kw] {
+			return &CompileError{Pos: tail[i].Pos, Msg: "duplicate " + kw + " " + where}
 		}
-		r.grace = g
+		seen[kw] = true
 		i += 2
 	}
-	if i < len(tail) && tail[i].Raw == "max_stale" {
-		if i+1 >= len(tail) {
-			return &CompileError{Pos: tail[i].Pos, Msg: "max_stale needs a duration"}
-		}
-		ms, err := parseDuration(tail[i+1].Raw)
-		if err != nil {
-			return &CompileError{Pos: tail[i+1].Pos, Msg: err.Error()}
-		}
-		if ms < r.grace {
-			return &CompileError{Pos: tail[i+1].Pos, Msg: "max_stale must be >= grace (a max_stale smaller than grace is dead — grace already serves that span)"}
-		}
-		r.maxStale = ms
-		i += 2
-	}
-	if i < len(tail) {
-		return &CompileError{Pos: tail[i].Pos, Msg: "expected `grace DUR` and/or `max_stale DUR` " + where + ", got " + quote(tail[i].Raw)}
+	// The dead-config bound is only knowable at compile when BOTH windows are literals;
+	// a header-sourced grace/max_stale is checked against the resolved values at runtime.
+	if r.graceFromHeader == "" && r.maxStaleFromHeader == "" && r.maxStale > 0 && r.maxStale < r.grace {
+		return &CompileError{Pos: tail[0].Pos, Msg: "max_stale must be >= grace (a max_stale smaller than grace is dead — grace already serves that span)"}
 	}
 	return nil
 }

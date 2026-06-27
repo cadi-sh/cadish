@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 
 	"github.com/cadi-sh/cadish/internal/cadishfile"
 	"github.com/cadi-sh/cadish/internal/check"
@@ -109,15 +110,23 @@ type sourceResponse struct {
 // endpoint never writes it — so the editor pre-loads the live config without any
 // datapath or config-mutation risk.
 func (s *Server) handleSource(w http.ResponseWriter, r *http.Request) {
-	resp := sourceResponse{Path: s.cfgPath}
+	var resp sourceResponse
 	if s.cfgPath == "" {
 		resp.Error = "no config path known"
 		writeJSON(w, resp)
 		return
 	}
+	// Expose only the base filename — never the absolute on-disk path — so a token
+	// holder cannot learn the host directory layout (same defense-in-depth as
+	// /api/config's handleConfig + stripReportPaths; fix for #16, restored here for
+	// the sibling /api/source which had regressed to returning the raw path).
+	resp.Path = filepath.Base(s.cfgPath)
 	b, err := os.ReadFile(s.cfgPath)
 	if err != nil {
-		resp.Error = err.Error()
+		// The os.ReadFile error string embeds the absolute path; strip it to the base
+		// filename through the same helper handleConfig uses, so a read failure cannot
+		// disclose the host layout either.
+		resp.Error = stripPathFromError(err, s.cfgPath)
 		writeJSON(w, resp)
 		return
 	}

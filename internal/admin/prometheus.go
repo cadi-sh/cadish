@@ -42,6 +42,7 @@ func (s *Server) handlePrometheus(w http.ResponseWriter, r *http.Request) {
 	counter("cadish_rate_limit_monitor_total", "Rate limit: would-429 recorded in monitor mode (passed).", snap.RateLimitMonitor)
 	counter("cadish_rate_limit_pass_total", "Rate limit: requests a rate_limit rule applied to but admitted.", snap.RateLimitPass)
 
+	gauge("cadish_upgrades_active", "Connection-upgrade (WebSocket) passthrough tunnels currently open.", float64(snap.UpgradesActive))
 	gauge("cadish_hit_ratio", "Cache hit ratio (hits+stale)/(hits+stale+misses).", snap.HitRatio())
 	gauge("cadish_uptime_seconds", "Process uptime in seconds.", snap.UptimeSeconds)
 	gauge("cadish_latency_p50_ms", "Estimated p50 request latency (ms).", snap.LatencyP50())

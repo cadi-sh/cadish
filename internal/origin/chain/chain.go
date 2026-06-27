@@ -121,8 +121,10 @@ func (c *Chain) ReplaceOrigins(f func(origin.Origin) origin.Origin) {
 // POSITIVE success (200/206) it returns that streaming response (caller
 // owns/closes the body). A NEGATIVE response (a full-body 404/410, backlog #21) is
 // treated as a miss: the chain falls through to the next origin, closing the
-// abandoned negative body. On a fall-through error it tries the next origin; on a
-// non-fall-through error it returns that error immediately. If every origin falls
+// abandoned negative body. On a fall-through error it tries the next origin,
+// closing the captured upstream body of the error it abandons (an HTTP origin
+// attaches the live non-2xx body to a *StatusError); on a non-fall-through error it
+// returns that error immediately (body intact for the caller). If every origin falls
 // through, the LAST outcome is surfaced — the last negative *Response if one was
 // seen after the last error, otherwise the last error.
 func (c *Chain) Fetch(ctx context.Context, req *origin.Request) (*origin.Response, error) {
@@ -138,6 +140,8 @@ func (c *Chain) Fetch(ctx context.Context, req *origin.Request) (*origin.Respons
 				lastNeg.Body.Close()
 			}
 			if lastErr != nil {
+				// We surface the context error, not lastErr — release its captured body.
+				origin.CloseStatusErrBody(lastErr)
 				return nil, fmt.Errorf("chain: context done after origin %d: %w", i, err)
 			}
 			return nil, err
@@ -147,10 +151,12 @@ func (c *Chain) Fetch(ctx context.Context, req *origin.Request) (*origin.Respons
 		if err == nil {
 			if !resp.Negative {
 				// Positive success: live body handed to the caller. Drop any earlier
-				// negative response we were holding as the fallback answer.
+				// negative response (and any held fall-through error body) we were
+				// holding as the fallback answer.
 				if lastNeg != nil {
 					lastNeg.Body.Close()
 				}
+				origin.CloseStatusErrBody(lastErr)
 				return resp, nil
 			}
 			// Negative (full-body 404/410): normally a miss the chain falls through.
@@ -166,15 +172,21 @@ func (c *Chain) Fetch(ctx context.Context, req *origin.Request) (*origin.Respons
 				}
 				return resp, nil
 			}
-			// Negative miss: hold it as the candidate answer (closing any earlier one)
-			// and fall through to the next origin.
+			// Negative miss: hold it as the candidate answer (closing any earlier one,
+			// and any held fall-through error body) and fall through to the next origin.
 			if lastNeg != nil {
 				lastNeg.Body.Close()
 			}
+			origin.CloseStatusErrBody(lastErr)
 			lastNeg = resp
 			lastErr = nil
 			continue
 		}
+		// A new error supersedes any previously-held fall-through error; release the
+		// captured upstream body of the one we are dropping (an HTTP origin attaches the
+		// live non-2xx body to a *StatusError). The error we keep (lastErr) retains its
+		// body for whoever finally surfaces it.
+		origin.CloseStatusErrBody(lastErr)
 		lastErr = err
 		// Do NOT fall through to another origin when the request carries a body — the
 		// consumed-and-non-replayable body plus non-idempotency rationale above. Surface
@@ -197,7 +209,13 @@ func (c *Chain) Fetch(ctx context.Context, req *origin.Request) (*origin.Respons
 	}
 	// Every origin fell through. Prefer surfacing a held full-body negative response
 	// (so the server can negatively cache the real error page) over a bare error.
+	// A negative held from an EARLIER origin can co-exist with a fall-through error
+	// captured from a LATER origin (e.g. chain [404, 503]: the 404 is held, then the
+	// 503's *StatusError — carrying a live upstream body — is captured but never
+	// cleared). When we surface the negative, release that abandoned error's captured
+	// body so it is not leaked (no-op for a nil / bodyless error).
 	if lastNeg != nil {
+		origin.CloseStatusErrBody(lastErr)
 		return lastNeg, nil
 	}
 	return nil, lastErr

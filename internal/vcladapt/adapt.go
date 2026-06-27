@@ -35,6 +35,7 @@ type builder struct {
 	matchers     []string // @name … lines for routes
 	responds     []string
 	cacheKey     []string
+	cacheKeyNote string
 	ttlLines     []string
 	respHeaders  []string
 	stripCookies bool
@@ -137,6 +138,14 @@ func (b *builder) recv(stmts []stmt) {
 			continue
 		}
 		c := s.clauses[0]
+		// A compound `&&` or negated (`!`/`!~`/`!=`) condition can't be decomposed into
+		// cadish's positive, OR-combined matchers without silently widening or inverting
+		// the rule (see condHasUntranslatableLogic). Flag it loudly rather than emit a
+		// mistranslation — this guards pass, route, and synth alike.
+		if condHasUntranslatableLogic(c.cond) {
+			b.todo("vcl_recv conditional uses `&&`/negation cadish can't decompose mechanically (would widen or invert the rule) — translate by hand", snippet(s))
+			continue
+		}
 		switch {
 		case bodyReturnsPass(c.body):
 			b.recvPass(c.cond, s)
@@ -159,14 +168,21 @@ func (b *builder) recvPass(cond []token, s stmt) {
 		if u == "" {
 			continue
 		}
+		mappedAny = true
 		if !looksRegexy(u) && strings.HasPrefix(u, "/") {
 			b.nocacheGlobs = append(b.nocacheGlobs, pathGlob(u))
-		} else {
-			b.passInline = append(b.passInline, "pass path_regex "+quote(u)+
-				"   # VCL `~` is a substring match — verify")
+			b.mapped++
+			continue
 		}
+		// cadish's path_regex compiles under RE2; a PCRE-only VCL pattern would emit
+		// output `cadish check` rejects (or a different meaning). Flag it, don't emit it.
+		if reason, bad := re2Reject(u); bad {
+			b.todo("vcl_recv return(pass) regex isn't valid RE2 (cadish uses RE2, not PCRE): "+reason+" — rewrite the pattern for RE2 by hand", "req.url ~ "+quote(u))
+			continue
+		}
+		b.passInline = append(b.passInline, "pass path_regex "+quote(u)+
+			"   # VCL `~` is a substring match — verify")
 		b.mapped++
-		mappedAny = true
 	}
 	if method != "" {
 		if strings.EqualFold(method, "PURGE") {
@@ -215,16 +231,39 @@ func (b *builder) recvSynth(cond []token, body []stmt, s stmt) {
 }
 
 func (b *builder) recvRoute(cond []token, upstream string, s stmt) {
-	host := firstMatch(cond, "req.http.host")
-	if host == "" {
+	// An OR-alternative host condition (`req.http.host ~ "a" || req.http.host ~ "b"`) is a
+	// union: BOTH hosts must route to the backend. The &&/negation guard in recv() already
+	// rejected any condition with `&&`/`!`, so anything reaching here is a pure positive
+	// chain — extractMatches yields every host atom, and emitting a matcher+route per atom
+	// reproduces the union faithfully. (firstMatch routed only the first and silently
+	// dropped the rest.)
+	hosts := extractMatches(cond, "req.http.host")
+	if len(hosts) == 0 {
 		b.todo("vcl_recv sets backend by a non-host condition", snippet(s))
 		return
 	}
-	b.hostCounter++
-	name := fmt.Sprintf("host%d", b.hostCounter)
-	b.matchers = append(b.matchers, fmt.Sprintf("@%s host_regex %s", name, quote(host)))
-	b.routes = append(b.routes, fmt.Sprintf("route @%s -> %s", name, sanitizeName(upstream)))
-	b.mapped++
+	mappedAny := false
+	for _, host := range hosts {
+		if host == "" {
+			continue
+		}
+		// host_regex compiles under RE2; a PCRE-only host pattern would fail `cadish check`.
+		// Reject just the offending alternative loudly and keep mapping the rest, naming the
+		// dropped pattern so the operator can rewrite it.
+		if reason, bad := re2Reject(host); bad {
+			b.todo("vcl_recv routes by a host regex that isn't valid RE2 (cadish uses RE2, not PCRE): "+reason+" — rewrite for RE2 by hand", "req.http.host ~ "+quote(host))
+			continue
+		}
+		b.hostCounter++
+		name := fmt.Sprintf("host%d", b.hostCounter)
+		b.matchers = append(b.matchers, fmt.Sprintf("@%s host_regex %s", name, quote(host)))
+		b.routes = append(b.routes, fmt.Sprintf("route @%s -> %s", name, sanitizeName(upstream)))
+		b.mapped++
+		mappedAny = true
+	}
+	if !mappedAny {
+		b.todo("vcl_recv sets backend by a non-host condition", snippet(s))
+	}
 }
 
 func (b *builder) recvSimple(s stmt) {
@@ -358,6 +397,26 @@ func (b *builder) hash(stmts []stmt) {
 			b.todo("vcl_hash hash_data("+expr+") not a plain url/host/header", "")
 		}
 	}
+	// Varnish's BUILT-IN vcl_hash always appends hash_data(req.url) and
+	// hash_data(req.http.host) AFTER the custom sub (only a rare `return(lookup)` in the
+	// custom sub bypasses it), so a custom vcl_hash that omits them — the common
+	// `hash_data(req.http.X-Currency)` shape in real configs — STILL keys on url+host.
+	// cadish's cache_key is the WHOLE key with no implicit base (an empty cache_key uses
+	// `method host path`, but a non-empty one is taken verbatim), so emitting only the
+	// custom terms would silently DROP url+host and collide every URL/host into one cache
+	// bucket — catastrophic cross-content/cross-host mixing. Seed the builtin base.
+	if len(b.cacheKey) > 0 {
+		seeded := false
+		for _, base := range []string{"host", "url"} {
+			if !containsStr(b.cacheKey, base) {
+				b.cacheKey = append([]string{base}, b.cacheKey...)
+				seeded = true
+			}
+		}
+		if seeded {
+			b.cacheKeyNote = "   # url+host added to match Varnish's built-in vcl_hash (always hashed after a custom sub); drop only if your VCL did return(lookup)"
+		}
+	}
 }
 
 // vcl_deliver / vcl_synth mapping.
@@ -413,7 +472,11 @@ func (b *builder) render(filename string) *Result {
 	var nocache []string
 	if len(b.nocacheGlobs) > 0 {
 		nocache = append(nocache, "@nocache path "+strings.Join(dedupe(b.nocacheGlobs), " "))
-		nocache = append(nocache, "pass @nocache")
+		// These globs are PREFIX matches, but the VCL they came from used `~` (an
+		// unanchored substring match) or `==` (an exact match) — neither is exactly a
+		// prefix. Surface the reduction so a migrator verifies it (mirrors the inline note
+		// on the `pass path_regex` branch); cadish `path /x*` is prefix, `path /x` is exact.
+		nocache = append(nocache, "pass @nocache   # globs are PREFIX matches — VCL `~` is substring / `==` is exact; verify each path")
 	}
 	for _, m := range b.passMethods {
 		nocache = append(nocache, "pass method "+m)
@@ -424,7 +487,7 @@ func (b *builder) render(filename string) *Result {
 	section("synthetic responses", b.responds)
 	section("request headers", b.reqHeaders)
 	if len(b.cacheKey) > 0 {
-		section("cache key", []string{"cache_key " + strings.Join(b.cacheKey, " ")})
+		section("cache key", []string{"cache_key " + strings.Join(b.cacheKey, " ") + b.cacheKeyNote})
 	}
 	section("ttl / grace", b.ttlLines)
 

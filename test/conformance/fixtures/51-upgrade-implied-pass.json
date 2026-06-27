@@ -1,0 +1,16 @@
+{
+  "name": "51-upgrade-implied-pass",
+  "cadishfile": "example.com {\n    @ws path /ws/*\n    upgrade @ws\n    cache_key host path\n    cache_ttl default ttl 1h\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/ws/room1" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/home" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

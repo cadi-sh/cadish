@@ -257,6 +257,16 @@ func TranslateSites(in Inputs) ([]RenderedSite, []Reject) {
 				}
 				pt := pathTypeOf(p)
 				path := normalizePath(p.Path, pt)
+				// Env-exfiltration guard (parity with the policy-fragment surface): a
+				// tenant path carrying an unescaped "{$VAR}" would, once quoted into the
+				// `path` matcher, expand against the CONTROLLER POD's environment when the
+				// combined config is loaded (config.SubstituteEnv), leaking secrets. QuoteArg
+				// quotes but does not neutralize "{$" (no value-preserving escape exists), so
+				// reject the path outright rather than emit it.
+				if containsEnvPlaceholder(path) {
+					rejects = append(rejects, Reject{Ingress: k, Reason: fmt.Sprintf("path %q contains an environment-variable placeholder ({$VAR}), which is not allowed in a tenant path", p.Path)})
+					continue
+				}
 				dk := host + "\x00" + path + "\x00" + string(pt)
 				if owner, dup := seen[dk]; dup {
 					if owner != k {
@@ -706,17 +716,10 @@ func firstDeniedDirective(nodes []cadishfile.Node) string {
 
 // containsEnvPlaceholder reports whether s contains an UNESCAPED "{$" env-expansion span
 // (the trigger for config.SubstituteEnv). A backslash-escaped "\{" is not a placeholder.
+// It delegates to cadishfile.ContainsEnvPlaceholder so the policy-fragment guard and the
+// tenant match-value/path guards share one implementation.
 func containsEnvPlaceholder(s string) bool {
-	for i := 0; i+1 < len(s); i++ {
-		if s[i] == '\\' { // skip the escaped character
-			i++
-			continue
-		}
-		if s[i] == '{' && s[i+1] == '$' {
-			return true
-		}
-	}
-	return false
+	return cadishfile.ContainsEnvPlaceholder(s)
 }
 
 // buildBareFragmentWrapper wraps a fragment in a synthetic site with NO injected
@@ -770,10 +773,15 @@ func isCatchAll(e routeEntry) bool {
 //   - Prefix/Impl "/p"      -> "path /p /p/*"       (matches /p and any /p/… subpath,
 //     reproducing Kubernetes element-wise Prefix: /p never matches /prefix)
 func pathMatcherArgs(e routeEntry) string {
+	// The path is tenant-authored (Ingress rule) and concatenated into the generated
+	// `path` matcher, so each token is rendered through the canonical quoter as a
+	// COMPLETE token (the "/*" suffix folded in before quoting). This stops a hostile
+	// path such as "/a}" from closing the host block (R38). A normal "/p" has no
+	// special characters and renders verbatim, so existing output is unchanged.
 	if e.pathType == networkingv1.PathTypeExact {
-		return "path " + e.path
+		return "path " + cadishfile.QuoteArg(e.path)
 	}
-	return fmt.Sprintf("path %s %s/*", e.path, e.path)
+	return fmt.Sprintf("path %s %s", cadishfile.QuoteArg(e.path), cadishfile.QuoteArg(e.path+"/*"))
 }
 
 // upstreamName builds a deterministic, syntactically valid upstream name from the

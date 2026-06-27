@@ -1,0 +1,170 @@
+[
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fexample.com\u001f/api/all",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 300000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 1800000000000,
+      "hitForMissNs": 0,
+      "storeTier": "ram",
+      "cacheable": true,
+      "stripHeaders": [
+        "X-Cache-Ttl",
+        "X-Cache-Grace",
+        "X-Cache-Max-Stale"
+      ]
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fexample.com\u001f/api/grace-fallback",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 300000000000,
+      "graceNs": 30000000000,
+      "maxStaleNs": 3600000000000,
+      "hitForMissNs": 0,
+      "storeTier": "ram",
+      "cacheable": true,
+      "stripHeaders": [
+        "X-Cache-Ttl",
+        "X-Cache-Grace",
+        "X-Cache-Max-Stale"
+      ]
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fexample.com\u001f/api/maxstale-below-grace-ignored",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 300000000000,
+      "graceNs": 300000000000,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "ram",
+      "cacheable": true,
+      "stripHeaders": [
+        "X-Cache-Ttl",
+        "X-Cache-Grace",
+        "X-Cache-Max-Stale"
+      ]
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "GET\u001fexample.com\u001f/api/grace-garbage-fallback",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 300000000000,
+      "graceNs": 30000000000,
+      "maxStaleNs": 3600000000000,
+      "hitForMissNs": 0,
+      "storeTier": "ram",
+      "cacheable": true,
+      "stripHeaders": [
+        "X-Cache-Ttl",
+        "X-Cache-Grace",
+        "X-Cache-Max-Stale"
+      ]
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  }
+]

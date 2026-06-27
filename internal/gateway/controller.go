@@ -36,6 +36,17 @@ type Applier interface {
 	ApplyConfig(*config.Config) error
 }
 
+// Warmer is the OPTIONAL seam the controller uses to flip the data plane's warm-readiness
+// flag AFTER its FIRST successful reconcile builds the routing table from synced listers.
+// *server.Server satisfies it via MarkWarm. Until marked warm the reserved /.cadish/readyz
+// probe returns 503, so the pod's readiness/startup probe keeps Kubernetes from routing to
+// a not-yet-reconciled pod (no rollout 404). A bare-Applier test fake that does not
+// implement it simply has no warm gate. MarkWarm is idempotent, so calling it on every
+// successful reconcile is safe.
+type Warmer interface {
+	MarkWarm()
+}
+
 // Config tunes the Gateway controller.
 type Config struct {
 	// Namespaces, when non-empty, restricts which namespaces' Gateways/HTTPRoutes are
@@ -66,6 +77,7 @@ type Controller struct {
 	gwcs     gwclient.Interface
 	applier  Applier
 	tlsInj   TLSInjector // nil when the applier cannot accept BYO Secret certs
+	warmer   Warmer      // nil when the applier cannot be marked warm (a bare-Applier test fake)
 	base     string
 	opts     Config
 	debounce time.Duration
@@ -176,7 +188,23 @@ func New(cs kubernetes.Interface, gwcs gwclient.Interface, applier Applier, base
 	if inj, ok := applier.(TLSInjector); ok {
 		c.tlsInj = inj
 	}
+	// The live server can be marked warm-ready after the first reconcile; a bare-Applier
+	// test fake that does not implement Warmer simply has no warm gate.
+	if wm, ok := applier.(Warmer); ok {
+		c.warmer = wm
+	}
 	return c
+}
+
+// markWarm flips the data plane's warm-readiness flag once the routing table reflects the
+// synced cluster state (a successful or no-op reconcile). Idempotent, and a no-op when the
+// applier is not a Warmer. A FAILED reconcile (snapshot error, un-salvageable compile,
+// failed ApplyConfig) returns before this is reached, so the pod stays NOT-ready (503)
+// until a reconcile succeeds — fail-safe.
+func (c *Controller) markWarm() {
+	if c.warmer != nil {
+		c.warmer.MarkWarm()
+	}
 }
 
 // SetLogger overrides the controller's logger (defaults to slog.Default()).
@@ -369,6 +397,12 @@ func (c *Controller) reconcile(ctx context.Context) {
 		c.mu.Unlock()
 		c.log.Info("gateway: applied config", "routes", len(in.Routes), "rejects", len(res.Rejects))
 	}
+
+	// First successful (or no-op) reconcile: the routing table now reflects the synced
+	// cluster state, so mark the data plane warm-ready (idempotent). The failure paths
+	// above (un-salvageable compile, failed ApplyConfig) return before here, so a pod
+	// whose first reconcile fails stays NOT-ready (503) until a reconcile succeeds.
+	c.markWarm()
 
 	// Status is written every reconcile (even on a no-op routing swap) so a status-only
 	// change (e.g. a new GatewayClass) is reflected. Status writing never gates serving.

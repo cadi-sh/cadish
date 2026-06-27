@@ -46,13 +46,28 @@ The IR JSON goes to the file/stdout you choose; the **coverage report goes to st
 
 ```console
 $ cadish edge build -config storefront.cadish -o storefront.edgeir.json
-edge coverage — example.com,*.example.com (IR v1)
+edge coverage — example.com,*.example.com (IR v6)
   edge-native: 21 directive(s)
   delegated:   1 directive(s)
     - purge x1 → pass: purge auth guards compare a SECRET token (the purge token, D12) that must never ship to a public edge worker; delegated to the Cadish server behind
 ```
 
 `-strict` would exit non-zero here, because the config delegates one directive.
+
+### `cadish edge build` fails LOUD when a selecting directive can't be honored
+
+A **selecting** directive — `pass`, `route`, `redirect`, a scoped/`classify`-token `cache_key`,
+`cache_ttl`, `storage`, an `edge {}` tier policy, or `upgrade` — that is scoped by a matcher the
+edge **cannot evaluate** (a server-only Gateway/lb matcher, the **`ip`** ACL, or an untranslatable
+RE2 regex such as `(?U)` / a scoped `(?i:…)` group) cannot be reproduced at the edge. Rather than
+silently mis-decide, the projector **fails open**: it passes ALL traffic for that site (the edge
+caches nothing) and the precise directive runs on the Cadish server behind.
+
+Because that is a major, **silent** capability change for a config that otherwise "builds fine",
+`cadish edge build` exits **non-zero EVEN WITHOUT `-strict`** in this case (the coverage report
+prints a `forced-pass:` line and a `…-FAIL-OPEN` warning naming the directive). Keep that directive
+on the Cadish server behind, or rewrite it so the edge can express it. In particular, an
+**`ip`-scoped** `pass`/`route`/`cache_key` is server-only — the edge has no real-client-IP concept.
 
 ### Secrets never reach the edge
 
@@ -224,16 +239,17 @@ availability stopgap, identical to the server's `writeOnError`.
 
 The `EdgeIR` is a **versioned, serializable** projection of the compiled pipeline — an
 **explicit contract** (not raw internal structs). The JS interpreter mirrors these field
-names 1:1, so they are stable. `irVersion` is `4` (D70 added `key.recipes`, `device`, and
+names 1:1, so they are stable. `irVersion` is `6` (D70 added `key.recipes`, `device`, and
 `response.ttl[].maxStale`; D74 added `site.redirectHosts` + `site.canonicalHost`; D75/D76
-added `response.transforms` + `response.transformMaxBytes` and `response.onError`); the
-runtime refuses a version it does not understand.
+added `response.transforms` + `response.transformMaxBytes` and `response.onError`; v5 added
+`response.ttl[].stripHeaders`; v6 (D101) added `cacheCredentialed`); the runtime refuses a
+version it does not understand.
 
 Top-level shape:
 
 ```jsonc
 {
-  "irVersion": 4,
+  "irVersion": 6,
   "site":     { "hosts": ["example.com", "*.example.com"] },
   "upstream": { "to": "web" },            // default upstream name ("" if none)
 
@@ -403,7 +419,7 @@ Two **guardrails** bound the KV tier (both global, one per block):
   `clamp(ttl+grace, 60s, kv_ttl)` (60s is KV's hard floor). Default `ttl+grace` (no cap).
 - **`kv_max_bytes SIZE`** is a hard size bound: a body larger than it is written to **L1
   only, never KV**, regardless of its `distribute` tier (large media stays out of KV; it
-  still caches per-POP). Default `1MB`; KV's own hard ceiling is 25 MB and a `kv_max_bytes`
+  still caches per-POP). Default `1 MiB`; KV's own hard ceiling is 25 MB and a `kv_max_bytes`
   above it is a build warning.
 
 **Invalidation is TTL-only.** A `purge`/BAN invalidates the cadish **server** and the

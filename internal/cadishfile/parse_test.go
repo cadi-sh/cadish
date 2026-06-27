@@ -55,6 +55,467 @@ func TestParseMultipleAddresses(t *testing.T) {
 	}
 }
 
+// TestParseMultiLineAddresses guards SPEC-MULTILINE-ADDR: a site whose address
+// list spans multiple lines (each wrapped line ending in a trailing comma) must
+// capture EVERY address, not just the last line. Before the dispatcher fix, the
+// earlier lines were silently mis-parsed as top-level statements and only the
+// last line's addresses survived — which registered the static TLS cert for too
+// few domains and caused a production 525 at the live cutover.
+func TestParseMultiLineAddresses(t *testing.T) {
+	src := "a.example.com, *.a.example.com,\nb.example.com, *.b.example.com {\n}\n"
+	f := mustParse(t, src)
+	if len(f.Sites) != 1 {
+		t.Fatalf("sites = %d, want 1 (multi-line address list must be ONE site)", len(f.Sites))
+	}
+	if len(f.Body) != 0 {
+		t.Fatalf("top-level Body = %d, want 0 (no address line may leak into Body): %#v", len(f.Body), f.Body)
+	}
+	want := []string{"a.example.com", "*.a.example.com", "b.example.com", "*.b.example.com"}
+	got := f.Sites[0].Addresses
+	if len(got) != len(want) {
+		t.Fatalf("addresses = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("address %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestParseMultiLineAddressesAfterGlobalBlock ensures a leading global-options
+// block still parses AND the following multi-line-address site captures all
+// addresses — the global "{ ... }" must not be confused with a site header and
+// must not swallow the address lines.
+func TestParseMultiLineAddressesAfterGlobalBlock(t *testing.T) {
+	src := "{\n\tadmin off\n}\na.example.com, *.a.example.com,\nb.example.com {\n\tcache_key url\n}\n"
+	f := mustParse(t, src)
+	if f.Global == nil {
+		t.Fatalf("Global = nil, want the leading options block parsed")
+	}
+	if len(f.Global.Body) != 1 {
+		t.Fatalf("Global.Body = %d, want 1 (admin off)", len(f.Global.Body))
+	}
+	if len(f.Sites) != 1 {
+		t.Fatalf("sites = %d, want 1", len(f.Sites))
+	}
+	want := []string{"a.example.com", "*.a.example.com", "b.example.com"}
+	got := f.Sites[0].Addresses
+	if len(got) != len(want) {
+		t.Fatalf("addresses = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("address %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestParseTopLevelStatementNotAbsorbed ensures the multi-line dispatch fix does
+// NOT mis-absorb a genuine top-level statement (an importable bare directive on
+// its own line) into a following site header. The directive ends with a newline
+// and no trailing comma, so it must stay in Body.
+func TestParseTopLevelStatementNotAbsorbed(t *testing.T) {
+	src := "header_up Host {host}\nexample.com {\n\tcache_key url\n}\n"
+	f := mustParse(t, src)
+	if len(f.Body) != 1 {
+		t.Fatalf("top-level Body = %d, want 1 (the bare directive): %#v", len(f.Body), f.Body)
+	}
+	d, ok := f.Body[0].(*Directive)
+	if !ok || d.Name != "header_up" {
+		t.Fatalf("Body[0] = %#v, want directive header_up", f.Body[0])
+	}
+	if len(f.Sites) != 1 || len(f.Sites[0].Addresses) != 1 || f.Sites[0].Addresses[0] != "example.com" {
+		t.Fatalf("sites = %#v, want one site [example.com]", f.Sites)
+	}
+}
+
+// TestParseTrailingCommaDirectiveNotAbsorbed (Finding 2) guards that a top-level
+// directive whose LAST argument happens to end in a comma is NOT mistaken for a
+// wrapped address list and absorbed into the following site header. Only a bare
+// address-shaped run may continue across a newline on a trailing comma.
+func TestParseTrailingCommaDirectiveNotAbsorbed(t *testing.T) {
+	src := "header_down X-Foo bar,\nexample.com {\n\tcache_key url\n}\n"
+	f := mustParse(t, src)
+	if len(f.Body) != 1 {
+		t.Fatalf("top-level Body = %d, want 1 (the header_down directive): %#v", len(f.Body), f.Body)
+	}
+	d, ok := f.Body[0].(*Directive)
+	if !ok || d.Name != "header_down" {
+		t.Fatalf("Body[0] = %#v, want directive header_down", f.Body[0])
+	}
+	if len(f.Sites) != 1 || len(f.Sites[0].Addresses) != 1 || f.Sites[0].Addresses[0] != "example.com" {
+		t.Fatalf("sites = %#v, want one site [example.com]", f.Sites)
+	}
+}
+
+// TestParseQuotedCommaNotContinued (Finding 2) guards that a QUOTED arg ending in a
+// comma (content, never an address separator) does not continue the address run.
+func TestParseQuotedCommaNotContinued(t *testing.T) {
+	src := "respond \"hi,\"\nexample.com {\n\tcache_key url\n}\n"
+	f := mustParse(t, src)
+	if len(f.Body) != 1 {
+		t.Fatalf("top-level Body = %d, want 1 (the respond directive): %#v", len(f.Body), f.Body)
+	}
+	d, ok := f.Body[0].(*Directive)
+	if !ok || d.Name != "respond" {
+		t.Fatalf("Body[0] = %#v, want directive respond", f.Body[0])
+	}
+	if len(f.Sites) != 1 || len(f.Sites[0].Addresses) != 1 || f.Sites[0].Addresses[0] != "example.com" {
+		t.Fatalf("sites = %#v, want one site [example.com]", f.Sites)
+	}
+}
+
+// TestParseUnseparatedMultiLineAddressesError (Finding 3) guards that a comma-LESS
+// multi-line site-address list (a wrapped header missing its trailing commas — the
+// silent-525 outage shape) is a LOUD positioned parse error, not a silently
+// truncated 1-address site.
+func TestParseUnseparatedMultiLineAddressesError(t *testing.T) {
+	src := "a.example.com\nb.example.com {\n\tcache_key url\n}\n"
+	_, err := Parse("f.cadish", []byte(src))
+	if err == nil {
+		t.Fatalf("expected a parse error for the comma-less multi-line address list, got nil")
+	}
+	if !strings.Contains(err.Error(), "comma") {
+		t.Fatalf("error = %q, want it to mention comma-separating wrapped addresses", err.Error())
+	}
+	pe, ok := err.(*ParseError)
+	if !ok {
+		t.Fatalf("error type = %T, want *ParseError", err)
+	}
+	if pe.Line != 1 {
+		t.Errorf("error line = %d, want 1 (the first dropped address)", pe.Line)
+	}
+}
+
+// TestParseCommaFirstSpaceWrappedAddressesError (Finding 1, HIGH) guards the
+// comma-on-first-address + space-separated wrap shape:
+//
+//	example.com, www.example.com
+//	api.example.com {
+//	  reverse_proxy backend:8080
+//	}
+//
+// The first line comma-separates its first address but the LAST word on the line
+// (www.example.com) carries NO trailing comma, so startsSiteBlock's
+// comma-after-every-element continuation abstains. Before the fix
+// unseparatedAddrWrap ALSO abstained — it short-circuited on the first word's
+// trailing comma — so the line fell through to a bogus top-level Body directive and
+// example.com / www.example.com were SILENTLY dropped; the static TLS cert then
+// covered too few hosts (the SNI/525 outage). It must instead be a LOUD positioned
+// parse error.
+func TestParseCommaFirstSpaceWrappedAddressesError(t *testing.T) {
+	src := "example.com, www.example.com\napi.example.com {\n\treverse_proxy backend:8080\n}\n"
+	_, err := Parse("f.cadish", []byte(src))
+	if err == nil {
+		t.Fatalf("expected a parse error for the comma-first space-wrapped address list, got nil (silent address drop)")
+	}
+	if !strings.Contains(err.Error(), "comma") {
+		t.Fatalf("error = %q, want it to mention comma-separating wrapped addresses", err.Error())
+	}
+	pe, ok := err.(*ParseError)
+	if !ok {
+		t.Fatalf("error type = %T, want *ParseError", err)
+	}
+	if pe.Line != 1 {
+		t.Errorf("error line = %d, want 1 (the first dropped address)", pe.Line)
+	}
+}
+
+// TestParseSingleLabelWrappedAddress (Finding 1, HIGH) guards that a comma-wrapped
+// multi-line site header whose NON-LAST line is a bare single-label host (a valid
+// cadish site/listen address — see config/addr.go) captures EVERY address. A prior
+// allAddrShaped gate rejected single-label hosts as "not address-shaped", refused to
+// cross the trailing-comma newline, and silently dropped the earlier line(s) as no-op
+// top-level statements — re-introducing the silent last-line-only truncation / 525
+// shape. The trailing comma is the address-list continuation signal regardless of
+// label count.
+func TestParseSingleLabelWrappedAddress(t *testing.T) {
+	f := mustParse(t, "intranet,\nexample.com {\n\tcache_key url\n}\n")
+	if len(f.Sites) != 1 {
+		t.Fatalf("sites = %d, want 1 (single-label wrapped header must be ONE site)", len(f.Sites))
+	}
+	if len(f.Body) != 0 {
+		t.Fatalf("top-level Body = %d, want 0 (no address line may leak into Body): %#v", len(f.Body), f.Body)
+	}
+	want := []string{"intranet", "example.com"}
+	got := f.Sites[0].Addresses
+	if len(got) != len(want) {
+		t.Fatalf("addresses = %v, want %v (intranet must NOT be silently lost)", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("address %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestParseSingleLabelMidWrappedAddress (Finding 1, HIGH) guards a single-label host
+// in the MIDDLE of a comma-wrapped run: a.example.com,\nintranet,\nexample.com {…}
+// must yield all three addresses with nothing leaked to Body.
+func TestParseSingleLabelMidWrappedAddress(t *testing.T) {
+	f := mustParse(t, "a.example.com,\nintranet,\nexample.com {\n}\n")
+	if len(f.Sites) != 1 {
+		t.Fatalf("sites = %d, want 1", len(f.Sites))
+	}
+	if len(f.Body) != 0 {
+		t.Fatalf("top-level Body = %d, want 0: %#v", len(f.Body), f.Body)
+	}
+	want := []string{"a.example.com", "intranet", "example.com"}
+	got := f.Sites[0].Addresses
+	if len(got) != len(want) {
+		t.Fatalf("addresses = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("address %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestParseSpaceSeparatedWrappedAddressError (HIGH, silent) guards the
+// space-separated wrapped-address hole: a wrapped (non-final) site-header line whose
+// 2+ whitespace-separated addresses end with only the LAST token carrying a "," —
+// `example.com www.example.com,\napi.example.com {…}`. The conservative continuation
+// rule (comma after EVERY element) correctly refuses to claim this as a site, but the
+// earlier addresses must NOT silently leak into top-level Body (the silent-525 hole):
+// they must produce a LOUD positioned parse error instead.
+func TestParseSpaceSeparatedWrappedAddressError(t *testing.T) {
+	src := "example.com www.example.com,\napi.example.com {\n\tcache_key url\n}\n"
+	_, err := Parse("f.cadish", []byte(src))
+	if err == nil {
+		t.Fatalf("expected a loud parse error for the space-separated wrapped address list, got nil (addresses silently dropped into Body)")
+	}
+	if !strings.Contains(err.Error(), "comma") {
+		t.Fatalf("error = %q, want it to mention comma-separating wrapped addresses", err.Error())
+	}
+	pe, ok := err.(*ParseError)
+	if !ok {
+		t.Fatalf("error type = %T, want *ParseError", err)
+	}
+	if pe.Line != 1 {
+		t.Errorf("error line = %d, want 1 (the first dropped address)", pe.Line)
+	}
+}
+
+// TestParseStandaloneCommaWrappedAddressError guards the standalone-comma wrap form
+// `a.example.com ,\nb.example.com {…}`: the first line's address must not be silently
+// dropped — it must be a loud positioned error (or a correct full parse), never a
+// silent Body directive.
+func TestParseStandaloneCommaWrappedAddressError(t *testing.T) {
+	src := "a.example.com ,\nb.example.com {\n\tcache_key url\n}\n"
+	f, err := Parse("f.cadish", []byte(src))
+	if err != nil {
+		// Loud error path: acceptable.
+		if !strings.Contains(err.Error(), "comma") {
+			t.Fatalf("error = %q, want it to mention comma", err.Error())
+		}
+		return
+	}
+	// Full-parse path: both addresses must be captured, nothing leaked to Body.
+	if len(f.Body) != 0 {
+		t.Fatalf("top-level Body = %d, want 0 (no address may silently leak): %#v", len(f.Body), f.Body)
+	}
+	if len(f.Sites) != 1 || len(f.Sites[0].Addresses) != 2 {
+		t.Fatalf("sites = %#v, want one site with both addresses", f.Sites)
+	}
+}
+
+// TestParseTopLevelDirectiveWithDottedArgsNotErrored guards that a real top-level
+// directive whose args happen to be dotted (`tls cert.example.com key.pem`) before a
+// site is NOT mistaken for a mis-wrapped address list: it begins with a bare directive
+// NAME (no dot), so it must stay a statement, never a false error.
+func TestParseTopLevelDirectiveWithDottedArgsNotErrored(t *testing.T) {
+	src := "tls cert.example.com key.pem\nexample.com {\n\tcache_key url\n}\n"
+	f := mustParse(t, src)
+	if len(f.Body) != 1 {
+		t.Fatalf("top-level Body = %d, want 1 (the tls directive): %#v", len(f.Body), f.Body)
+	}
+	d, ok := f.Body[0].(*Directive)
+	if !ok || d.Name != "tls" {
+		t.Fatalf("Body[0] = %#v, want directive tls", f.Body[0])
+	}
+	if len(f.Sites) != 1 || len(f.Sites[0].Addresses) != 1 || f.Sites[0].Addresses[0] != "example.com" {
+		t.Fatalf("sites = %#v, want one site [example.com]", f.Sites)
+	}
+}
+
+// TestParsePortFirstUnseparatedWrapError (Finding 2, MED) guards the comma-less wrap
+// whose FIRST element is a bare `:port` listen form (`:8080`) — one of the most common
+// cadish/Caddy address shapes. The prior `clearlyHostnameShaped` gate returned true only
+// for a dotted host or "localhost", so a `:port` first word made unseparatedAddrWrap
+// ABSTAIN → the first address was silently parsed as a no-op top-level Body directive and
+// the site bound only `example.com` (a lost/narrowed listener that passed `cadish check`
+// with no diagnostic). It must be a LOUD positioned parse error.
+func TestParsePortFirstUnseparatedWrapError(t *testing.T) {
+	src := ":8080\nexample.com {\n\tcache_key url\n}\n"
+	_, err := Parse("f.cadish", []byte(src))
+	if err == nil {
+		t.Fatalf("expected a loud parse error for the comma-less `:port` wrap, got nil (listener silently dropped)")
+	}
+	if !strings.Contains(err.Error(), "comma") {
+		t.Fatalf("error = %q, want it to mention comma-separating wrapped addresses", err.Error())
+	}
+	pe, ok := err.(*ParseError)
+	if !ok {
+		t.Fatalf("error type = %T, want *ParseError", err)
+	}
+	if pe.Line != 1 {
+		t.Errorf("error line = %d, want 1 (the first dropped address)", pe.Line)
+	}
+}
+
+// TestParseIPv6FirstUnseparatedWrapError (Finding 2, MED) guards the comma-less wrap
+// whose FIRST element is a bracketed IPv6 literal (`[::1]:8080`): same silent-drop hole
+// as the `:port` shape — a directive name can never begin with "[", so failing it loudly
+// is false-positive-safe.
+func TestParseIPv6FirstUnseparatedWrapError(t *testing.T) {
+	src := "[::1]:8080\nexample.com {\n\tcache_key url\n}\n"
+	_, err := Parse("f.cadish", []byte(src))
+	if err == nil {
+		t.Fatalf("expected a loud parse error for the comma-less `[IPv6]:port` wrap, got nil (listener silently dropped)")
+	}
+	if !strings.Contains(err.Error(), "comma") {
+		t.Fatalf("error = %q, want it to mention comma-separating wrapped addresses", err.Error())
+	}
+	pe, ok := err.(*ParseError)
+	if !ok {
+		t.Fatalf("error type = %T, want *ParseError", err)
+	}
+	if pe.Line != 1 {
+		t.Errorf("error line = %d, want 1 (the first dropped address)", pe.Line)
+	}
+}
+
+// TestParsePortIPv6CommaWrapStillParsesBoth (Finding 2 regression) confirms the
+// comma-TERMINATED variants of the same shapes still parse BOTH addresses as one site —
+// the broadened loud-error trigger must not over-fire on a correctly comma-separated
+// wrapped list.
+func TestParsePortIPv6CommaWrapStillParsesBoth(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		src  string
+		want []string
+	}{
+		{"port", ":8080,\nexample.com {\n\tcache_key url\n}\n", []string{":8080", "example.com"}},
+		{"ipv6", "[::1]:8080,\nexample.com {\n}\n", []string{"[::1]:8080", "example.com"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := mustParse(t, tc.src)
+			if len(f.Sites) != 1 || len(f.Body) != 0 {
+				t.Fatalf("sites=%d body=%d, want 1/0 (both addresses one site, nothing leaked)", len(f.Sites), len(f.Body))
+			}
+			got := f.Sites[0].Addresses
+			if len(got) != len(tc.want) {
+				t.Fatalf("addresses = %v, want %v", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("address %d = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestParseDotlessHostPortUnseparatedWrapError (Finding 4) guards the comma-less wrap
+// whose FIRST element is a DOT-LESS `host:port` (`cache:6081`, `localhost:8080`): the
+// colon makes it unambiguously an address (no directive name can contain ":"), so a
+// forgotten comma before the next address header must fail LOUDLY instead of silently
+// dropping the leading listener.
+func TestParseDotlessHostPortUnseparatedWrapError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		src  string
+	}{
+		{"named-host-port", "cache:6081\nexample.com {\n\tcache_key url\n}\n"},
+		{"localhost-port", "localhost:8080\nexample.com {\n\tcache_key url\n}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse("f.cadish", []byte(tc.src))
+			if err == nil {
+				t.Fatalf("expected a loud parse error for the comma-less dot-less host:port wrap, got nil (listener silently dropped)")
+			}
+			if !strings.Contains(err.Error(), "comma") {
+				t.Fatalf("error = %q, want it to mention comma-separating wrapped addresses", err.Error())
+			}
+			pe, ok := err.(*ParseError)
+			if !ok {
+				t.Fatalf("error type = %T, want *ParseError", err)
+			}
+			if pe.Line != 1 {
+				t.Errorf("error line = %d, want 1 (the first dropped address)", pe.Line)
+			}
+		})
+	}
+}
+
+// TestParseDotlessHostPortCommaWrapStillParsesBoth (Finding 4 regression) confirms the
+// comma-TERMINATED variant still parses BOTH addresses as one site — the broadened
+// trigger must not over-fire on a correctly comma-separated wrap.
+func TestParseDotlessHostPortCommaWrapStillParsesBoth(t *testing.T) {
+	f := mustParse(t, "cache:6081,\nexample.com {\n}\n")
+	if len(f.Sites) != 1 || len(f.Body) != 0 {
+		t.Fatalf("sites=%d body=%d, want 1/0 (both addresses one site)", len(f.Sites), len(f.Body))
+	}
+	want := []string{"cache:6081", "example.com"}
+	got := f.Sites[0].Addresses
+	if len(got) != len(want) {
+		t.Fatalf("addresses = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("address %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestParseSemicolonSeparatedAddressWrapError (Finding 5) guards the silent drop when an
+// address-shaped leading run terminates at a `;` statement separator immediately before
+// an address header (`example.com; api.example.com {…}`). The `;` breaks the address-run
+// walk just like a newline, so the loud comma-less-wrap error must also fire there rather
+// than dropping the leading `example.com` listener.
+func TestParseSemicolonSeparatedAddressWrapError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		src  string
+	}{
+		{"semicolon-same-line", "example.com; api.example.com {\n}\n"},
+		{"semicolon-then-newline", "example.com;\napi.example.com {\n}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse("f.cadish", []byte(tc.src))
+			if err == nil {
+				t.Fatalf("expected a loud parse error for the `;`-separated address wrap, got nil (listener silently dropped)")
+			}
+			if !strings.Contains(err.Error(), "comma") {
+				t.Fatalf("error = %q, want it to mention comma-separating wrapped addresses", err.Error())
+			}
+			pe, ok := err.(*ParseError)
+			if !ok {
+				t.Fatalf("error type = %T, want *ParseError", err)
+			}
+			if pe.Line != 1 {
+				t.Errorf("error line = %d, want 1 (the first dropped address)", pe.Line)
+			}
+		})
+	}
+}
+
+// TestParseSingleLineAddressesUnchanged is a guard that the common single-line
+// case (the overwhelming majority of real configs) parses identically after the
+// dispatcher change.
+func TestParseSingleLineAddressesUnchanged(t *testing.T) {
+	f := mustParse(t, "a.example.com, *.a.example.com, b.example.com {\n}\n")
+	if len(f.Sites) != 1 || len(f.Body) != 0 {
+		t.Fatalf("sites=%d body=%d, want 1/0", len(f.Sites), len(f.Body))
+	}
+	want := []string{"a.example.com", "*.a.example.com", "b.example.com"}
+	got := f.Sites[0].Addresses
+	if len(got) != len(want) {
+		t.Fatalf("addresses = %v, want %v", got, want)
+	}
+}
+
 func TestParseMatcherDef(t *testing.T) {
 	f := mustParse(t, `x {
     @nocache path /a/* /b/*
@@ -326,6 +787,38 @@ func TestSubstituteEnv(t *testing.T) {
 	}
 }
 
+// TestSubstituteEnvInQuotedString is the R07 regression: a QUOTED env span "{$VAR}"
+// must be substituted. A quoted token is ArgLiteral, so it was previously skipped by
+// SubstituteEnv entirely — `auth_token "{$ADMIN_TOKEN}"` loaded the LITERAL text as a
+// predictable bearer token (fail-open vs the unquoted form). It must substitute (and
+// fail closed to "" when unset), while a quoted RUNTIME placeholder "{device}" — not an
+// env span — stays an inert literal (quoting still suppresses runtime placeholders).
+func TestSubstituteEnvInQuotedString(t *testing.T) {
+	f := mustParse(t, "x {\n auth_token \"{$TOK}\" \"{$MISSING}\" \"{device}\" \"plain\"\n}\n")
+	SubstituteEnv(f, func(name string) (string, bool) {
+		if name == "TOK" {
+			return "secret123", true
+		}
+		return "", false
+	})
+	d := f.Sites[0].Body[0].(*Directive)
+	if d.Args[0].Raw != "secret123" {
+		t.Errorf("quoted env arg = %q, want secret123 (R07: a quoted {$VAR} must substitute, not load literally)", d.Args[0].Raw)
+	}
+	if d.Args[0].Kind != ArgLiteral {
+		t.Errorf("quoted env arg kind = %v, want literal", d.Args[0].Kind)
+	}
+	if d.Args[1].Raw != "" {
+		t.Errorf("unset quoted env arg = %q, want \"\" (fail closed, not the literal {$MISSING})", d.Args[1].Raw)
+	}
+	if d.Args[2].Raw != "{device}" {
+		t.Errorf("quoted runtime placeholder = %q, want untouched {device} (only {$ENV} spans expand in quotes)", d.Args[2].Raw)
+	}
+	if d.Args[3].Raw != "plain" {
+		t.Errorf("quoted plain = %q, want plain", d.Args[3].Raw)
+	}
+}
+
 func TestSubstituteEnvUnset(t *testing.T) {
 	f := mustParse(t, "x {\n a {$MISSING}b\n}\n")
 	SubstituteEnv(f, func(string) (string, bool) { return "", false })
@@ -383,5 +876,104 @@ func TestDirectiveRegistry(t *testing.T) {
 	}
 	if len(r.Names()) == 0 {
 		t.Error("Names() should be non-empty")
+	}
+}
+
+// TestParseSingleLabelFirstWrapParsesNoError (Finding R12) documents that a bare
+// single-label FIRST word in a comma-less wrap (`intranet`\n`api.internal {`) is NOT a
+// hard parse error: a dot-less label is shape-indistinguishable from a directive name
+// (a single-label directive followed by a single-label site formats to the identical
+// shape, so erroring would break the Format round-trip — proven by FuzzParse). It parses
+// with `intranet` as a no-op top-level Body statement; the silent-drop is surfaced one
+// layer up, by the `cadish check` `noop-top-level-statement` warning (see internal/check).
+func TestParseSingleLabelFirstWrapParsesNoError(t *testing.T) {
+	f := mustParse(t, "intranet\napi.internal {\n\tcache_key url\n}\n")
+	if len(f.Sites) != 1 || f.Sites[0].Addresses[0] != "api.internal" {
+		t.Fatalf("sites = %#v, want one site [api.internal]", f.Sites)
+	}
+	// `intranet` lands as a stray top-level Body statement (the drop check warns on it).
+	if len(f.Body) != 1 {
+		t.Fatalf("top-level Body = %d, want 1 (the dropped `intranet`): %#v", len(f.Body), f.Body)
+	}
+}
+
+// TestParseSingleLabelDirectiveNotFalseFlagged is the R12 NON-regression guard: a bona
+// fide single-word top-level directive followed by a site block (multi-word run, or a
+// directive whose line does not precede an address header) must NOT be flagged. The
+// existing `header_down X-Foo bar,` case (TestParseTrailingCommaDirectiveNotAbsorbed)
+// covers the multi-word run; this pins that a single bare word that is NOT immediately
+// before an address header still parses as a top-level directive.
+func TestParseSingleLabelDirectiveNotFalseFlagged(t *testing.T) {
+	// `metrics` directive on its own line, then a blank line, then a NON-address-header
+	// statement context: the following is a real top-level statement, not a wrapped site.
+	src := "metrics\nheader_down X-Foo\nexample.com {\n\tcache_key url\n}\n"
+	f := mustParse(t, src)
+	if len(f.Sites) != 1 || f.Sites[0].Addresses[0] != "example.com" {
+		t.Fatalf("sites = %#v, want one site [example.com]", f.Sites)
+	}
+	// `metrics` and `header_down` must both survive as top-level directives, not error.
+	if len(f.Body) != 2 {
+		t.Fatalf("top-level Body = %d, want 2 (metrics + header_down): %#v", len(f.Body), f.Body)
+	}
+}
+
+// TestParseSingleLeadingTokenRoundTrips (FuzzParse `.;;0{ }`) pins the Parse/Format
+// symmetry for a SINGLE lone leading address-shaped token followed by a degenerate site
+// header whose own address is merely token-shaped (a bare digit/label such as `0`, NOT
+// clearly hostname-shaped). Such a leading token is accepted as a no-op top-level Body
+// directive (later flagged by `cadish check`), so Parse must NOT hard-error it — and its
+// Format output must re-Parse identically. Before the fix Parse accepted `.;;0{ }`
+// (`.` a Body directive, `0 { }` a site) yet its Format `.\n0 {` re-parsed as a
+// comma-less address wrap and ERRORED — an internal Parse/Format asymmetry.
+func TestParseSingleLeadingTokenRoundTrips(t *testing.T) {
+	for _, in := range []string{
+		".;;0{ }",
+		".\n0 {\n}\n",
+		"localhost\n0 {\n}\n",
+		"[::1]\n0 {\n}\n",
+		"host:80\n0 {\n}\n",
+	} {
+		// Parse must accept it (no loud error).
+		if _, err := Parse("rt.cadish", []byte(in)); err != nil {
+			t.Errorf("Parse(%q) errored, want accepted as no-op Body directive + site: %v", in, err)
+			continue
+		}
+		// Format(Parse(x)) must be idempotent: re-Format of the output must not error.
+		out, ferr := Format([]byte(in))
+		if ferr != nil {
+			t.Errorf("Format(%q) errored: %v", in, ferr)
+			continue
+		}
+		out2, ferr2 := Format(out)
+		if ferr2 != nil {
+			t.Errorf("re-Format of formatted %q errored (round-trip break): %v", out, ferr2)
+			continue
+		}
+		if string(out) != string(out2) {
+			t.Errorf("Format not idempotent for %q:\n once: %q\n twice: %q", in, out, out2)
+		}
+	}
+}
+
+// TestParseMultiWordWrapStillLoud is the non-regression twin of the round-trip fix: a
+// genuine comma-LESS wrap of TWO clearly hostname-shaped addresses must STILL be a loud
+// positioned error — whether the writer separated the run with a newline OR with one or
+// more ";" (Finding 5). The detector treats ";" and newline identically so Format (which
+// normalizes separators to newlines) can never move such an input across the boundary.
+func TestParseMultiWordWrapStillLoud(t *testing.T) {
+	for _, in := range []string{
+		"a.com\nb.com {\n}\n",
+		"a.com;b.com {\n}\n",
+		"a.com ;; b.com {\n}\n",
+		"a.com;;b.com;;c.com {\n}\n",
+	} {
+		_, err := Parse("loud.cadish", []byte(in))
+		if err == nil {
+			t.Errorf("Parse(%q) accepted, want a loud comma-separate error (silent address drop)", in)
+			continue
+		}
+		if !strings.Contains(err.Error(), "comma") {
+			t.Errorf("Parse(%q) error = %q, want it to mention comma-separating", in, err.Error())
+		}
 	}
 }

@@ -37,11 +37,11 @@ when there are errors or a parse failure. Parse/import errors are printed as
 cadish check — test/migration/storefront/Cadishfile
 
 Site: example.com, *.example.com
-  Matchers:               5
+  Matchers:               6
   Directives:             28
-  Regex evals / request:  4   (path_regex/host_regex/regex-valued header on the hot path)
+  Regex evals / request:  3   (path_regex/host_regex/regex-valued header on the hot path)
   Directives by phase:    SETUP 5  RECV 6  KEY 1  ORIGIN 7  DELIVER 9
-  Est. per-request cost:  50   (6 exact×1 + 2 glob×2 + 4 regex×10)
+  Est. per-request cost:  41   (7 exact×1 + 2 glob×2 + 3 regex×10)
   Suggestions:
     • good: @nocache collapses 24 paths into one matcher (a single set/trie lookup, not 24 compares)
 
@@ -71,8 +71,8 @@ Directives grouped by the lifecycle phase in which they run:
 
 | Phase | When | Directives |
 |---|---|---|
-| `SETUP` | parsed once, not per request | `tls`, `cache`, `cache_unsafe`, `upstream`, `cluster`, `origin`, `lb`, `sticky`, `host_header`, `sni`, `http_reuse`, `import`, `device_detect`, `geo`, `trust_proxy`, `normalize`, `tenant`, `classify`, `edge`, `access_log`, `strict_host`, `admin`, `proxy_protocol`, `security`, `monitor` |
-| `RECV` | on receiving the request | `respond`, `redirect`, `rewrite`, `purge`, `route`, `pass`, `allow`, `deny`, `block`, `rate_limit` |
+| `SETUP` | parsed once, not per request | `tls`, `cache`, `cache_unsafe`, `client_cache_control`, `upstream`, `cluster`, `origin`, `lb`, `sticky`, `host_header`, `sni`, `http_reuse`, `tls_insecure`, `ca_file`, `alpn`, `resolve`, `import`, `device_detect`, `geo`, `trust_proxy`, `normalize`, `tenant`, `classify`, `edge`, `access_log`, `strict_host`, `admin`, `proxy_protocol`, `server`, `security`, `monitor` |
+| `RECV` | on receiving the request | `respond`, `redirect`, `rewrite`, `purge`, `route`, `pass`, `upgrade`, `allow`, `deny`, `block`, `rate_limit`, `cookie_allow`, `cache_credentialed` |
 | `KEY` | building the cache key | `cache_key` |
 | `ORIGIN` | on a miss, against the origin response | `cache_ttl`, `storage` |
 | `DELIVER` | just before responding | `header`, `strip_cookies`, `cors`, `replace`, `encode` |
@@ -115,6 +115,12 @@ Findings are `warning`s (advisory) or `error`s (fail the check). Each carries a
 | `cache-key-no-default` | A site mixes scoped `cache_key` rules but has no `default` / unscoped catch-all, so some requests would resolve to no key. |
 | `unbounded-key-token` | A `cache_key` keys on a raw, high-cardinality value (`header:NAME`, the whole `query`, `{sticky}`) → cache fragmentation. |
 | `ip-acl-without-trust-proxy` / `sni-without-https` / `geo-unconfigured` | Config-hygiene warnings: an `ip` ACL with no `trust_proxy`, `sni` on a non-HTTPS upstream, or a `{geo}` token with no `geo` source. |
+| `unused-normalize-token` | A `normalize NAME { … }` bucket is defined but its `{NAME}` token is used in no `cache_key` recipe — the bucket is computed for nothing and the cache silently does not vary on it. Key it (`cache_key … {NAME}`) or remove the block. |
+| `unused-device-detect` | A `device_detect { … }` block is configured but no `cache_key` recipe keys on `{device}` — the device classifier is computed for nothing, so the cache silently does not segment by device class. Key it (`cache_key … {device}`) or remove the block. |
+| `acme-host-unissuable` | A site requests automatic TLS (`tls acme`) for an address a public ACME CA can never issue for — an IP literal, `localhost`, a single-label dotless name, or a reserved special-use TLD (`.local`/`.localhost`/`.test`/`.invalid`/`.example`/`.internal`). It checks clean but silently never serves TLS (the challenge fails only at the first handshake). Use a static `tls { cert … key … }`, `tls off`, or a public DNS name. |
+| `upstream-healthy-non-pool` | An `upstream_healthy NAME` matcher names an upstream that does not build as a load-balancer pool (a trivial single-backend `upstream`, or an `s3`/`sign` origin) — it has no active health probe, so the matcher always reports it healthy and can never detect it down. Add a `health { … }` block to actively track it. |
+| `noop-top-level-statement` | A directive or `@matcher` sits at the top level OUTSIDE any site block while site blocks are present — it never runs (cadish builds pipelines per site). Often a site-address list that lost a comma and dropped an address into the top-level body (e.g. `intranet` then `api.internal {`); comma-separate the addresses, or move the statement into the right site. |
+| `default-key-omits-query` | A site caches (`cache_ttl`) but defines no `cache_key`, so the default key `method host path` ignores the query string — `/api?id=1` and `/api?id=2` collide on one entry (Varnish hashed the query by default). Add `cache_key … query` (or `query_allow …`) if responses vary by query; safe to ignore for query-independent content. |
 | `invalid-duration` / `invalid-size` / `invalid-upstream-url` / `invalid-listen` / `invalid-geo-source` | A directive argument is malformed (bad duration, byte size, URL, listen address, or geo source). |
 | `compile-error` | The site lints clean at the AST level but fails to **compile** into the runtime pipeline — i.e. it would refuse to `cadish run` (e.g. `undefined matcher @x`, `classify value must be non-empty`, `pass needs a matcher or condition`). `check` compiles every site and surfaces the compiler's own `file:line:col`, so "passes check ⇒ will boot" holds. (error) |
 | `build-error` | The site compiles but fails the **structural config build** `cadish run` performs — a site with no `upstream` to fetch from, a duplicate `upstream`/`cluster` name, an `origin chain` referencing an undeclared upstream, or a malformed `sticky` line. Carries the same `file:line:col` `run` would print. (error) |

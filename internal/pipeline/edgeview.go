@@ -76,6 +76,17 @@ type EdgeClassifier struct {
 	Rows      []EdgeClassifyRow
 	Default   string
 	Synthetic map[string]EdgeMatcher
+	// DerivesFrom names the request cookies this axis consumes (`derives_from cookie
+	// NAME…`). The edge worker keeps them through cookie_allow so the classifier reads
+	// the original value and the key is built from it, then strips them post-key before
+	// the credential bypass + origin fetch — the SAME derive→strip the server performs,
+	// so the two runtimes collapse cardinality identically. nil when none declared.
+	DerivesFrom []string
+	// DerivesForward is the SUBSET of DerivesFrom declared `forward` (alias `keep`): the
+	// worker FORWARDS these to origin unchanged (does NOT strip) and treats them as covered
+	// by {TOKEN} in the credential bypass — the same forward-mode the server applies, so the
+	// edge and origin agree. nil when no row uses the modifier.
+	DerivesForward []string
 }
 
 // EdgeClassifyRow is one `when @a @b -> VALUE` row: the matcher names (AND) and the
@@ -120,12 +131,13 @@ type EdgeKeyRecipe struct {
 // EdgeKeyToken is the neutral view of one cache_key token.
 type EdgeKeyToken struct {
 	// Kind is a stable string token name the JS interpreter switches on:
-	//   method|host|path|url|query|query_allow|header|sticky|device|geo|
+	//   method|host|path|url|query|query_allow|query_strip|header|sticky|device|geo|
 	//   geo.continent|geo.region|normalize|classify|tenant|literal
 	Kind  string
 	Arg   string   // header name (header), literal text (literal), constant tenant
 	Ref   string   // normalize/classify: the referenced definition name
 	Allow []string // query_allow: the param-name allowlist (exact + globs)
+	Deny  []string // query_strip: the param-name denylist (exact + globs)
 }
 
 // EdgeScope is the neutral view of a directive scope: an OR set of matcher NAMES.
@@ -159,12 +171,16 @@ type EdgeRespond struct {
 	Body   string
 }
 
-// EdgeRedirect is a compiled redirect rule. Exactly one of Regex / Scope selects.
+// EdgeRedirect is a compiled redirect rule. Regex and/or Scope select: the
+// regex-only and scope-only forms set exactly one; the combined scope+regex form
+// sets BOTH (HasScope true AND a non-empty Regex), and the rule fires only when the
+// scope matches AND the regex matches the path.
 type EdgeRedirect struct {
-	Regex  string    // path-regex form: the RE2 source ("" in the scoped form)
-	Scope  EdgeScope // scoped form (Always=false, the selecting scope)
-	Status int
-	Target string // template: {host}/{path}/{query}/{uri} (+ $0..$9 in the regex form)
+	Regex    string    // path-regex selector: the RE2 source ("" when there is no path regex)
+	HasScope bool      // true when Scope is a real selector (scope-only or combined form)
+	Scope    EdgeScope // the selecting scope (valid only when HasScope)
+	Status   int
+	Target   string // template: {host}/{path}/{query}/{uri} (+ $0..$9 when Regex is set)
 }
 
 // EdgePurge is a compiled purge guard.
@@ -190,14 +206,32 @@ type EdgeTTL struct {
 	HitForMiss time.Duration
 	IsHFM      bool
 	FromHeader string // origin response header to read the TTL from ("" => static TTL)
+	// GraceFromHeader / MaxStaleFromHeader name origin response headers the grace /
+	// max_stale window is read from per-response ("" => the static Grace / MaxStale
+	// above is used). The literal stays as the fallback when the header is
+	// absent/unparseable; the worker mirrors the server's resolveGraceMaxStale.
+	GraceFromHeader    string
+	MaxStaleFromHeader string
+	// RespHeader is an optional RESPONSE-phase `resp_header NAME VALUE` term ANDed in
+	// front of the selector (SelKind/Codes/Scope): the rule applies only when the origin
+	// response carries the named header value. nil for every rule that does not name
+	// resp_header. The worker evaluates it before the kind selector, mirroring the server.
+	RespHeader *EdgeMatcher
+	// StripHeaders names the from_header-family control headers this rule CONSUMES from
+	// the origin response (X-Cache-Ttl/X-Cache-Grace/X-Cache-Max-Stale, whichever are
+	// configured). The worker removes them before store + deliver, exactly as the server
+	// does (handler.go), so the internal origin↔cache contract never leaks to the client.
+	// nil for a plain rule that sources nothing from a header (the common case).
+	StripHeaders []string
 }
 
 // EdgeStorage is a compiled storage tier rule.
 type EdgeStorage struct {
-	SelKind string // status_in|status_not_in|scope|default
-	Codes   []int
-	Scope   EdgeScope
-	Tier    string // ram|disk
+	SelKind    string // status_in|status_not_in|scope|default
+	Codes      []int
+	Scope      EdgeScope
+	Tier       string       // ram|disk
+	RespHeader *EdgeMatcher // optional response-phase resp_header AND-term (see EdgeTTL.RespHeader)
 }
 
 // EdgeCORS is the neutral view of a cors rule.
@@ -287,16 +321,20 @@ func (p *Pipeline) EdgeTenantConstant() string { return p.tenant }
 // EdgeMatchers returns every NAMED matcher, keyed by name, as a neutral view.
 // Anonymous inline matchers (name == "") are not included here — they surface
 // inside the scope that owns them.
+//
+// The `ip` ACL matcher resolves the trusted-proxy real client IP (decision #16), which the
+// edge has no concept of, so it is projected as a SERVER-ONLY matcher (Kind "ip" → projectMatcher
+// marks ServerOnly) rather than SKIPPED (R02). It was previously dropped on the assumption it is
+// "only referenced by the security gate" — but `ip` is a GENERAL request-phase matcher that can
+// scope ANY directive (`pass @internal_ips`, `cache_key @internal …`, `route @office …`). Skipping
+// it left a DANGLING name in the projected scope (scopeView still emits it) that the runtime
+// silently treats as a non-match → e.g. `pass @internal_ips` became an edge cache STORE while the
+// server passes it. Projecting it ServerOnly routes every ip-scoped directive through the same
+// fail-closed delegation/fail-open machinery as `upstream_healthy`, so it can never silently
+// mis-project; a security-gate-only `ip` is simply delegated (the gate is already server-only).
 func (p *Pipeline) EdgeMatchers() map[string]EdgeMatcher {
 	out := make(map[string]EdgeMatcher, len(p.matchers))
 	for name, m := range p.matchers {
-		// Security is SERVER-ONLY (design §2.15): the `ip` ACL matcher resolves the
-		// trusted-proxy real client IP (decision #16), which the edge has no concept of,
-		// and it is referenced only by the (un-projected) security gate. Skip it so it
-		// never reaches the worker IR — Cloudflare provides the edge's own security.
-		if m.kind == kindIP {
-			continue
-		}
 		out[name] = m.edgeView()
 	}
 	return out
@@ -329,7 +367,15 @@ func (p *Pipeline) EdgeClassifiers() map[string]EdgeClassifier {
 			}
 			rows = append(rows, EdgeClassifyRow{Conj: conj, Value: r.value})
 		}
-		out[name] = EdgeClassifier{Rows: rows, Default: cl.def, Synthetic: synth}
+		var derives []string
+		if len(cl.derivesFrom) > 0 {
+			derives = append(derives, cl.derivesFrom...)
+		}
+		var derivesFwd []string
+		if len(cl.derivesForward) > 0 {
+			derivesFwd = append(derivesFwd, cl.derivesForward...)
+		}
+		out[name] = EdgeClassifier{Rows: rows, Default: cl.def, Synthetic: synth, DerivesFrom: derives, DerivesForward: derivesFwd}
 	}
 	return out
 }
@@ -495,6 +541,19 @@ func (p *Pipeline) EdgePassRules() []EdgeScope {
 	return out
 }
 
+// EdgeCredentialedRules returns the `cache_credentialed @scope` scopes, in order (D101).
+// The projector runs each through the fail-closed chokepoint: a scope referencing a
+// ServerOnly/untranslatable matcher fails CLOSED at the edge (fail-open site-wide pass +
+// ForcedPass++), and a translatable scope is projected into EdgeIR.CacheCredentialed so the
+// worker applies the SAME origin-authoritative precedence the server does.
+func (p *Pipeline) EdgeCredentialedRules() []EdgeScope {
+	out := make([]EdgeScope, 0, len(p.credentialedRules))
+	for _, sc := range p.credentialedRules {
+		out = append(out, scopeView(sc))
+	}
+	return out
+}
+
 // EdgeRespondRules returns the exact-path `respond PATH STATUS BODY` rules, in order.
 // The scoped form (`respond @scope STATUS BODY`, e.g. the ingress terminal no-match
 // 404) is NOT projected: the edge IR's EdgeRespond models only an exact path, and the
@@ -540,7 +599,9 @@ func (p *Pipeline) EdgeRedirectRules() []EdgeRedirect {
 		er := EdgeRedirect{Status: r.status, Target: r.target}
 		if r.re != nil {
 			er.Regex = r.re.String()
-		} else {
+		}
+		if r.sc != nil {
+			er.HasScope = true
 			er.Scope = scopeView(r.sc)
 		}
 		out = append(out, er)
@@ -580,7 +641,10 @@ func (p *Pipeline) EdgeTTLRules() []EdgeTTL {
 		out = append(out, EdgeTTL{
 			SelKind: k, Codes: codes, Scope: sc,
 			TTL: r.ttl, Grace: r.grace, MaxStale: r.maxStale, HitForMiss: r.hfm, IsHFM: r.isHFM,
-			FromHeader: r.fromHeader,
+			FromHeader:      r.fromHeader,
+			GraceFromHeader: r.graceFromHeader, MaxStaleFromHeader: r.maxStaleFromHeader,
+			RespHeader:   selRespHeaderView(r.sel),
+			StripHeaders: r.consumedHeaders(),
 		})
 	}
 	return out
@@ -591,7 +655,7 @@ func (p *Pipeline) EdgeStorageRules() []EdgeStorage {
 	out := make([]EdgeStorage, 0, len(p.storageRules))
 	for _, r := range p.storageRules {
 		k, codes, sc := selectorView(r.sel)
-		out = append(out, EdgeStorage{SelKind: k, Codes: codes, Scope: sc, Tier: r.tier})
+		out = append(out, EdgeStorage{SelKind: k, Codes: codes, Scope: sc, Tier: r.tier, RespHeader: selRespHeaderView(r.sel)})
 	}
 	return out
 }
@@ -625,6 +689,19 @@ func (p *Pipeline) EdgeTransformRules() []EdgeTransform {
 	out := make([]EdgeTransform, 0, len(p.transformRules))
 	for _, tr := range p.transformRules {
 		out = append(out, EdgeTransform{Scope: scopeView(tr.scope), Old: tr.repl.Old, New: tr.repl.New})
+	}
+	return out
+}
+
+// EdgeUpgradeScopes returns one scope per `upgrade @scope` rule. `upgrade` is
+// inherently server-only: it opens a live, hijacked connection-upgrade (WebSocket)
+// tunnel to the origin, which a stateless edge worker cannot host. The projector
+// delegates each so it surfaces in the coverage report (and trips `-strict`) instead
+// of being silently dropped.
+func (p *Pipeline) EdgeUpgradeScopes() []EdgeScope {
+	out := make([]EdgeScope, 0, len(p.upgradeRules))
+	for _, sc := range p.upgradeRules {
+		out = append(out, scopeView(sc))
 	}
 	return out
 }
@@ -715,6 +792,17 @@ func selectorView(s selector) (kind string, codes []int, sc EdgeScope) {
 	}
 }
 
+// selRespHeaderView projects a selector's optional `resp_header` AND-term to its
+// neutral EdgeMatcher view, or nil when the selector has none. The worker evaluates
+// it before the kind selector (status/scope/default), mirroring selector.matches.
+func selRespHeaderView(s selector) *EdgeMatcher {
+	if s.respHeader == nil {
+		return nil
+	}
+	em := s.respHeader.edgeView()
+	return &em
+}
+
 func sortedCodes(m map[int]struct{}) []int {
 	out := make([]int, 0, len(m))
 	for c := range m {
@@ -795,6 +883,8 @@ func edgeKindName(k matcherKind) string {
 		return "upstream"
 	case kindContentType:
 		return "content_type"
+	case kindRespHeader:
+		return "resp_header"
 	case kindCookie:
 		return "cookie"
 	case kindCookieJSON:
@@ -819,12 +909,18 @@ func edgeKindName(k matcherKind) string {
 		// explicitly (not "unknown") keeps that detection precise.
 		return "all"
 	case kindIP:
-		// SERVER-ONLY (design §2.15, D49): the `ip` ACL resolves the trusted-proxy real
-		// client IP, which the edge has no concept of. It must NEVER reach the worker IR.
-		// EdgeMatchers() already skips kindIP before projecting, so reaching here is a
-		// programming error in a future caller — name it explicitly (not "unknown") so a
-		// leak is caught loudly rather than silently projecting as an unknown kind.
-		return "server-only-ip"
+		// SERVER-ONLY: the `ip` ACL resolves the trusted-proxy real client IP, which the edge
+		// has no concept of (decision #16). The kind name is in serverOnlyEdgeKinds, so the
+		// projector marks it ServerOnly and DELEGATES (or fails open) every directive that
+		// references it — fail-closed at the edge — rather than silently mis-projecting an
+		// ip-scoped pass/route/cache_key into a wrong native decision (R02).
+		return "ip"
+	case kindUpstreamHealthy:
+		// SERVER-ONLY: live upstream-pool health is a property of the Cadish server's lb
+		// state and does not exist at the edge (like the security gate, D49). The kind name
+		// is in serverOnlyEdgeKinds, so the projector marks it ServerOnly and DELEGATES every
+		// directive that references it (fail-closed at the edge) rather than mis-projecting.
+		return "upstream_healthy"
 	}
 	return "unknown"
 }
@@ -844,6 +940,8 @@ func (t keyToken) edgeView() EdgeKeyToken {
 		return EdgeKeyToken{Kind: "query"}
 	case tokQueryAllow:
 		return EdgeKeyToken{Kind: "query_allow", Allow: nameGlobPatterns(t.allow)}
+	case tokQueryStrip:
+		return EdgeKeyToken{Kind: "query_strip", Deny: nameGlobPatterns(t.deny)}
 	case tokHeader:
 		return EdgeKeyToken{Kind: "header", Arg: t.arg}
 	case tokCookie:
@@ -872,14 +970,12 @@ func (t keyToken) edgeView() EdgeKeyToken {
 }
 
 // edgeView projects one compiled matcher to the neutral EdgeMatcher view,
-// reconstructing the original pattern source for the factored set kinds.
+// reconstructing the original pattern source for the factored set kinds. A kindIP
+// matcher projects to a fields-less `ip` view (no IP/CIDR data leaks to the worker);
+// projectMatcher then marks it ServerOnly so the projector delegates / fails open every
+// directive that references it (R02) — it is no longer a panic, so an inline `ip`
+// (`pass ip 10.0.0.0/8`) never crashes `cadish edge build`.
 func (m *matcher) edgeView() EdgeMatcher {
-	if m.kind == kindIP {
-		// Defense in depth: security is server-only (D49). EdgeMatchers()/scopeView never
-		// feed an `ip` matcher here; a future caller that does is a bug, so fail closed
-		// rather than silently projecting a server-only ACL into the worker IR.
-		panic("pipeline: ip matcher must never be projected to the edge IR (security is server-only)")
-	}
 	em := EdgeMatcher{Kind: edgeKindName(m.kind), ResponsePhase: isResponsePhaseKind(m.kind)}
 	switch m.kind {
 	case kindPath:
@@ -909,6 +1005,13 @@ func (m *matcher) edgeView() EdgeMatcher {
 		em.Upstreams = sortedSetKeys(m.upstreams)
 	case kindContentType:
 		em.ContentTypes = append([]string(nil), m.contentTypes...)
+	case kindRespHeader:
+		// Response-phase, edge-expressible: the worker reads the named origin response
+		// header and value-matches it with the SAME name-glob engine (nameGlobMatch) the
+		// server uses (respValues). Name is the header; Values carries the exact-or-`*`-glob
+		// value patterns (empty => presence). ResponsePhase=true gates it to the response walk.
+		em.Name = m.headerName
+		em.Values = append([]string(nil), m.respValuePatterns...)
 	case kindCookie:
 		em.Name = m.cookieName
 		em.Glob = m.cookieGlob

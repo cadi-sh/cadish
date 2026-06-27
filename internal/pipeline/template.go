@@ -31,6 +31,13 @@ type TemplateEnv struct {
 	Geo          string
 	GeoContinent string
 	GeoRegion    string
+
+	// Scheme is the request scheme for the {proto}/{scheme} placeholder: "https"
+	// when cadish terminated TLS for the inbound connection, else "http". It is filled
+	// from Request.TLS on BOTH the dynamic-header path (fillHeaderTemplateEnv) and the
+	// redirect path (redirectRule.eval sets it inline). If left "" (a caller that does not
+	// set it), named() defaults it to "http".
+	Scheme string
 }
 
 // classifyResolver resolves {classify.NAME} placeholders against a request's
@@ -71,8 +78,10 @@ func (e *TemplateEnv) uri() string {
 // expandTemplate substitutes placeholders in tmpl against env and returns the
 // result. Two placeholder families are supported:
 //
-//   - Named braces: {host} {path} {query} {uri} — request-derived scalars. An
-//     unknown {name} is left verbatim (so a literal "{x}" in a URL survives).
+//   - Named braces: {host} {host.base} {host.sub} {path} {query} {uri} —
+//     request-derived scalars ({host.base}/{host.sub} split {host} into its
+//     public-suffix-aware registrable base and leading subdomain). An unknown
+//     {name} is left verbatim (so a literal "{x}" in a URL survives).
 //   - Numbered captures: $1 … $9 (and $0 for the whole match) — regex submatches
 //     from the selecting path_regex matcher. A "$$" is a literal '$'. A "$N" with
 //     no corresponding capture expands to "" (out-of-range groups vanish, matching
@@ -159,6 +168,18 @@ func (e *TemplateEnv) named(name string, cr classifyResolver) (string, bool) {
 	switch name {
 	case "host":
 		return e.Host, true
+	case "host.base":
+		// Registrable base domain of {host}, public-suffix aware (es.nudity.tv ->
+		// nudity.tv). Derived from e.Host — which on the redirect path is the VALIDATED
+		// redirect host (p.redirectHost), never the raw attacker Host — so the computed
+		// host keeps the F12 open-redirect defense.
+		b, _ := hostParts(e.Host)
+		return b, true
+	case "host.sub":
+		// Leading subdomain label(s) below the registrable domain (es/www/pt), empty for
+		// a bare base host. Same {host}-derived, trusted source as {host.base}.
+		_, s := hostParts(e.Host)
+		return s, true
 	case "path":
 		return e.Path, true
 	case "query":
@@ -173,6 +194,14 @@ func (e *TemplateEnv) named(name string, cr classifyResolver) (string, bool) {
 		return e.GeoContinent, true
 	case "geo.region":
 		return e.GeoRegion, true
+	case "proto", "scheme":
+		// {proto}/{scheme}: "https" when cadish terminated TLS for the inbound
+		// connection, else "http". Both the header and redirect paths set Scheme from
+		// req.TLS; a "" (unset) defaults to "http" so the token is never left empty.
+		if e.Scheme == "https" {
+			return "https", true
+		}
+		return "http", true
 	}
 	if hn, ok := strings.CutPrefix(name, "http."); ok && hn != "" {
 		if e.Header == nil {

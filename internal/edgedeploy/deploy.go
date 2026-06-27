@@ -155,6 +155,13 @@ func (c *Client) Deploy(ctx context.Context, cfg Config, scriptSource string) er
 	if cfg.AccountID == "" || cfg.WorkerName == "" {
 		return fmt.Errorf("deploy: account and worker are required (set them in the edge {} block or via flags)")
 	}
+	// Fail closed on an account id or worker name that would alter the REST path it
+	// is interpolated into: a `/`, whitespace, query/fragment, or percent would
+	// retarget the PUT at an UNRELATED resource (a different account or script), so a
+	// mis-derived target is rejected BEFORE any upload rather than clobbering it.
+	if err := validateDeployTarget(cfg.AccountID, cfg.WorkerName); err != nil {
+		return err
+	}
 	bindings := []binding{}
 	if cfg.OriginURL != "" {
 		bindings = append(bindings, binding{Type: "plain_text", Name: "CADISH_ORIGIN", Text: cfg.OriginURL})
@@ -182,6 +189,30 @@ func (c *Client) Deploy(ctx context.Context, cfg Config, scriptSource string) er
 	path := fmt.Sprintf("/accounts/%s/workers/scripts/%s", cfg.AccountID, cfg.WorkerName)
 	_, err = c.do(ctx, http.MethodPut, path, body, contentType)
 	return err
+}
+
+// validateDeployTarget rejects an account id or worker name that is empty or carries
+// a character that would change the Cloudflare REST path it is interpolated into
+// (path separator, whitespace, query/fragment, or percent). CF identifiers never
+// contain these; rejecting fail-closes a mis-derived or malicious target before the
+// script PUT (and the KV calls keyed on the account) can hit the wrong resource.
+func validateDeployTarget(accountID, worker string) error {
+	if err := safePathSegment("account", accountID); err != nil {
+		return err
+	}
+	return safePathSegment("worker", worker)
+}
+
+func safePathSegment(field, s string) error {
+	if s == "" {
+		return fmt.Errorf("deploy: %s is empty", field)
+	}
+	for _, r := range s {
+		if r <= ' ' || r == 0x7f || r == '/' || r == '?' || r == '#' || r == '%' {
+			return fmt.Errorf("deploy: %s %q contains an invalid character (would retarget the Cloudflare API path)", field, s)
+		}
+	}
+	return nil
 }
 
 // buildUpload assembles the multipart body for an ES-module worker upload: a

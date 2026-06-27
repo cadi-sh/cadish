@@ -15,8 +15,8 @@ package httporigin
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -70,6 +70,19 @@ type Origin struct {
 	// (gap H6, `http_reuse never`) — the Go equivalent of HAProxy's http-reuse never.
 	disableKeepAlives bool
 
+	// insecureTLS disables verification of the backend's TLS certificate
+	// (TLSVERIFY, `tls_insecure` = HAProxy `ssl verify none`). Opt-in and
+	// per-upstream only; false ⇒ full verification (the secure default).
+	insecureTLS bool
+	// rootCAs is a private CA pool to verify the backend against (TLSVERIFY,
+	// `ca_file <path>`). nil ⇒ the system roots. Mutually exclusive with
+	// insecureTLS (enforced by the config layer).
+	rootCAs *x509.CertPool
+	// alpn pins the origin TLS ALPN protocol list (TLSVERIFY, `alpn http/1.1`).
+	// Empty ⇒ Go's default (HTTP/2 auto-upgrade preserved via ForceAttemptHTTP2);
+	// pinning `http/1.1` sets NextProtos and so disables the h2 auto-upgrade.
+	alpn []string
+
 	// betweenBytes is the per-upstream body-stall budget (gap G5,
 	// `timeout … between_bytes D`). The origin does NOT wrap the body (the streaming
 	// contract forbids it); it only stamps the value onto each Response so the server
@@ -111,6 +124,34 @@ func WithDisableKeepAlives(disable bool) Option {
 	return func(o *Origin) { o.disableKeepAlives = disable }
 }
 
+// WithInsecureTLS disables verification of the backend's TLS certificate for this
+// origin only (TLSVERIFY, `tls_insecure` = HAProxy `ssl verify none`). When true
+// the origin gets its OWN http.Transport whose TLSClientConfig.InsecureSkipVerify
+// is set, so a self-signed / mismatched origin cert handshakes instead of failing.
+// HTTP/2: setting only this knob leaves NextProtos empty, so h2 is still attempted
+// via ForceAttemptHTTP2 (use WithALPN to pin a protocol). False is a no-op (full
+// verification, the secure default, datapath unchanged).
+func WithInsecureTLS(insecure bool) Option {
+	return func(o *Origin) { o.insecureTLS = insecure }
+}
+
+// WithRootCAs verifies the backend against a private CA pool for this origin only
+// (TLSVERIFY, `ca_file <path>`) — the secure alternative to WithInsecureTLS. A
+// non-nil pool sets TLSClientConfig.RootCAs on the origin's OWN transport; nil is a
+// no-op (the system roots, as today).
+func WithRootCAs(pool *x509.CertPool) Option {
+	return func(o *Origin) { o.rootCAs = pool }
+}
+
+// WithALPN pins the origin TLS ALPN protocol list for this origin only (TLSVERIFY,
+// `alpn http/1.1`). A non-empty list sets TLSClientConfig.NextProtos on the
+// origin's OWN transport; because that disables Go's automatic h2 negotiation,
+// pinning `http/1.1` is the supported way to force HTTP/1.1 to the origin. Empty is
+// a no-op (Go's default; h2 still auto-attempted).
+func WithALPN(protos []string) Option {
+	return func(o *Origin) { o.alpn = protos }
+}
+
 // WithBetweenBytes sets the per-upstream body-stall budget (gap G5,
 // `timeout … between_bytes D`). The origin attaches it to each Response as advisory
 // metadata; the server enforces it as a between-bytes deadline on the streaming
@@ -148,33 +189,64 @@ func New(baseURL string, opts ...Option) (*Origin, error) {
 	if o.hc == nil {
 		o.hc = pooledHTTPClient()
 	}
-	applyTransportKnobs(o.hc, o.sni, o.disableKeepAlives)
+	applyTransportKnobs(o.hc, o)
 	return o, nil
 }
 
-// applyTransportKnobs sets the gap-H6 transport knobs on hc's *http.Transport in
-// place. A non-empty sni sets TLSClientConfig.ServerName; disable sets
-// DisableKeepAlives. When NEITHER is set it is a no-op (the default path leaves the
-// transport untouched — the zero-datapath-change invariant). It only touches the
-// transport when hc.Transport is an *http.Transport (the shape this package and lb
-// both build).
-func applyTransportKnobs(hc *http.Client, sni string, disable bool) {
-	if sni == "" && !disable {
+// applyTransportKnobs sets the per-upstream transport knobs on hc's *http.Transport
+// in place: the gap-H6 knobs (`sni` ⇒ TLSClientConfig.ServerName, `http_reuse never`
+// ⇒ DisableKeepAlives) and the TLSVERIFY knobs (`tls_insecure` ⇒ InsecureSkipVerify,
+// `ca_file` ⇒ RootCAs, `alpn` ⇒ NextProtos). When NO knob is set it is a no-op (the
+// default path leaves the transport untouched — the zero-datapath-change invariant).
+// It only touches the transport when hc.Transport is an *http.Transport (the shape
+// this package and lb both build).
+//
+// HTTP/2: the TLS-affecting knobs are applied to a single cloned *tls.Config. Setting
+// InsecureSkipVerify / RootCAs WITHOUT an `alpn` leaves NextProtos empty, so Go still
+// auto-negotiates h2 (the pooled/timeout transports set ForceAttemptHTTP2). Pinning
+// `alpn http/1.1` sets NextProtos and so deliberately disables the h2 auto-upgrade.
+func applyTransportKnobs(hc *http.Client, o *Origin) {
+	tlsKnob := o.sni != "" || o.insecureTLS || o.rootCAs != nil || len(o.alpn) != 0
+	if !tlsKnob && !o.disableKeepAlives {
 		return
 	}
 	tr, ok := hc.Transport.(*http.Transport)
 	if !ok {
 		return
 	}
-	if sni != "" {
+	if tlsKnob {
+		var tc *tls.Config
 		if tr.TLSClientConfig == nil {
-			tr.TLSClientConfig = &tls.Config{ServerName: sni} //nolint:gosec // ServerName only; default MinVersion applies
+			tc = &tls.Config{} //nolint:gosec // fields set below; default MinVersion applies
 		} else {
-			tr.TLSClientConfig = tr.TLSClientConfig.Clone()
-			tr.TLSClientConfig.ServerName = sni
+			tc = tr.TLSClientConfig.Clone()
 		}
+		if o.sni != "" {
+			tc.ServerName = o.sni
+		}
+		// Defense-in-depth (Finding 7): tls_insecure ⊕ ca_file is already a compile
+		// error (parseTransportPolicy), so these never co-exist legitimately. But if a
+		// future plumbing mistake ever set both, InsecureSkipVerify=true would win and
+		// silently IGNORE the RootCAs — failing OPEN. Prefer verification: only skip when
+		// no private CA pool is configured, so such a mistake fails CLOSED.
+		if o.insecureTLS && o.rootCAs == nil {
+			tc.InsecureSkipVerify = true //nolint:gosec // opt-in per-upstream `tls_insecure` (HAProxy `ssl verify none`)
+		}
+		if o.rootCAs != nil {
+			tc.RootCAs = o.rootCAs
+		}
+		if len(o.alpn) != 0 {
+			tc.NextProtos = o.alpn
+			// An explicit ALPN pin must be honored verbatim. ForceAttemptHTTP2 (set on
+			// the pooled/timeout transports) otherwise makes net/http append "h2" to
+			// NextProtos, so `alpn http/1.1` would still offer h2. Turn it off so the
+			// pinned list is exactly what reaches the ClientHello — this is what
+			// disables the h2 auto-upgrade. (No `alpn` ⇒ left on ⇒ h2 preserved.)
+			tr.ForceAttemptHTTP2 = false
+		}
+		tr.TLSClientConfig = tc
 	}
-	if disable {
+	if o.disableKeepAlives {
 		tr.DisableKeepAlives = true
 	}
 }
@@ -299,11 +371,31 @@ func (o *Origin) hostFor(clientHost string) string {
 	}
 }
 
+// ResolveUpgrade implements origin.Upgrader: it returns this origin's backend base
+// URL plus its OWN per-upstream transport so a connection-upgrade (WebSocket)
+// passthrough tunnel reuses the configured connect/TLS timeouts, `sni`,
+// `http_reuse`, and TLS-verify knobs — never a second, unconfigured dialer. The
+// Host is resolved through the same `host_header` policy a normal fetch uses. It
+// never errors (a single HTTP base URL is always an eligible target).
+func (o *Origin) ResolveUpgrade(_ context.Context, req *origin.Request) (origin.UpgradeTarget, error) {
+	base := *o.base // copy; never hand out the shared pointer
+	var clientHost string
+	if req != nil {
+		clientHost = req.ClientHost
+	}
+	var rt http.RoundTripper
+	if o.hc != nil {
+		rt = o.hc.Transport
+	}
+	return origin.UpgradeTarget{URL: &base, Transport: rt, Host: o.hostFor(clientHost)}, nil
+}
+
 // negativeStatus reports whether an upstream status is a not-found / gone status
 // that cadish returns as a full-body NEGATIVE *Response (so it can be negatively
 // cached with its real error-page body), rather than collapsed to the bodyless
 // ErrNotFound sentinel. Other non-success statuses (5xx, 401, 403…) are not
-// negatively cacheable and surface as a *StatusError with the body drained.
+// negatively cacheable and surface as a *StatusError that CARRIES the live body +
+// headers (so the server streams the real error response), never drained.
 func negativeStatus(code int) bool {
 	return code == http.StatusNotFound || code == http.StatusGone
 }
@@ -311,8 +403,9 @@ func negativeStatus(code int) bool {
 // Fetch implements origin.Origin. It forwards the Range header verbatim, streams
 // the body (no buffering), returns a 404/410 as a full-body NEGATIVE *Response
 // (Negative true), and returns a *origin.StatusError for any other non-success
-// status (body closed). See the origin package doc for the ownership/streaming
-// contract.
+// status — carrying the live error body + headers (the holder MUST Close it) so
+// the server can stream the origin's real error response verbatim. See the origin
+// package doc for the ownership/streaming contract.
 func (o *Origin) Fetch(ctx context.Context, in *origin.Request) (*origin.Response, error) {
 	method := in.Method
 	if method == "" {
@@ -398,22 +491,20 @@ func (o *Origin) Fetch(ctx context.Context, in *origin.Request) (*origin.Respons
 			BetweenBytes:  o.betweenBytes,
 		}, nil
 	default:
-		// Any other status (4xx, 5xx): drain+close and surface a StatusError so a
-		// chain can fall through without us ever streaming an error page to the
-		// client.
-		status := resp.StatusCode
-		drainClose(resp.Body)
-		return nil, &origin.StatusError{Status: status, Origin: originName}
+		// Any other status (401/403/422/5xx, …): cadish does NOT negatively cache
+		// these, but the upstream body (a JSON error envelope, an auth challenge, a
+		// maintenance notice) is meaningful to the client. Surface a StatusError that
+		// CARRIES the live body + headers — we do NOT drain it — so the server streams
+		// the real error response verbatim on the pass / non-negatively-cached path,
+		// while a chain can still fall through on the status (closing the abandoned
+		// body). A passed/uncached error is never stored, so there is no
+		// cache-poisoning risk. The holder MUST Close Body (CloseStatusErrBody).
+		return nil, &origin.StatusError{
+			Status:        resp.StatusCode,
+			Origin:        originName,
+			Header:        resp.Header,
+			Body:          resp.Body,
+			ContentLength: resp.ContentLength, // -1 when unknown (chunked)
+		}
 	}
-}
-
-// drainClose discards a small amount of the body then closes it, so the
-// underlying keep-alive connection can be returned to the pool for reuse instead
-// of being torn down. We cap the drain so a huge error page can't block us.
-func drainClose(body io.ReadCloser) {
-	if body == nil {
-		return
-	}
-	_, _ = io.CopyN(io.Discard, body, 4<<10)
-	_ = body.Close()
 }

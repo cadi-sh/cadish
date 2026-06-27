@@ -130,6 +130,40 @@ func TestStripCookiesSetCookieIroncladEvenCacheUnsafe(t *testing.T) {
 	}
 }
 
+// TestSetCookieNeverCachedUnderRespHeaderTTLRule (Minor 2) pins the safe default against
+// a `resp_header`-scoped cache_ttl tier: a response selected by `cache_ttl resp_header
+// X-Powered-By Express ttl 1m grace 2w` that ALSO carries Set-Cookie (or Cache-Control:
+// private) is STILL refused — the ironclad never-cache-a-credential default wins over the
+// TTL tier. Structurally guaranteed (Set-Cookie/private are refused regardless of which
+// TTL rule matched); this is the explicit regression guard.
+func TestSetCookieNeverCachedUnderRespHeaderTTLRule(t *testing.T) {
+	p := compileSrc(t, `example.com {
+    cache_key path
+    cache_ttl resp_header X-Powered-By Express ttl 1m grace 2w
+    cache_ttl default ttl 1h
+}`)
+	req := &Request{Path: "/x"}
+
+	// Sanity: the resp_header tier IS selected for an Express response without a cookie
+	// (so the test below actually exercises that tier, not the default).
+	plain := http.Header{"X-Powered-By": {"Express"}}
+	if d := p.EvalResponse(req, 200, plain); !d.Cacheable || d.TTL != time.Minute {
+		t.Fatalf("Express response (no cookie) should hit the resp_header tier (cacheable ttl 1m), got cacheable=%v ttl=%v", d.Cacheable, d.TTL)
+	}
+
+	// Same tier, but the response sets a cookie -> NEVER cached (credential safe default).
+	withCookie := http.Header{"X-Powered-By": {"Express"}, "Set-Cookie": {"sid=abc; Path=/"}}
+	if d := p.EvalResponse(req, 200, withCookie); d.Cacheable {
+		t.Error("a Set-Cookie response must NOT be cached even under a resp_header cache_ttl tier (safe default wins)")
+	}
+
+	// And a Cache-Control: private response under the same tier is likewise refused.
+	private := http.Header{"X-Powered-By": {"Express"}, "Cache-Control": {"private"}}
+	if d := p.EvalResponse(req, 200, private); d.Cacheable {
+		t.Error("a Cache-Control: private response must NOT be cached even under a resp_header cache_ttl tier")
+	}
+}
+
 // TestSetCookieScopesCompile: set_cookie is a response-phase matcher, so it may
 // scope the origin-response directives (cache_ttl, storage) AND the deliver
 // directives (header, strip_cookies, cors).

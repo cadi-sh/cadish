@@ -8,8 +8,10 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +29,23 @@ import (
 type applierFunc func(*config.Config) error
 
 func (f applierFunc) ApplyConfig(c *config.Config) error { return f(c) }
+
+// warmApplier is an Applier that ALSO implements Warmer, recording ApplyConfig + MarkWarm
+// call counts so a test can assert the warm-readiness gate flips (only) after a successful
+// reconcile. applyErr, when set, makes ApplyConfig fail (a first-reconcile failure must NOT
+// mark warm).
+type warmApplier struct {
+	applyErr error
+	applied  atomic.Int32
+	warmed   atomic.Int32
+}
+
+func (w *warmApplier) ApplyConfig(*config.Config) error {
+	w.applied.Add(1)
+	return w.applyErr
+}
+
+func (w *warmApplier) MarkWarm() { w.warmed.Add(1) }
 
 func hasSiteHost(cfg *config.Config, host string) bool {
 	for _, s := range cfg.Sites {
@@ -54,6 +73,75 @@ func sliceFor(service, namespace, ip string, port int32) *discoveryv1.EndpointSl
 		AddressType: discoveryv1.AddressTypeIPv4,
 		Endpoints:   []discoveryv1.Endpoint{{Addresses: []string{ip}, Conditions: discoveryv1.EndpointConditions{Ready: &ready}}},
 		Ports:       []discoveryv1.EndpointPort{{Name: &pname, Port: &pnum}},
+	}
+}
+
+// TestControllerMarksWarmAfterFirstReconcile proves the warm-readiness gate flips once the
+// first successful reconcile builds the routing table: the controller calls MarkWarm on the
+// Warmer applier only AFTER ApplyConfig succeeds.
+func TestControllerMarksWarmAfterFirstReconcile(t *testing.T) {
+	gc := gatewayClass("cadish", ControllerName)
+	g := gw("prod", "gw", "cadish", "")
+	rt := httpRoute("prod", "api", "gw", "example.com", "web", 80, []match{{"/api", gatewayv1.PathMatchPathPrefix}})
+	gwcs := gwfake.NewSimpleClientset()
+	mustCreate(t, gwcs, gc, g, rt)
+	cs := k8sfake.NewSimpleClientset(svc("prod", "web"), sliceFor("web", "prod", "10.0.0.1", 80))
+
+	applier := &warmApplier{}
+	ctrl := New(cs, gwcs, applier, ``, Config{ResyncDebounce: 10 * time.Millisecond})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = ctrl.Run(ctx) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if applier.warmed.Load() > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("controller never marked warm (applied=%d warmed=%d)", applier.applied.Load(), applier.warmed.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if applier.applied.Load() == 0 {
+		t.Fatal("marked warm without ever applying a config")
+	}
+}
+
+// TestControllerDoesNotMarkWarmOnFailedFirstReconcile is the fail-safe guard: when the very
+// first ApplyConfig fails, the controller keeps the last good config AND must NOT mark warm
+// — the pod stays NOT-ready (503) until a reconcile succeeds.
+func TestControllerDoesNotMarkWarmOnFailedFirstReconcile(t *testing.T) {
+	gc := gatewayClass("cadish", ControllerName)
+	g := gw("prod", "gw", "cadish", "")
+	rt := httpRoute("prod", "api", "gw", "example.com", "web", 80, []match{{"/api", gatewayv1.PathMatchPathPrefix}})
+	gwcs := gwfake.NewSimpleClientset()
+	mustCreate(t, gwcs, gc, g, rt)
+	cs := k8sfake.NewSimpleClientset(svc("prod", "web"), sliceFor("web", "prod", "10.0.0.1", 80))
+
+	applier := &warmApplier{applyErr: errors.New("apply boom")}
+	ctrl := New(cs, gwcs, applier, ``, Config{ResyncDebounce: 10 * time.Millisecond})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = ctrl.Run(ctx) }()
+
+	// Wait until the controller has attempted (and failed) at least one ApplyConfig.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if applier.applied.Load() > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("controller never attempted ApplyConfig")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Give the reconcile loop a few more cycles; a failing apply must NEVER mark warm.
+	time.Sleep(200 * time.Millisecond)
+	if w := applier.warmed.Load(); w != 0 {
+		t.Fatalf("controller marked warm %d time(s) despite a failing first reconcile", w)
 	}
 }
 

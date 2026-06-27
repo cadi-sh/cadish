@@ -68,6 +68,44 @@ func TestClassify_EquivalentToOldPair(t *testing.T) {
 	}
 }
 
+// TestClassify_BackwardClockJumpFailSafe pins the freshness index's behavior under a
+// BACKWARD wall-clock step. In production f.now() is time.Now() (monotonic), so a wall
+// jump never reaches this index; the test drives an injected non-monotonic clock to
+// prove the comparison is internally consistent and fail-safe either way:
+//   - A backward jump must NOT make a fresh object spuriously expire (now < expires
+//     still classifies fresh) — never a needless revalidate storm.
+//   - A backward jump must NOT extend life beyond the stored window once real forward
+//     time resumes: advancing past the ORIGINAL expiry instant still expires the entry
+//     (revalidate), never serve-stale-as-fresh. expires/graceUntil are stored as
+//     now.Add(ttl); classify compares the SAME clock's now, so the window is anchored
+//     to the stored instant, not to the (jumped) wall offset.
+func TestClassify_BackwardClockJumpFailSafe(t *testing.T) {
+	clk := newFakeClock()
+	const key = "site|GET|/clk"
+	f := newFreshness(clk.now)
+	f.store(key, time.Minute, 0, 0) // fresh for 60s, no grace
+
+	// Step the clock BACKWARD an hour: the object must remain fresh (now is well before
+	// expires), not flip to miss.
+	clk.advance(-time.Hour)
+	if state, _ := f.classify(key); state != stateFresh {
+		t.Fatalf("after backward jump: got %v, want stateFresh (must not spuriously expire)", state)
+	}
+
+	// Recover to the original instant: still within the 60s TTL.
+	clk.advance(time.Hour)
+	if state, _ := f.classify(key); state != stateFresh {
+		t.Fatalf("back at original instant (within TTL): got %v, want stateFresh", state)
+	}
+
+	// Real forward time past the stored expiry: the entry expires (no grace) — the
+	// backward excursion did not extend its life.
+	clk.advance(2 * time.Minute)
+	if state, _ := f.classify(key); state != stateMiss {
+		t.Fatalf("past stored expiry: got %v, want stateMiss (no serve-stale-as-fresh)", state)
+	}
+}
+
 func TestClassify_BannedEntryRevalidates(t *testing.T) {
 	clk := newFakeClock()
 	const key = "site|GET|/banme"

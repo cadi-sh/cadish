@@ -1,0 +1,5 @@
+{
+  "name": "50-cache-ttl-storage-failclosed",
+  "cadishfile": "example.com {\n    @live upstream_healthy pool\n    cache_ttl @live hit_for_miss 1s\n    cache_ttl default ttl 1h\n    storage @live -> disk\n    storage default -> ram\n    cache_key host path\n}",
+  "cases": []
+}

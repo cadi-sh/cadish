@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/cadi-sh/cadish/internal/logs"
@@ -88,6 +89,17 @@ func Logs(args []string) int {
 // working). socket is the unix path to dial for the live source.
 func runLogs(files []string, follow, fromStart bool, socket string, filter logs.Filter, format logs.Format, stdin io.Reader, out, errOut io.Writer) int {
 	if len(files) > 1 {
+		// flag.Parse stops at the first non-flag token, so any flags placed AFTER the
+		// FILE (e.g. `cadish logs access.log -host x`) arrive here as extra positionals.
+		// Detect that and tell the operator flags must precede the FILE, rather than the
+		// opaque "at most one FILE" — a flag silently dropped after a positional was the
+		// staging foot-gun.
+		for _, a := range files[1:] {
+			if strings.HasPrefix(a, "-") {
+				fmt.Fprintf(errOut, "cadish logs: flags must come before the FILE argument (got %q after %q)\n", a, files[0])
+				return 2
+			}
+		}
 		fmt.Fprintln(errOut, "cadish logs: at most one FILE argument")
 		return 2
 	}

@@ -1,12 +1,71 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"strings"
 
 	"github.com/cadi-sh/cadish/internal/cache"
 	"github.com/cadi-sh/cadish/internal/cadishfile"
 )
+
+// cacheKeyVocabDirectives are the site-level directives that define the cache-KEY
+// namespace: the `cache_key` recipe itself plus every block its tokens can
+// reference — user normalizers, classifiers, the tenant resolver, the device
+// classifier, and the geo source. A change to ANY of them can remap which content
+// a given key addresses, so cacheKeyFingerprint folds them all in.
+var cacheKeyVocabDirectives = map[string]bool{
+	"cache_key":     true,
+	"normalize":     true,
+	"classify":      true,
+	"tenant":        true,
+	"device_detect": true,
+	"geo":           true,
+}
+
+// cacheKeyFingerprint returns a stable hash of the directives that define a site's
+// cache-key namespace (cacheKeyVocabDirectives), in source order. Two configs whose
+// sites produce the SAME fingerprint compute byte-identical keys for the same
+// request, so a warm cache store is safe to carry across a reload between them;
+// when the fingerprint DIFFERS the old store's entries are keyed under a different
+// recipe and must NOT be reused (see Site.cacheKeyFP / TransplantStoresFrom). It is
+// purely structural (directive names + args + nested blocks); positions, comments and
+// unrelated directives (header ops, ttl, routing, upstreams) are intentionally
+// excluded so an unrelated edit still preserves the warm cache.
+func cacheKeyFingerprint(site *cadishfile.Site) string {
+	var b strings.Builder
+	for _, n := range site.Body {
+		d, ok := n.(*cadishfile.Directive)
+		if !ok || !cacheKeyVocabDirectives[d.Name] {
+			continue
+		}
+		writeDirectiveFingerprint(&b, d)
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+// writeDirectiveFingerprint renders a directive subtree (name, args, nested block)
+// into b deterministically, using control bytes as separators so distinct shapes can
+// never collide. Recurses into nested blocks (e.g. a `normalize NAME { … }` body).
+func writeDirectiveFingerprint(b *strings.Builder, d *cadishfile.Directive) {
+	b.WriteByte(0x01)
+	b.WriteString(d.Name)
+	for _, a := range d.Args {
+		b.WriteByte(0x02)
+		b.WriteString(a.Raw)
+	}
+	if d.HasBlock {
+		b.WriteByte(0x03)
+		for _, n := range d.Block {
+			if sub, ok := n.(*cadishfile.Directive); ok {
+				writeDirectiveFingerprint(b, sub)
+			}
+		}
+		b.WriteByte(0x04)
+	}
+}
 
 // buildStore constructs the site's two-tier cache.Store from its `cache { … }`
 // block. Recognized sub-directives:

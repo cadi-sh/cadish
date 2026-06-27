@@ -2,6 +2,7 @@ package lb
 
 import (
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -144,6 +145,24 @@ func parsePool(kind string, d *cadishfile.Directive) (Config, error) {
 				return Config{}, err
 			}
 			cfg.DisableReuse = true
+		case "tls_insecure":
+			if err := ParseTLSInsecureArg(sub); err != nil {
+				return Config{}, err
+			}
+			cfg.Insecure = true
+		case "alpn":
+			protos, err := ParseALPNArg(sub)
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.ALPN = protos
+		case "resolve":
+			iv, ns, err := ParseResolveArg(sub)
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.ResolveInterval = iv
+			cfg.Nameservers = ns
 		default:
 			return Config{}, posErrf(sub.Pos, "%s %q: unknown directive %q", kind, cfg.Name, sub.Name)
 		}
@@ -196,6 +215,91 @@ func ParseHTTPReuseArg(d *cadishfile.Directive) error {
 		return posErrf(d.Args[0].Pos, "http_reuse: unsupported value %q (only `never` is supported; reuse is the default)", d.Args[0].Raw)
 	}
 	return nil
+}
+
+// ParseTLSInsecureArg validates a bare `tls_insecure` flag (TLSVERIFY, HAProxy
+// `ssl verify none`). It takes NO arguments; any token is a positioned error. It
+// returns nil on the valid bare form; the caller sets Insecure. Shared by lint and
+// runtime so `cadish check` rejects `tls_insecure foo` (check≡run).
+func ParseTLSInsecureArg(d *cadishfile.Directive) error {
+	if len(d.Args) != 0 {
+		return posErrf(d.Pos, "tls_insecure takes no arguments (it is a bare flag; use `ca_file <path>` to verify against a private CA)")
+	}
+	return nil
+}
+
+// ParseALPNArg parses an `alpn <proto>…` directive into its protocol list
+// (TLSVERIFY, `alpn http/1.1`). It requires at least one non-empty protocol token
+// and rejects an accidental matcher ref (`@name`). Shared by lint and runtime so
+// `cadish check` validates the same tokens the runtime parser consumes (check≡run).
+func ParseALPNArg(d *cadishfile.Directive) ([]string, error) {
+	if len(d.Args) == 0 {
+		return nil, posErrf(d.Pos, "alpn needs at least one protocol (e.g. `alpn http/1.1` or `alpn h2 http/1.1`)")
+	}
+	protos := make([]string, 0, len(d.Args))
+	for _, a := range d.Args {
+		v := a.Raw
+		if v == "" || strings.HasPrefix(v, "@") {
+			return nil, posErrf(a.Pos, "alpn: invalid protocol %q", v)
+		}
+		protos = append(protos, v)
+	}
+	return protos, nil
+}
+
+// ParseResolveArg parses the per-upstream `resolve [<interval>] [nameserver
+// <ip:port>…]` directive (RESOLVER, sound subset). Accepted forms:
+//
+//	resolve 10s
+//	resolve nameserver 10.134.8.94:53
+//	resolve 10s nameserver 10.134.8.94:53 10.134.8.95:53
+//
+// The optional leading token is a duration (the dynamic re-resolution interval);
+// the optional `nameserver` keyword introduces one or more `ip:port` DNS servers
+// the pool dials instead of the system resolver. At least one of the two must be
+// present (a bare `resolve` is an error). Shared by lint and runtime so `cadish
+// check` validates exactly the tokens the runtime parser consumes (check≡run).
+func ParseResolveArg(d *cadishfile.Directive) (time.Duration, []string, error) {
+	args := d.Args
+	var iv time.Duration
+	// A leading non-`nameserver` token is the interval.
+	if len(args) > 0 && args[0].Raw != "nameserver" {
+		dur, err := pipeline.ParseDuration(args[0].Raw)
+		if err != nil {
+			return 0, nil, posErrf(args[0].Pos, "resolve: bad interval %q (want a duration like `10s`, or the `nameserver` keyword): %v", args[0].Raw, err)
+		}
+		if dur <= 0 {
+			return 0, nil, posErrf(args[0].Pos, "resolve: interval must be > 0")
+		}
+		iv = dur
+		args = args[1:]
+	}
+	var nameservers []string
+	if len(args) > 0 {
+		if args[0].Raw != "nameserver" {
+			return 0, nil, posErrf(args[0].Pos, "resolve: unexpected token %q (want the `nameserver` keyword)", args[0].Raw)
+		}
+		args = args[1:]
+		if len(args) == 0 {
+			return 0, nil, posErrf(d.Pos, "resolve: `nameserver` needs at least one `ip:port` address")
+		}
+		for _, a := range args {
+			host, port, err := net.SplitHostPort(a.Raw)
+			if err != nil || host == "" || port == "" {
+				return 0, nil, posErrf(a.Pos, "resolve: nameserver %q must be `ip:port` (e.g. `10.134.8.94:53`)", a.Raw)
+			}
+			// The port must be a NUMERIC port, not a service name or stray token: a bare
+			// `host:label` shape would otherwise pass SplitHostPort yet fail at dial time.
+			if p, perr := strconv.Atoi(port); perr != nil || p < 1 || p > 65535 {
+				return 0, nil, posErrf(a.Pos, "resolve: nameserver %q has a non-numeric or out-of-range port (want `ip:port`, e.g. `10.134.8.94:53`)", a.Raw)
+			}
+			nameservers = append(nameservers, a.Raw)
+		}
+	}
+	if iv == 0 && len(nameservers) == 0 {
+		return 0, nil, posErrf(d.Pos, "resolve needs an interval and/or `nameserver <ip:port>…` (e.g. `resolve 10s nameserver 10.134.8.94:53`)")
+	}
+	return iv, nameservers, nil
 }
 
 func parsePolicyArg(d *cadishfile.Directive) (Policy, error) {

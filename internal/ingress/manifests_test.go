@@ -43,6 +43,42 @@ func TestLeaderElectFlagFormInManifests(t *testing.T) {
 	}
 }
 
+// TestControllerProbesUseWarmReadyz pins the warm-readiness wiring in the shipped manifests
+// and the Helm chart: the controller's startupProbe + readinessProbe MUST be an httpGet on
+// /.cadish/readyz (so k8s does not route to an un-warmed pod), while the livenessProbe MUST
+// stay a tcpSocket probe (process-alive, not warm — a warm-based liveness would kill a pod
+// that is merely between configs). Asserted over the raw manifests AND the Helm template so
+// the two never drift.
+func TestControllerProbesUseWarmReadyz(t *testing.T) {
+	files := []string{
+		"k8s/ingress-controller.yaml",
+		"k8s/gateway-controller.yaml",
+		"helm/cadish/templates/controller.yaml",
+	}
+	// startupProbe / readinessProbe must each carry an httpGet of /.cadish/readyz.
+	startup := regexp.MustCompile(`(?s)startupProbe:\s*\n\s*httpGet:\s*\n\s*path:\s*/\.cadish/readyz`)
+	readiness := regexp.MustCompile(`(?s)readinessProbe:\s*\n\s*httpGet:\s*\n\s*path:\s*/\.cadish/readyz`)
+	// livenessProbe must remain a tcpSocket probe (NOT httpGet).
+	livenessTCP := regexp.MustCompile(`(?s)livenessProbe:\s*\n\s*tcpSocket:`)
+	for _, f := range files {
+		src := readDeploy(t, f)
+		if !startup.MatchString(src) {
+			t.Errorf("%s: startupProbe must be httpGet /.cadish/readyz", f)
+		}
+		if !readiness.MatchString(src) {
+			t.Errorf("%s: readinessProbe must be httpGet /.cadish/readyz", f)
+		}
+		if !livenessTCP.MatchString(src) {
+			t.Errorf("%s: livenessProbe must stay tcpSocket (process-alive, not warm)", f)
+		}
+		// Defensive: the liveness probe must NOT have been switched to the readyz endpoint.
+		liveBlock := regexp.MustCompile(`(?s)livenessProbe:.*?(failureThreshold|resources:)`).FindString(src)
+		if strings.Contains(liveBlock, "/.cadish/readyz") {
+			t.Errorf("%s: livenessProbe must NOT use the warm-readiness endpoint", f)
+		}
+	}
+}
+
 // TestControllerRBACGrantsServices: the status writer reads the publish Service to
 // resolve the advertised address; without `services` get the GET is RBAC-forbidden and
 // status.loadBalancer never populates (the second staging bug). The controller
@@ -56,6 +92,32 @@ func TestControllerRBACGrantsServices(t *testing.T) {
 	}
 	if !regexp.MustCompile(`(?s)services.*?get|get.*?services`).MatchString(src) {
 		t.Error("rbac-controller.yaml: `services` is present but without a `get` verb")
+	}
+}
+
+// TestControllerRBACServicesIsGetOnly pins least privilege on the `services` rule: the
+// controller does a direct GET of the single publish Service (resolvePublishAddress) and
+// keeps NO Service informer/lister, so `get` is the only verb it needs. Granting list or
+// watch would be unused over-privilege (it could enumerate every Service in the cluster).
+// This locks the rule to verbs that are a subset of {get} across both controller manifests.
+func TestControllerRBACServicesIsGetOnly(t *testing.T) {
+	// Match the services rule's verbs list: `resources: ["services"]` then `verbs: [...]`.
+	rule := regexp.MustCompile(`(?s)resources:\s*\[\s*"services"\s*\]\s*\n\s*verbs:\s*\[([^\]]*)\]`)
+	for _, f := range []string{"k8s/rbac-controller.yaml", "k8s/rbac-controller-scoped.yaml"} {
+		src := readDeploy(t, f)
+		m := rule.FindStringSubmatch(src)
+		if m == nil {
+			t.Fatalf("%s: could not find the `services` rule verbs", f)
+		}
+		verbs := m[1]
+		if !strings.Contains(verbs, "get") {
+			t.Errorf("%s: services rule must grant `get` (status writer reads the publish Service); got verbs [%s]", f, verbs)
+		}
+		for _, over := range []string{"list", "watch", "create", "update", "patch", "delete"} {
+			if strings.Contains(verbs, over) {
+				t.Errorf("%s: services rule grants over-broad verb %q (the controller only GETs the publish Service); got verbs [%s]", f, over, verbs)
+			}
+		}
 	}
 }
 

@@ -259,6 +259,24 @@ func TestFetch_5xxIsStatusError(t *testing.T) {
 	if origin.StatusOf(err) != 500 {
 		t.Fatalf("StatusOf = %d want 500", origin.StatusOf(err))
 	}
+	// PRESERVE-ORIGIN-ERROR-BODY: the non-2xx StatusError now CARRIES the live body +
+	// headers (not drained) so the server can stream the origin's real error response
+	// verbatim. The holder MUST Close it.
+	if se.Body == nil {
+		t.Fatal("StatusError.Body = nil, want the live upstream error body (not drained)")
+	}
+	if got := se.Header.Get("Content-Type"); got != "text/plain; charset=utf-8" {
+		t.Fatalf("StatusError.Header Content-Type = %q, want the upstream error header", got)
+	}
+	got, rerr := io.ReadAll(se.Body)
+	se.CloseBody()
+	if rerr != nil {
+		t.Fatalf("read StatusError.Body: %v", rerr)
+	}
+	if string(got) != "boom\n" {
+		t.Fatalf("StatusError.Body = %q, want the upstream error body %q", got, "boom\n")
+	}
+	se.CloseBody() // idempotent: safe to call again
 }
 
 func TestFetch_ConnectionError(t *testing.T) {

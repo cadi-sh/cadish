@@ -145,6 +145,52 @@ func TestStickyPinAndRehash(t *testing.T) {
 	}
 }
 
+// TestResolveUpgradeHonorsRoutingKey pins Finding 3: a connection-upgrade tunnel
+// through a Sticky pool must pin to the SAME backend the Fetch path's pick would,
+// reading the routing key from the ctx (lb.WithRoutingKey) instead of falling back to
+// round-robin. Before the fix ResolveUpgrade hard-coded context.Background(), so a
+// Sticky pool round-robined the tunnel — repeated calls with one key would NOT be
+// stable. Uses the default origin factory so the backends are real httporigin
+// Upgraders.
+func TestResolveUpgradeHonorsRoutingKey(t *testing.T) {
+	cfg := staticCfg(t, Sticky, "http://a:80", "http://b:80", "http://c:80", "http://d:80")
+	u, err := New(cfg) // default factory -> httporigin origins (real Upgraders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithRoutingKey(context.Background(), "user-42")
+
+	// The Fetch path's canonical pick for this key.
+	want := u.pick(ctx, &origin.Request{}, map[string]bool{})
+	if want == nil {
+		t.Fatal("sticky pick returned nil")
+	}
+	wantHost := strings.TrimPrefix(want.baseURL, "http://")
+
+	tgt, err := u.ResolveUpgrade(ctx, &origin.Request{})
+	if err != nil {
+		t.Fatalf("ResolveUpgrade: %v", err)
+	}
+	if tgt.URL == nil {
+		t.Fatal("ResolveUpgrade returned nil URL")
+	}
+	if tgt.URL.Host != wantHost {
+		t.Fatalf("upgrade tunnel pinned to %s, want %s (must match the Fetch pick for the sticky key)", tgt.URL.Host, wantHost)
+	}
+
+	// Stability: the same key always targets the same backend (would round-robin across
+	// the 4 backends without the key being threaded through).
+	for i := 0; i < 20; i++ {
+		got, err := u.ResolveUpgrade(ctx, &origin.Request{})
+		if err != nil {
+			t.Fatalf("ResolveUpgrade iter %d: %v", i, err)
+		}
+		if got.URL.Host != wantHost {
+			t.Fatalf("sticky upgrade not stable: iter %d got %s, want %s (routing key not honored)", i, got.URL.Host, wantHost)
+		}
+	}
+}
+
 func TestShardByURL(t *testing.T) {
 	factory, _ := fakeFactory()
 	cfg := staticCfg(t, Shard, "http://a:80", "http://b:80", "http://c:80")
@@ -586,4 +632,40 @@ func TestK8sPokeReresolves(t *testing.T) {
 		backends, _, _ := u.snapshot()
 		return len(backends) == 2
 	})
+}
+
+// statusOrigin always returns a *StatusError with a fixed status, for asserting the
+// passive-ejection FSM's status classification.
+type statusOrigin struct{ code int }
+
+func (s statusOrigin) Fetch(ctx context.Context, req *origin.Request) (*origin.Response, error) {
+	return nil, &origin.StatusError{Status: s.code, Origin: "fake"}
+}
+
+// TestPassiveEjectionIgnores4xx pins the recordOutcome classification: a RETURNED 4xx
+// (403/404/429 — the backend answered fine, the client/request is at fault) must NOT
+// extend the passive-failure streak, so no number of 4xx answers ejects the backend.
+// Only transport errors (StatusOf==0) and 5xx (the backend itself failing) do — the
+// complement of TestPassiveEjection, which ejects on a returned 500.
+func TestPassiveEjectionIgnores4xx(t *testing.T) {
+	for _, code := range []int{http.StatusForbidden, http.StatusNotFound, http.StatusTooManyRequests} {
+		now := time.Unix(1000, 0)
+		clock := func() time.Time { return now }
+		factory := func(string, *Target, Timeouts) (origin.Origin, error) { return statusOrigin{code}, nil }
+		cfg := staticCfg(t, RoundRobin, "http://a:80")
+		u, err := New(cfg, WithOriginFactory(factory), WithClock(clock), WithPassiveEjection(3, 30*time.Second))
+		if err != nil {
+			t.Fatalf("%d: New: %v", code, err)
+		}
+		b := mustBackends(u)[0]
+		// Far more than the threshold of consecutive 4xx answers.
+		for i := 0; i < 10; i++ {
+			if _, ferr := u.Fetch(context.Background(), &origin.Request{Key: "/x"}); ferr == nil {
+				t.Fatalf("%d: expected the 4xx surfaced as an error", code)
+			}
+		}
+		if !b.eligible(now) {
+			t.Fatalf("%d: backend ejected after 4xx answers — a 4xx must not penalize backend health", code)
+		}
+	}
 }

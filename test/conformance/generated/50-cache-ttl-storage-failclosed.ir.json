@@ -1,0 +1,76 @@
+{
+  "irVersion": 6,
+  "site": {
+    "hosts": [
+      "example.com"
+    ],
+    "redirectHosts": [
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "live": {
+      "kind": "upstream_healthy",
+      "serverOnly": true
+    }
+  },
+  "recv": {
+    "pass": [
+      {
+        "always": true
+      }
+    ]
+  },
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1h0m0s"
+      }
+    ],
+    "storage": [
+      {
+        "selKind": "default",
+        "tier": "ram"
+      }
+    ]
+  },
+  "deliver": {},
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  },
+  "delegate": [
+    {
+      "directive": "upstream_healthy",
+      "reason": "matcher @live uses the `upstream_healthy` matcher (a server-side Gateway matcher with no edge JavaScript runtime case); it is failed-closed at the edge, so any directive matching on it must run on the Cadish server behind"
+    }
+  ]
+}

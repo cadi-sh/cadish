@@ -121,6 +121,47 @@ func (c Config) fingerprint() string {
 	b.WriteString(sep)
 	b.WriteString("reuse=")
 	b.WriteString(strconv.FormatBool(c.DisableReuse))
+	b.WriteString(sep)
+	// TLSVERIFY knobs (per-upstream origin TLS verification). These change how the
+	// origin handshake is verified / which ALPN is offered, so two pools differing
+	// ONLY here must NOT be transplanted with each other's transport across a reload
+	// (the spec's per-upstream isolation invariant). CAFile (the path) plus CAPEMHash
+	// (a content hash of the loaded PEM bytes) together stand in for the loaded RootCAs
+	// pool, which is not stably hashable: hashing the CONTENT — not just the path — makes
+	// a CA rotated IN PLACE (same path, new bytes) force a fresh pool instead of keeping
+	// the old RootCAs across a reload (Finding 4).
+	b.WriteString("insecure=")
+	b.WriteString(strconv.FormatBool(c.Insecure))
+	b.WriteString(sep)
+	b.WriteString("cafile=")
+	b.WriteString(c.CAFile)
+	b.WriteString(sep)
+	b.WriteString("capem=")
+	b.WriteString(c.CAPEMHash)
+	b.WriteString(sep)
+	b.WriteString("alpn=")
+	for _, p := range c.ALPN {
+		b.WriteString(p)
+		b.WriteString("\x1e")
+	}
+	b.WriteString(sep)
+
+	// Dynamic re-resolution knobs (the inline `resolve [interval] [nameserver ip:port…]`).
+	// They change WHICH resolver the pool runs (interval / nameserver set + ORDER), so a
+	// pool differing only here must be rebuilt — else editing `resolve` and reloading keeps
+	// the OLD resolver until restart (Finding 2). The nameserver ORDER is meaningful
+	// (fall-through), so hash them IN ORDER, each length-prefixed so two distinct lists can
+	// never alias to the same byte string.
+	b.WriteString("resolveiv=")
+	b.WriteString(strconv.FormatInt(int64(c.ResolveInterval), 10))
+	b.WriteString(sep)
+	b.WriteString("nameservers=")
+	for _, ns := range c.Nameservers {
+		b.WriteString(strconv.Itoa(len(ns)))
+		b.WriteString(":")
+		b.WriteString(ns)
+		b.WriteString("\x1e")
+	}
 
 	sum := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(sum[:])

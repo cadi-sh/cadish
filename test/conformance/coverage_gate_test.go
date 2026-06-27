@@ -8,7 +8,31 @@ import (
 	"regexp"
 	"sort"
 	"testing"
+
+	"github.com/cadi-sh/cadish/internal/edgeir"
 )
+
+// TestServerOnlyKindsInLockstep is the Finding 7 drift guard: the test-local
+// serverOnlyMatcherKinds must EQUAL the projector's edgeir.serverOnlyEdgeKinds set. The
+// two drifted once (the projector added `upstream_healthy` while this mirror still listed
+// only all+query), silently weakening the coverage gate. Asserting set equality here makes
+// any future divergence fail loudly instead of going unnoticed.
+func TestServerOnlyKindsInLockstep(t *testing.T) {
+	proj := edgeir.ServerOnlyEdgeKinds()
+	for k := range proj {
+		if !serverOnlyMatcherKinds[k] {
+			t.Errorf("projector marks %q server-only but the coverage-gate mirror does not", k)
+		}
+	}
+	for k := range serverOnlyMatcherKinds {
+		if !proj[k] {
+			t.Errorf("coverage-gate mirror lists %q but the projector does not — stale entry", k)
+		}
+	}
+	if len(proj) != len(serverOnlyMatcherKinds) {
+		t.Errorf("set sizes differ: projector=%d, mirror=%d", len(proj), len(serverOnlyMatcherKinds))
+	}
+}
 
 // purgeGuardTokenFixture is the fixture whose Cadishfile carries a purge-guard secret
 // (an inline `purge when header X-Purge-Token <token>`), and the literal token it must
@@ -80,12 +104,12 @@ func TestEveryProjectableKindHasFixture(t *testing.T) {
 	// on purpose — it is server-only and never reaches the worker IR.
 	wantMatcherKinds := []string{
 		"path", "path_regex", "host", "host_regex", "header", "method", "upstream",
-		"content_type", "cookie", "cookie_json", "header_json", "set_cookie",
+		"content_type", "resp_header", "cookie", "cookie_json", "header_json", "set_cookie",
 		"classify", "geo", "query_present",
 	}
 	// Cache-key token kinds: the Kind values of pipeline.toEdgeKeyToken.
 	wantTokenKinds := []string{
-		"method", "host", "path", "url", "query", "query_allow", "header", "sticky",
+		"method", "host", "path", "url", "query", "query_allow", "query_strip", "header", "sticky",
 		"device", "geo", "geo.continent", "geo.region", "normalize", "classify",
 		"tenant", "literal",
 	}
@@ -353,11 +377,14 @@ func bytesIndex(s, sub string) int {
 
 // serverOnlyMatcherKinds mirrors internal/edgeir.serverOnlyEdgeKinds: matcher kinds with
 // NO edge JavaScript runtime case, which the projector marks serverOnly + delegates and the
-// worker fails CLOSED on. Kept in lockstep with the projector's set (Fix #1/#4). A kind here
-// need not have a JS matchOne case — it must never silently match at the edge.
+// worker fails CLOSED on. Kept in lockstep with the projector's set (Fix #1/#4); equality is
+// asserted by TestServerOnlyKindsInLockstep so this can never silently drift again. A kind
+// here need not have a JS matchOne case — it must never silently match at the edge.
 var serverOnlyMatcherKinds = map[string]bool{
-	"all":   true,
-	"query": true,
+	"all":              true,
+	"query":            true,
+	"upstream_healthy": true, // live lb-pool liveness probe — no edge analogue (D49)
+	"ip":               true, // IP/CIDR ACL — resolves the real client IP, no edge analogue (R02)
 }
 
 // collectMatcherKinds walks a generated IR and returns the kinds of every MATCHER object:

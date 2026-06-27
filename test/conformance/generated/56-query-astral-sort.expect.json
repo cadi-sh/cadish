@@ -1,0 +1,39 @@
+[
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "example.com\u001fm=%EE%80%80\u0026m=%F0%9F%98%80\u0026x%EE%80%80=1\u0026x%F0%9F%98%80=2",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 0,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "X-Cache-Key",
+      "cacheKeyRaw": true,
+      "cacheKeyValue": "example.com\u001fm=%EE%80%80\u0026m=%F0%9F%98%80\u0026x%EE%80%80=1\u0026x%F0%9F%98%80=2",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  }
+]

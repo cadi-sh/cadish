@@ -458,10 +458,10 @@ func TestJSONMatcherValueExposureWarning(t *testing.T) {
 	}
 }
 
-// compileWithEnv mirrors the real edge load: parse → SubstituteEnv → compile. An
-// unquoted `{$VAR}` placeholder is env-expanded to its literal value before compile
-// (so a secret lands in the IR); a quoted `"{$VAR}"` stays the literal text `{$VAR}`
-// (never expanded — classifyArg treats a quoted token as a literal).
+// compileWithEnv mirrors the real edge load: parse → SubstituteEnv → compile. A
+// `{$VAR}` placeholder — quoted OR unquoted (both expand since R07/D94) — is
+// env-expanded to its value before compile (so a secret lands in the IR); only an
+// ESCAPED `\{$VAR}` keeps the literal text.
 func compileWithEnv(t *testing.T, src string, env map[string]string) *pipeline.Pipeline {
 	t.Helper()
 	f, err := cadishfile.Parse("test.cadish", []byte(src))
@@ -501,12 +501,11 @@ func withEnvValues(t *testing.T, env map[string]string) {
 }
 
 // TestValueExposureScansAllStringFields (Fix 1) pins that the secret-exposure gate
-// covers EVERY IR string field whose source could be an unquoted `{$VAR}` env
-// placeholder — not just matcher values. An env-expanded secret in a request/response
-// header value, a `replace` transform, a `respond on_error` body, a `redirect` target,
-// or a cache_key `literal:` token must be flagged for value exposure (so `cadish edge
-// build -strict` trips), while a quoted `"{$VAR}"` (which stays the literal text and
-// never ships the secret) must NOT warn.
+// covers EVERY IR string field whose source could be a `{$VAR}` env placeholder — not
+// just matcher values. An env-expanded secret in a request/response header value, a
+// `replace` transform, a `respond on_error` body, a `redirect` target, or a cache_key
+// `literal:` token must be flagged for value exposure (so `cadish edge build -strict`
+// trips). Since R07/D94 a quoted `"{$VAR}"` expands too, so the quoted cases warn as well.
 func TestValueExposureScansAllStringFields(t *testing.T) {
 	env := map[string]string{"HDR_SECRET": "topsecret-aabbccdd"}
 	withEnvValues(t, env)
@@ -552,6 +551,16 @@ func TestValueExposureScansAllStringFields(t *testing.T) {
     cache_key host literal:{$HDR_SECRET}
     cache_ttl default ttl 1m
 }`},
+		// R07/D94: a QUOTED "{$VAR}" now ALSO env-expands (no longer kept literal), so a
+		// quoted secret in an edge-projected field ships to the edge and MUST warn too.
+		{"quoted req header value", `example.com {
+    header X-Internal-Auth "{$HDR_SECRET}"
+    cache_ttl default ttl 1m
+}`},
+		{"quoted on_error body", `example.com {
+    respond on_error 503 "{$HDR_SECRET}"
+    cache_ttl default ttl 1m
+}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -567,11 +576,12 @@ func TestValueExposureScansAllStringFields(t *testing.T) {
 	}
 }
 
-// TestValueExposureQuotedPlaceholderClean (Fix 1): a QUOTED "{$VAR}" is never
-// env-expanded — it stays the literal text `{$VAR}` and ships no secret — so it must
-// NOT be flagged. And a plain non-env literal must not be flagged either (the scan is
-// env-value-scoped, not flag-everything, for these fields).
-func TestValueExposureQuotedPlaceholderClean(t *testing.T) {
+// TestValueExposureNonEnvClean: a value that does NOT carry a process-env secret must
+// NOT be flagged — the scan is env-value-scoped, not flag-everything. A plain literal
+// ships clean, and an ESCAPED `\{$VAR}` keeps the literal text (not the secret) so it
+// ships clean too. (Post-R07/D94 a QUOTED `"{$VAR}"` DOES expand and IS flagged — see
+// TestValueExposureScansAllStringFields's quoted cases.)
+func TestValueExposureNonEnvClean(t *testing.T) {
 	env := map[string]string{"HDR_SECRET": "topsecret-aabbccdd"}
 	withEnvValues(t, env)
 
@@ -579,16 +589,12 @@ func TestValueExposureQuotedPlaceholderClean(t *testing.T) {
 		name string
 		src  string
 	}{
-		{"quoted placeholder header", `example.com {
-    header X-Internal-Auth "{$HDR_SECRET}"
-    cache_ttl default ttl 1m
-}`},
 		{"plain literal header", `example.com {
     header X-Frame-Options DENY
     cache_ttl default ttl 1m
 }`},
-		{"quoted placeholder on_error", `example.com {
-    respond on_error 503 "{$HDR_SECRET}"
+		{"escaped placeholder header", `example.com {
+    header X-Internal-Auth \{$HDR_SECRET}
     cache_ttl default ttl 1m
 }`},
 	}
@@ -600,7 +606,7 @@ func TestValueExposureQuotedPlaceholderClean(t *testing.T) {
 				t.Fatalf("Project: %v", err)
 			}
 			if rep.ValueExposed != 0 {
-				t.Errorf("ValueExposed = %d, want 0 (quoted/non-env value ships no secret); warnings = %v", rep.ValueExposed, rep.Warnings)
+				t.Errorf("ValueExposed = %d, want 0 (non-env value ships no secret); warnings = %v", rep.ValueExposed, rep.Warnings)
 			}
 		})
 	}
@@ -998,6 +1004,30 @@ func TestProjectUntranslatableRegexDelegated(t *testing.T) {
 	}
 }
 
+// TestProjectLaterRedirectDelegatedAfterUntranslatable guards Finding 5: once an
+// earlier redirect rule is delegated (here because it uses an untranslatable RE2
+// construct), every LATER redirect must ALSO be delegated — never appended natively
+// in source order. Otherwise the edge would terminally answer a request whose true
+// origin first-match is the earlier (delegated) rule, a silent wrong-redirect.
+func TestProjectLaterRedirectDelegatedAfterUntranslatable(t *testing.T) {
+	src := `x {
+    redirect (?U)^/a+$ 301 https://e/x
+    redirect ^/a$ 302 https://e/y
+    cache_key host path
+}`
+	p := compile(t, src)
+	ir, rep, err := Project(p)
+	if err != nil {
+		t.Fatalf("Project: %v", err)
+	}
+	if len(ir.Recv.Redirect) != 0 {
+		t.Errorf("want 0 native redirects (both delegated for first-match safety), got %d: %+v", len(ir.Recv.Redirect), ir.Recv.Redirect)
+	}
+	if !hasDelegate(rep, "redirect") {
+		t.Errorf("redirect not delegated; report = %+v", rep)
+	}
+}
+
 // TestProjectInlineClassifyMatcherEmitted (BUG-2) asserts that an inline (unnamed)
 // matcher in a classify `when` row projects to a synthesized NAMED matcher the
 // runtime can resolve — never an empty conj entry (which would silently no-op).
@@ -1209,5 +1239,759 @@ func TestScopedRespondDelegated(t *testing.T) {
 	}
 	if rep.Delegated == 0 {
 		t.Errorf("rep.Delegated = 0, want > 0 so -strict fails (scoped respond must not be silently dropped)")
+	}
+}
+
+// hasPass reports whether the projected RECV pass list contains an unconditional
+// (Always) pass scope — the Finding 2/3 site-wide fail-open marker.
+func hasAlwaysPass(ir EdgeIR) bool {
+	for _, s := range ir.Recv.Pass {
+		if s.Always {
+			return true
+		}
+	}
+	return false
+}
+
+// hasWarn reports whether any coverage warning contains the substring.
+func hasWarn(rep CoverageReport, sub string) bool {
+	for _, w := range rep.Warnings {
+		if strings.Contains(w, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRedirectScopeServerOnlyDelegated (Finding 1): a `redirect @scope` whose scope
+// references a SERVER-ONLY matcher (upstream_healthy) fails closed at the edge — so a
+// LATER redirect would wrongly become the edge's first match while the Go server picks
+// the earlier (scoped) rule. The projector must delegate the scoped redirect AND, via the
+// first-match cascade, every later redirect — shipping ZERO native redirects.
+func TestRedirectScopeServerOnlyDelegated(t *testing.T) {
+	src := `example.com {
+    @live upstream_healthy pool
+    redirect @live 302 https://blocked.example/
+    redirect (?i)^/foo 301 https://new.example/
+    cache_key host path
+}`
+	p := compile(t, src)
+	ir, rep, err := Project(p)
+	if err != nil {
+		t.Fatalf("Project: %v", err)
+	}
+	if len(ir.Recv.Redirect) != 0 {
+		t.Errorf("want 0 native redirects (scoped + later both delegated), got %d: %+v", len(ir.Recv.Redirect), ir.Recv.Redirect)
+	}
+	if !hasDelegate(rep, "redirect") {
+		t.Errorf("redirect referencing a server-only scope not delegated; report = %+v", rep)
+	}
+	// Two redirects total ⇒ at least two redirect delegate entries (the scoped one + the
+	// cascaded later one), so the edge never terminally answers the later rule.
+	n := 0
+	for _, it := range rep.DelegatedItems {
+		if it.Directive == "redirect" {
+			n++
+		}
+	}
+	if n < 2 {
+		t.Errorf("want >=2 redirect delegations (scoped + cascade), got %d", n)
+	}
+}
+
+// TestRedirectScopeUntranslatableRegexDelegated (Finding 1): the SAME first-match-wins
+// protection when the scope references an untranslatable `(?U)` path_regex (not the
+// redirect's own regex).
+func TestRedirectScopeUntranslatableRegexDelegated(t *testing.T) {
+	src := `example.com {
+    @ungreedy path_regex (?U)^/(foo|bar)
+    redirect @ungreedy 302 https://blocked.example/
+    redirect (?i)^/foo 301 https://new.example/
+    cache_key host path
+}`
+	p := compile(t, src)
+	ir, rep, err := Project(p)
+	if err != nil {
+		t.Fatalf("Project: %v", err)
+	}
+	if len(ir.Recv.Redirect) != 0 {
+		t.Errorf("want 0 native redirects (scoped untranslatable + later both delegated), got %d: %+v", len(ir.Recv.Redirect), ir.Recv.Redirect)
+	}
+	if !hasDelegate(rep, "redirect") {
+		t.Errorf("redirect referencing an untranslatable-regex scope not delegated; report = %+v", rep)
+	}
+}
+
+// TestPassScopeFailClosedFailsOpen (Finding 2): a `pass @scope` whose scope fails closed
+// at the edge would let the edge CACHE a path the server passes. The projector must fail
+// OPEN — emit a site-wide unconditional pass — so the edge never caches a passed path.
+func TestPassScopeFailClosedFailsOpen(t *testing.T) {
+	// Untranslatable-regex scope.
+	{
+		src := `example.com {
+    @ungreedy path_regex (?U)^/(foo|bar)
+    pass @ungreedy
+    cache_key host path
+    cache_ttl default ttl 1h
+}`
+		p := compile(t, src)
+		ir, rep, err := Project(p)
+		if err != nil {
+			t.Fatalf("Project: %v", err)
+		}
+		if !hasAlwaysPass(ir) {
+			t.Errorf("want a site-wide Always pass (fail-open) for a fail-closed pass scope; recv.pass = %+v", ir.Recv.Pass)
+		}
+		// The fail-closed scope must NOT be shipped as a native pass the edge cannot honor.
+		for _, s := range ir.Recv.Pass {
+			if !s.Always && scopeFailsClosed(s, ir.Matchers) {
+				t.Errorf("a fail-closed pass scope was shipped native: %+v", s)
+			}
+		}
+		if !hasWarn(rep, "PASS-FAIL-OPEN") {
+			t.Errorf("want a PASS-FAIL-OPEN warning; warnings = %v", rep.Warnings)
+		}
+	}
+	// Server-only matcher scope.
+	{
+		src := `example.com {
+    @live upstream_healthy pool
+    pass @live
+    cache_key host path
+    cache_ttl default ttl 1h
+}`
+		p := compile(t, src)
+		ir, _, err := Project(p)
+		if err != nil {
+			t.Fatalf("Project: %v", err)
+		}
+		if !hasAlwaysPass(ir) {
+			t.Errorf("want a site-wide Always pass (fail-open) for a server-only pass scope; recv.pass = %+v", ir.Recv.Pass)
+		}
+	}
+}
+
+// hasNativeScopedPass reports whether the RECV pass list contains a NON-Always pass
+// scope that names the given matcher — i.e. the scoped pass was shipped natively (the
+// no-over-reaction marker for a fully edge-translatable scope).
+func hasNativeScopedPass(ir EdgeIR, name string) bool {
+	for _, s := range ir.Recv.Pass {
+		if s.Always {
+			continue
+		}
+		for _, n := range s.Names {
+			if n == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestPassScopeViaFailClosedClassifierFailsOpen (Finding 1, MED): a `pass @gated` gated on
+// a CLASSIFY-token matcher (`@gated classify {C}==v`) carries no ServerOnly/Regex flag of
+// its own, but the classifier C has a ROW whose conjunction references a fail-closed matcher
+// (an untranslatable `(?U)` regex, or a server-only `upstream_healthy`). At the edge that row
+// is skipped → the classifier returns its default → `@gated` never fires → the edge would
+// CACHE a path the Go server passes. The projector must treat the classify matcher as
+// fail-closed (via the classifiersFailClosed fixpoint) and fail OPEN — a site-wide pass.
+func TestPassScopeViaFailClosedClassifierFailsOpen(t *testing.T) {
+	// (a) classifier row uses an untranslatable `(?U)` path_regex.
+	t.Run("untranslatable-regex-row", func(t *testing.T) {
+		src := `example.com {
+    @ungreedy path_regex (?U)^/(gate|block)
+    classify {age} {
+        when @ungreedy -> gate
+        default        -> open
+    }
+    @gated classify {age}==gate
+    pass @gated
+    cache_key host path
+    cache_ttl default ttl 1h
+}`
+		p := compile(t, src)
+		ir, rep, err := Project(p)
+		if err != nil {
+			t.Fatalf("Project: %v", err)
+		}
+		if !ir.Matchers["gated"].failsClosed {
+			t.Errorf("classify matcher @gated reading a fail-closed classifier was not marked failsClosed: %+v", ir.Matchers["gated"])
+		}
+		if !hasAlwaysPass(ir) {
+			t.Errorf("want a site-wide Always pass (fail-open) for a pass gated on a fail-closed classifier; recv.pass = %+v", ir.Recv.Pass)
+		}
+		for _, s := range ir.Recv.Pass {
+			if !s.Always && scopeFailsClosed(s, ir.Matchers) {
+				t.Errorf("a fail-closed pass scope was shipped native: %+v", s)
+			}
+		}
+		if !hasWarn(rep, "PASS-FAIL-OPEN") {
+			t.Errorf("want a PASS-FAIL-OPEN warning; warnings = %v", rep.Warnings)
+		}
+	})
+
+	// (b) classifier row uses a server-only `upstream_healthy` matcher.
+	t.Run("server-only-row", func(t *testing.T) {
+		src := `example.com {
+    @live upstream_healthy pool
+    classify {health} {
+        when @live -> up
+        default    -> down
+    }
+    @gated classify {health}==up
+    pass @gated
+    cache_key host path
+    cache_ttl default ttl 1h
+}`
+		p := compile(t, src)
+		ir, _, err := Project(p)
+		if err != nil {
+			t.Fatalf("Project: %v", err)
+		}
+		if !ir.Matchers["gated"].failsClosed {
+			t.Errorf("classify matcher @gated reading a server-only-row classifier was not marked failsClosed: %+v", ir.Matchers["gated"])
+		}
+		if !hasAlwaysPass(ir) {
+			t.Errorf("want a site-wide Always pass (fail-open) for a server-only-row classifier; recv.pass = %+v", ir.Recv.Pass)
+		}
+	})
+
+	// (c) TRANSITIVE: a classifier whose row reads ANOTHER classify token that is itself
+	// fail-closed must propagate through the fixpoint (nested classify indirection).
+	t.Run("transitive-nested-classifier", func(t *testing.T) {
+		src := `example.com {
+    @ungreedy path_regex (?U)^/(gate|block)
+    classify {inner} {
+        when @ungreedy -> hit
+        default        -> miss
+    }
+    @innergate classify {inner}==hit
+    classify {outer} {
+        when @innergate -> gated
+        default         -> plain
+    }
+    @outergate classify {outer}==gated
+    pass @outergate
+    cache_key host path
+    cache_ttl default ttl 1h
+}`
+		p := compile(t, src)
+		ir, _, err := Project(p)
+		if err != nil {
+			t.Fatalf("Project: %v", err)
+		}
+		if !ir.Matchers["outergate"].failsClosed {
+			t.Errorf("transitive classify matcher @outergate not marked failsClosed (nested fixpoint missed): %+v", ir.Matchers["outergate"])
+		}
+		if !hasAlwaysPass(ir) {
+			t.Errorf("want a site-wide Always pass (fail-open) for a transitively fail-closed classifier; recv.pass = %+v", ir.Recv.Pass)
+		}
+	})
+
+	// (d) NO OVER-REACTION: a classifier whose rows are ALL edge-translatable must NOT
+	// trip fail-open — the scoped `pass @gated` ships NATIVE (the edge can honor it).
+	t.Run("translatable-classifier-stays-native", func(t *testing.T) {
+		src := `example.com {
+    @verified cookie verified_prod
+    @adult    host adult.example.com
+    classify {age} {
+        when @verified -> ok
+        when @adult    -> gate
+        default        -> open
+    }
+    @gated classify {age}==gate
+    pass @gated
+    cache_key host path
+    cache_ttl default ttl 1h
+}`
+		p := compile(t, src)
+		ir, rep, err := Project(p)
+		if err != nil {
+			t.Fatalf("Project: %v", err)
+		}
+		if ir.Matchers["gated"].failsClosed {
+			t.Errorf("classify matcher @gated reading a fully-translatable classifier was wrongly marked failsClosed")
+		}
+		if hasAlwaysPass(ir) {
+			t.Errorf("over-reaction: a fully-translatable classifier tripped a site-wide fail-open pass; recv.pass = %+v", ir.Recv.Pass)
+		}
+		if !hasNativeScopedPass(ir, "gated") {
+			t.Errorf("want the scoped `pass @gated` shipped NATIVE for a translatable classifier; recv.pass = %+v", ir.Recv.Pass)
+		}
+		if hasWarn(rep, "PASS-FAIL-OPEN") {
+			t.Errorf("unexpected PASS-FAIL-OPEN warning for a translatable classifier; warnings = %v", rep.Warnings)
+		}
+	})
+}
+
+// TestCacheTTLScopeFailClosedFailsOpen (Finding 2): a scoped `cache_ttl @scope` whose
+// scope fails closed at the edge would silently fall through to `default` (wrong TTL).
+// The projector must DROP the unrepresentable scoped rule and fail OPEN (site-wide pass)
+// so the edge caches nothing it cannot judge.
+func TestCacheTTLScopeFailClosedFailsOpen(t *testing.T) {
+	src := `example.com {
+    @ungreedy path_regex (?U)^/(live|stream)
+    cache_ttl @ungreedy hit_for_miss 1s
+    cache_ttl default ttl 1h
+    cache_key host path
+}`
+	p := compile(t, src)
+	ir, rep, err := Project(p)
+	if err != nil {
+		t.Fatalf("Project: %v", err)
+	}
+	// The scoped TTL rule must NOT be projected (the edge cannot evaluate its scope).
+	for _, ttl := range ir.Response.TTL {
+		if ttl.SelKind == "scope" && ttl.Scope != nil && scopeFailsClosed(*ttl.Scope, ir.Matchers) {
+			t.Errorf("a fail-closed scoped cache_ttl rule was shipped: %+v", ttl)
+		}
+	}
+	if !hasAlwaysPass(ir) {
+		t.Errorf("want a site-wide Always pass (fail-open) for a fail-closed scoped cache_ttl; recv.pass = %+v", ir.Recv.Pass)
+	}
+	if !hasWarn(rep, "CACHE_TTL-FAIL-OPEN") {
+		t.Errorf("want a CACHE_TTL-FAIL-OPEN warning; warnings = %v", rep.Warnings)
+	}
+}
+
+// TestStorageScopeFailClosedFailsOpen (Finding 2): the SAME protection for a scoped
+// `storage @scope -> tier` whose scope fails closed at the edge.
+func TestStorageScopeFailClosedFailsOpen(t *testing.T) {
+	src := `example.com {
+    @live upstream_healthy pool
+    storage @live -> disk
+    storage default -> ram
+    cache_key host path
+    cache_ttl default ttl 1h
+}`
+	p := compile(t, src)
+	ir, rep, err := Project(p)
+	if err != nil {
+		t.Fatalf("Project: %v", err)
+	}
+	for _, st := range ir.Response.Storage {
+		if st.SelKind == "scope" && st.Scope != nil && scopeFailsClosed(*st.Scope, ir.Matchers) {
+			t.Errorf("a fail-closed scoped storage rule was shipped: %+v", st)
+		}
+	}
+	if !hasAlwaysPass(ir) {
+		t.Errorf("want a site-wide Always pass (fail-open) for a fail-closed scoped storage; recv.pass = %+v", ir.Recv.Pass)
+	}
+	if !hasWarn(rep, "STORAGE-FAIL-OPEN") {
+		t.Errorf("want a STORAGE-FAIL-OPEN warning; warnings = %v", rep.Warnings)
+	}
+}
+
+// TestEdgeTierPolicyScopeFailClosedFailsOpen (LAST store-decision surface): an `edge {}`
+// per-scope tier policy (`local | distribute | skip @scope`) whose scope references a
+// matcher the edge fails closed on cannot be evaluated by resolveEdgeTier, which then
+// falls the request to the `default` tier — caching a `skip` path the operator marked
+// never-cache-at-edge, or mis-tiering a local/distribute object. The projector must NOT
+// ship that policy and must fail OPEN (site-wide pass) — mirroring storage/cache_ttl —
+// emitting an EDGE-TIER-FAIL-OPEN warning so `--strict` trips. Covers all three tiers and
+// the three fail-closed shapes (untranslatable regex, server-only matcher, transitive
+// classify token).
+func TestEdgeTierPolicyScopeFailClosedFailsOpen(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{
+			// skip @scope on an untranslatable (?U) regex: the never-cache-at-edge intent.
+			name: "skip-untranslatable-regex",
+			src: `example.com {
+    @ungreedy path_regex (?U)^/(live|stream)
+    edge {
+        worker w
+        kv     EDGE_CACHE
+        default local
+        skip @ungreedy
+    }
+    cache_key host path
+    cache_ttl default ttl 1h
+}`,
+		},
+		{
+			// distribute @scope on a server-only upstream_healthy matcher.
+			name: "distribute-server-only-matcher",
+			src: `example.com {
+    @live upstream_healthy pool
+    edge {
+        worker w
+        kv     EDGE_CACHE
+        default local
+        distribute @live
+    }
+    cache_key host path
+    cache_ttl default ttl 1h
+}`,
+		},
+		{
+			// skip gated on a classify token whose classifier reads a fail-closed matcher
+			// (transitive coverage via clsFC).
+			name: "skip-transitive-classify-token",
+			src: `example.com {
+    @ungreedy path_regex (?U)^/(gate|block)
+    classify {age} {
+        when @ungreedy -> gate
+        default        -> open
+    }
+    @gated classify {age}==gate
+    edge {
+        worker w
+        kv     EDGE_CACHE
+        default local
+        skip @gated
+    }
+    cache_key host path
+    cache_ttl default ttl 1h
+}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := compile(t, tc.src)
+			ir, rep, err := Project(p)
+			if err != nil {
+				t.Fatalf("Project: %v", err)
+			}
+			// No fail-closed tier policy may ship to the worker.
+			for _, pol := range ir.Edge.Policies {
+				if scopeFailsClosed(pol.Scope, ir.Matchers) {
+					t.Errorf("a fail-closed edge tier policy was shipped: %+v", pol)
+				}
+			}
+			if len(ir.Edge.Policies) != 0 {
+				t.Errorf("want the fail-closed tier policy dropped; policies = %+v", ir.Edge.Policies)
+			}
+			if !hasAlwaysPass(ir) {
+				t.Errorf("want a site-wide Always pass (fail-open) for a fail-closed edge tier policy; recv.pass = %+v", ir.Recv.Pass)
+			}
+			if !hasWarn(rep, "EDGE-TIER-FAIL-OPEN") {
+				t.Errorf("want an EDGE-TIER-FAIL-OPEN warning; warnings = %v", rep.Warnings)
+			}
+		})
+	}
+}
+
+// TestEdgeTierPolicyTranslatableProjectsNative (regression / no over-reaction): a fully
+// edge-translatable `edge { skip @y }` STILL projects the tier policy native — no
+// fail-open, no EDGE-TIER-FAIL-OPEN warning.
+func TestEdgeTierPolicyTranslatableProjectsNative(t *testing.T) {
+	src := `example.com {
+    @html   content_type text/html
+    @assets path /assets/*
+    edge {
+        worker w
+        kv     EDGE_CACHE
+        default local
+        distribute @html
+        skip @assets
+    }
+    cache_key url
+    cache_ttl default ttl 30s grace 10m
+}`
+	p := compile(t, src)
+	ir, rep, err := Project(p)
+	if err != nil {
+		t.Fatalf("Project: %v", err)
+	}
+	if len(ir.Edge.Policies) != 2 {
+		t.Fatalf("want 2 native edge policies, got %d: %+v", len(ir.Edge.Policies), ir.Edge.Policies)
+	}
+	if ir.Edge.Policies[0].Tier != "distribute" || ir.Edge.Policies[0].Scope.Names[0] != "html" {
+		t.Errorf("policy[0] = %+v", ir.Edge.Policies[0])
+	}
+	if ir.Edge.Policies[1].Tier != "skip" || ir.Edge.Policies[1].Scope.Names[0] != "assets" {
+		t.Errorf("policy[1] = %+v", ir.Edge.Policies[1])
+	}
+	if hasWarn(rep, "EDGE-TIER-FAIL-OPEN") {
+		t.Errorf("unexpected EDGE-TIER-FAIL-OPEN warning for a translatable edge tier policy; warnings = %v", rep.Warnings)
+	}
+	if hasAlwaysPass(ir) {
+		t.Errorf("unexpected site-wide pass for a translatable edge tier policy; recv.pass = %+v", ir.Recv.Pass)
+	}
+}
+
+// hasFailClosedRecipe reports whether any shipped cache_key recipe selector or classify
+// token references a matcher/classifier the edge fails closed on — the divergent-key
+// shape Findings 1 & 2 must never ship to the worker.
+func hasFailClosedRecipe(ir EdgeIR, clsFC map[string]bool) bool {
+	check := func(s Scope, tokens []KeyToken) bool {
+		fc, _ := directiveScopeOrTokensFailClosed(s, tokens, ir.Matchers, clsFC)
+		return fc
+	}
+	if check(Scope{Always: true}, ir.Key.Tokens) {
+		return true
+	}
+	for _, r := range ir.Key.Recipes {
+		if check(r.Selector, r.Tokens) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestCacheKeyRecipeScopeFailClosedFailsOpen (Finding 1, HIGH): a scoped `cache_key @scope …`
+// RECIPE whose SELECTOR references a matcher the edge fails closed on (a server-only matcher
+// or an untranslatable RE2 regex) never matches at the edge → selectKeyTokens falls through to
+// a later/catch-all recipe → a DIFFERENT key than the Go server (full matcher set,
+// first-match-wins) → the edge stores one variant and serves it cross-variant. The projector
+// must NOT ship that recipe and must fail OPEN (site-wide pass) — mirroring cache_ttl/storage.
+func TestCacheKeyRecipeScopeFailClosedFailsOpen(t *testing.T) {
+	// (a) untranslatable-regex selector.
+	t.Run("untranslatable-regex-selector", func(t *testing.T) {
+		src := `example.com {
+    @ungreedy path_regex (?U)^/(live|stream)
+    cache_key @ungreedy host path query
+    cache_key default   host path
+    cache_ttl default ttl 1h
+}`
+		p := compile(t, src)
+		ir, rep, err := Project(p)
+		if err != nil {
+			t.Fatalf("Project: %v", err)
+		}
+		clsFC := classifiersFailClosed(ir.Classifiers, ir.Matchers)
+		if hasFailClosedRecipe(ir, clsFC) {
+			t.Errorf("a fail-closed cache_key recipe was shipped to the edge; recipes = %+v", ir.Key.Recipes)
+		}
+		if !hasAlwaysPass(ir) {
+			t.Errorf("want a site-wide Always pass (fail-open) for a fail-closed cache_key recipe selector; recv.pass = %+v", ir.Recv.Pass)
+		}
+		if !hasWarn(rep, "CACHE_KEY-FAIL-OPEN") {
+			t.Errorf("want a CACHE_KEY-FAIL-OPEN warning; warnings = %v", rep.Warnings)
+		}
+	})
+
+	// (b) server-only selector.
+	t.Run("server-only-selector", func(t *testing.T) {
+		src := `example.com {
+    @live upstream_healthy pool
+    cache_key @live  host path query
+    cache_key default host path
+    cache_ttl default ttl 1h
+}`
+		p := compile(t, src)
+		ir, rep, err := Project(p)
+		if err != nil {
+			t.Fatalf("Project: %v", err)
+		}
+		clsFC := classifiersFailClosed(ir.Classifiers, ir.Matchers)
+		if hasFailClosedRecipe(ir, clsFC) {
+			t.Errorf("a server-only cache_key recipe was shipped to the edge; recipes = %+v", ir.Key.Recipes)
+		}
+		if !hasAlwaysPass(ir) {
+			t.Errorf("want a site-wide Always pass (fail-open) for a server-only cache_key recipe selector; recv.pass = %+v", ir.Recv.Pass)
+		}
+		if !hasWarn(rep, "CACHE_KEY-FAIL-OPEN") {
+			t.Errorf("want a CACHE_KEY-FAIL-OPEN warning; warnings = %v", rep.Warnings)
+		}
+	})
+
+	// (c) NO OVER-REACTION: a scoped recipe whose selector is fully edge-translatable ships
+	// NATIVE (both recipes projected, no fail-open pass) — the 183-case parity guard.
+	t.Run("translatable-selector-stays-native", func(t *testing.T) {
+		src := `example.com {
+    @ssr header X-SSR 1
+    cache_key @ssr    host path
+    cache_key default host url
+    cache_ttl default ttl 1h
+}`
+		p := compile(t, src)
+		ir, rep, err := Project(p)
+		if err != nil {
+			t.Fatalf("Project: %v", err)
+		}
+		if hasAlwaysPass(ir) {
+			t.Errorf("over-reaction: a translatable cache_key recipe tripped a fail-open pass; recv.pass = %+v", ir.Recv.Pass)
+		}
+		if len(ir.Key.Recipes) != 2 {
+			t.Errorf("want both recipes shipped native; got %d: %+v", len(ir.Key.Recipes), ir.Key.Recipes)
+		}
+		if hasWarn(rep, "CACHE_KEY-FAIL-OPEN") {
+			t.Errorf("unexpected CACHE_KEY-FAIL-OPEN warning for a translatable recipe; warnings = %v", rep.Warnings)
+		}
+	})
+}
+
+// TestCacheKeyClassifyTokenFailClosedFailsOpen (Finding 2, HIGH): a cache_key `classify {C}`
+// TOKEN whose classifier C has a ROW referencing a fail-closed matcher resolves to the
+// classifier DEFAULT at the edge while the Go server returns the matched row → a divergent key
+// COMPONENT → cross-variant serving. The projector must drop the divergently-keyed recipe and
+// fail OPEN.
+func TestCacheKeyClassifyTokenFailClosedFailsOpen(t *testing.T) {
+	// (a) the token sits on the DEFAULT (unscoped) recipe — covered by the site-wide pass.
+	t.Run("default-recipe-token", func(t *testing.T) {
+		src := `example.com {
+    @ungreedy path_regex (?U)^/(gate|block)
+    classify {bucket} {
+        when @ungreedy -> a
+        default        -> b
+    }
+    cache_key method host path {bucket}
+    cache_ttl default ttl 1h
+}`
+		p := compile(t, src)
+		ir, rep, err := Project(p)
+		if err != nil {
+			t.Fatalf("Project: %v", err)
+		}
+		clsFC := classifiersFailClosed(ir.Classifiers, ir.Matchers)
+		if !clsFC["bucket"] {
+			t.Fatalf("classifier {bucket} reading a fail-closed matcher was not marked fail-closed; clsFC = %+v", clsFC)
+		}
+		if hasFailClosedRecipe(ir, clsFC) {
+			t.Errorf("a recipe reading a fail-closed classify token was shipped; tokens = %+v recipes = %+v", ir.Key.Tokens, ir.Key.Recipes)
+		}
+		if !hasAlwaysPass(ir) {
+			t.Errorf("want a site-wide Always pass (fail-open) for a fail-closed classify key token; recv.pass = %+v", ir.Recv.Pass)
+		}
+		if !hasWarn(rep, "CACHE_KEY-FAIL-OPEN") {
+			t.Errorf("want a CACHE_KEY-FAIL-OPEN warning; warnings = %v", rep.Warnings)
+		}
+	})
+
+	// (b) the token sits on a SCOPED recipe (the catch-all default stays valid, but the
+	// scoped recipe reading the fail-closed classifier must fail open).
+	t.Run("scoped-recipe-token", func(t *testing.T) {
+		src := `example.com {
+    @ungreedy path_regex (?U)^/(gate|block)
+    @ssr      header X-SSR 1
+    classify {bucket} {
+        when @ungreedy -> a
+        default        -> b
+    }
+    cache_key @ssr    host path {bucket}
+    cache_key default host path
+    cache_ttl default ttl 1h
+}`
+		p := compile(t, src)
+		ir, rep, err := Project(p)
+		if err != nil {
+			t.Fatalf("Project: %v", err)
+		}
+		clsFC := classifiersFailClosed(ir.Classifiers, ir.Matchers)
+		if hasFailClosedRecipe(ir, clsFC) {
+			t.Errorf("a scoped recipe reading a fail-closed classify token was shipped; recipes = %+v", ir.Key.Recipes)
+		}
+		if !hasAlwaysPass(ir) {
+			t.Errorf("want a site-wide Always pass (fail-open); recv.pass = %+v", ir.Recv.Pass)
+		}
+		if !hasWarn(rep, "CACHE_KEY-FAIL-OPEN") {
+			t.Errorf("want a CACHE_KEY-FAIL-OPEN warning; warnings = %v", rep.Warnings)
+		}
+	})
+
+	// (c) NO OVER-REACTION: a classify key token whose classifier is fully edge-translatable
+	// ships NATIVE (the {device}-style native classify case must not regress).
+	t.Run("translatable-classifier-token-stays-native", func(t *testing.T) {
+		src := `example.com {
+    @verified cookie verified_prod
+    classify {bucket} {
+        when @verified -> ok
+        default        -> open
+    }
+    cache_key method host path {bucket}
+    cache_ttl default ttl 1h
+}`
+		p := compile(t, src)
+		ir, rep, err := Project(p)
+		if err != nil {
+			t.Fatalf("Project: %v", err)
+		}
+		if hasAlwaysPass(ir) {
+			t.Errorf("over-reaction: a translatable classify key token tripped a fail-open pass; recv.pass = %+v", ir.Recv.Pass)
+		}
+		if hasWarn(rep, "CACHE_KEY-FAIL-OPEN") {
+			t.Errorf("unexpected CACHE_KEY-FAIL-OPEN warning for a translatable classifier token; warnings = %v", rep.Warnings)
+		}
+	})
+}
+
+// TestRouteScopeFailClosedFailsOpen (systematic audit): `route @scope upstream` is
+// first-match-wins (resolveUpstream). A route whose scope fails closed at the edge would
+// skip to a later route / the default upstream → the edge fetches+caches a WRONG-origin
+// body while Go routes to the scoped upstream → cross-origin cache poisoning. The projector
+// must drop that route and fail OPEN — the same guard as pass/cache_ttl/storage/cache_key.
+func TestRouteScopeFailClosedFailsOpen(t *testing.T) {
+	src := `example.com {
+    upstream backend2 { to http://b2:80 }
+    @ungreedy path_regex (?U)^/(api|v2)
+    route @ungreedy -> backend2
+    cache_key host path
+    cache_ttl default ttl 1h
+}`
+	p := compile(t, src)
+	ir, rep, err := Project(p)
+	if err != nil {
+		t.Fatalf("Project: %v", err)
+	}
+	for _, rt := range ir.Recv.Route {
+		if scopeFailsClosed(rt.Scope, ir.Matchers) {
+			t.Errorf("a fail-closed route was shipped to the edge: %+v", rt)
+		}
+	}
+	if !hasAlwaysPass(ir) {
+		t.Errorf("want a site-wide Always pass (fail-open) for a fail-closed route scope; recv.pass = %+v", ir.Recv.Pass)
+	}
+	if !hasWarn(rep, "ROUTE-FAIL-OPEN") {
+		t.Errorf("want a ROUTE-FAIL-OPEN warning; warnings = %v", rep.Warnings)
+	}
+}
+
+// TestUpgradeScopeProjectedIntoPass (Finding 3): `upgrade @scope` implies pass on the
+// server for EVERY matching request (the whole upgrade scope is uncacheable). The
+// projector must (a) still DELEGATE the connection hijack, and (b) ALSO project the
+// upgrade scope into recv.pass so the edge never caches an upgrade-scope path.
+func TestUpgradeScopeProjectedIntoPass(t *testing.T) {
+	src := `example.com {
+    @ws path /ws/*
+    upgrade @ws
+    cache_key host path
+    cache_ttl default ttl 1h
+}`
+	p := compile(t, src)
+	ir, rep, err := Project(p)
+	if err != nil {
+		t.Fatalf("Project: %v", err)
+	}
+	// (a) still delegated (the live tunnel cannot run at the edge).
+	if !hasDelegate(rep, "upgrade") {
+		t.Errorf("upgrade must remain delegated; report = %+v", rep)
+	}
+	// (b) the upgrade scope is projected into recv.pass so the edge passes /ws/*.
+	found := false
+	for _, s := range ir.Recv.Pass {
+		for _, n := range s.Names {
+			if n == "ws" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("upgrade scope @ws not projected into recv.pass (implied-pass missing); recv.pass = %+v", ir.Recv.Pass)
+	}
+}
+
+// TestUpgradeScopeFailClosedFailsOpen (Finding 3 + 2): when the upgrade scope itself
+// fails closed at the edge, the implied-pass falls back to the site-wide fail-open pass.
+func TestUpgradeScopeFailClosedFailsOpen(t *testing.T) {
+	src := `example.com {
+    @live upstream_healthy pool
+    upgrade @live
+    cache_key host path
+    cache_ttl default ttl 1h
+}`
+	p := compile(t, src)
+	ir, rep, err := Project(p)
+	if err != nil {
+		t.Fatalf("Project: %v", err)
+	}
+	if !hasAlwaysPass(ir) {
+		t.Errorf("want a site-wide Always pass for a fail-closed upgrade scope; recv.pass = %+v", ir.Recv.Pass)
+	}
+	if !hasWarn(rep, "UPGRADE-FAIL-OPEN") {
+		t.Errorf("want an UPGRADE-FAIL-OPEN warning; warnings = %v", rep.Warnings)
 	}
 }

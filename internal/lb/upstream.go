@@ -2,6 +2,7 @@ package lb
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -181,24 +182,40 @@ func New(cfg Config, opts ...Option) (*Upstream, error) {
 		return nil, err
 	}
 	u := &Upstream{
-		cfg:              cfg,
-		byID:             map[string]*backend{},
-		ring:             newRing(cfg.Replicas, nil),
-		resolver:         defaultResolver(),
+		cfg:  cfg,
+		byID: map[string]*backend{},
+		ring: newRing(cfg.Replicas, nil),
+		// The DEFAULT system resolver is wrapped in guardedResolver too (Finding 3): a
+		// dns:// hostname that resolves via the system resolv.conf onto a link-local /
+		// cloud-metadata address (169.254.0.0/16, fe80::/10, fd00:ec2::254) must NOT
+		// become a live backend, exactly as on the custom-nameserver path. The guard
+		// drops only those ranges; every legitimate RFC1918/loopback/ULA backend passes
+		// through untouched, so the default path is behaviorally unchanged for real hosts.
+		resolver:         guardedResolver{inner: defaultResolver()},
 		now:              time.Now,
 		resolveInterval:  defaultResolveInterval,
 		passiveThreshold: defaultPassiveThreshold,
 		ejectDuration:    defaultEjectDuration,
+	}
+	// Config-driven RESOLVER knobs (inline `resolve [<interval>] [nameserver …]`),
+	// applied BEFORE opts so a test's WithResolver/WithResolveInterval still wins.
+	// When neither knob is set the default path is byte-for-byte unchanged: the
+	// process-wide system resolver and the 30s re-resolution interval.
+	if len(cfg.Nameservers) > 0 {
+		u.resolver = nameserverResolver(cfg.Nameservers)
+	}
+	if cfg.ResolveInterval > 0 {
+		u.resolveInterval = cfg.ResolveInterval
 	}
 	for _, opt := range opts {
 		opt(u)
 	}
 	u.poke = make(chan struct{}, 1)
 	if u.newOrigin == nil {
-		u.newOrigin = hostAwareOriginFactory(cfg.HostHeader, cfg.SNI, cfg.DisableReuse)
+		u.newOrigin = hostAwareOriginFactory(cfg)
 	}
 	if u.probeDoer == nil {
-		u.probeDoer = defaultProbeDoer(cfg.Timeouts)
+		u.probeDoer = defaultProbeDoer(cfg.Timeouts, originTLSConfig(cfg))
 	}
 	// Initial resolution (best-effort): populate the backend set/ring now.
 	u.resolveOnce(context.Background())
@@ -578,6 +595,31 @@ func (u *Upstream) pick(ctx context.Context, req *origin.Request, tried map[stri
 	}
 }
 
+// ResolveUpgrade implements origin.Upgrader for a load-balanced pool: it picks ONE
+// eligible backend (honoring the pool's health FSM / passive ejection — the same
+// `pick` the Fetch path uses, so an unhealthy or ejected backend is skipped) and
+// delegates to that backend's per-upstream origin so the upgrade tunnel reuses the
+// backend's own transport (SNI / keepalive / TLS-verify). It returns
+// origin.ErrNoUpgradeBackend when the pool currently has no eligible backend (the
+// edge equivalent of ErrNoBackend on the Fetch path). The tunnel runs OFF the Fetch
+// path, so pool inflight accounting is intentionally not incremented here — a live
+// hijacked connection is owned by the server's ReverseProxy, not a trackedBody.
+func (u *Upstream) ResolveUpgrade(ctx context.Context, req *origin.Request) (origin.UpgradeTarget, error) {
+	// Thread the caller's ctx (carrying lb.WithRoutingKey) into pick so a Sticky /
+	// Shard-by-key pool pins the tunnel to the SAME backend the Fetch path would —
+	// otherwise a stateful socket.io tunnel would lose affinity to round-robin
+	// (Finding 3). Shard-by-URL reads req.Key and health/ejection are unaffected.
+	b := u.pick(ctx, req, nil)
+	if b == nil {
+		return origin.UpgradeTarget{}, origin.ErrNoUpgradeBackend
+	}
+	up, ok := b.origin.(origin.Upgrader)
+	if !ok {
+		return origin.UpgradeTarget{}, origin.ErrNoUpgradeBackend
+	}
+	return up.ResolveUpgrade(ctx, req)
+}
+
 // shardKey returns the hash input for the Shard policy: the request URL (Key)
 // for ShardURL, or the caller-supplied routing key for ShardKeyVal.
 func (u *Upstream) shardKey(ctx context.Context, req *origin.Request) (string, bool) {
@@ -713,22 +755,37 @@ type HostHeaderPolicy struct {
 }
 
 // hostAwareOriginFactory builds the default OriginFactory closing over the pool's
-// Host-header policy plus the gap-H6 transport knobs (sni / disableReuse), so every
-// backend origin forwards/overrides the Host consistently (backlog #11) and, when
-// set, advertises the configured SNI / disables connection reuse. When sni == ""
-// and disableReuse == false the forwarded options are no-ops, so the built origin
-// is byte-for-byte the legacy one (shared pool, Go-default SNI, keep-alive on).
-func hostAwareOriginFactory(hh HostHeaderPolicy, sni string, disableReuse bool) OriginFactory {
+// Host-header policy plus the per-upstream transport knobs (gap-H6 sni/disableReuse
+// and TLSVERIFY insecure/rootCAs/alpn), so every backend origin forwards/overrides
+// the Host consistently (backlog #11) and, when set, advertises the configured SNI,
+// disables connection reuse, and applies the per-upstream origin-TLS verification.
+// When no knob is set the forwarded options are no-ops, so the built origin is
+// byte-for-byte the legacy one (shared pool, Go-default SNI, keep-alive on, full
+// verification).
+func hostAwareOriginFactory(cfg Config) OriginFactory {
+	hh := cfg.HostHeader
 	return func(baseURL string, _ *Target, to Timeouts) (origin.Origin, error) {
 		opts := []httporigin.Option{httporigin.WithHostPolicy(hh.Policy, hh.Value)}
 		if to.Connect > 0 || to.FirstByte > 0 {
 			opts = append(opts, httporigin.WithHTTPClient(clientForTimeouts(to)))
 		}
-		if sni != "" {
-			opts = append(opts, httporigin.WithSNI(sni))
+		if cfg.SNI != "" {
+			opts = append(opts, httporigin.WithSNI(cfg.SNI))
 		}
-		if disableReuse {
+		if cfg.DisableReuse {
 			opts = append(opts, httporigin.WithDisableKeepAlives(true))
+		}
+		// TLSVERIFY: per-upstream origin TLS verification. Insecure and RootCAs are
+		// mutually exclusive (the config layer enforces it); ALPN pins the offered
+		// protocol list. All default to the secure/no-op value.
+		if cfg.Insecure {
+			opts = append(opts, httporigin.WithInsecureTLS(true))
+		}
+		if cfg.RootCAs != nil {
+			opts = append(opts, httporigin.WithRootCAs(cfg.RootCAs))
+		}
+		if len(cfg.ALPN) != 0 {
+			opts = append(opts, httporigin.WithALPN(cfg.ALPN))
 		}
 		// between_bytes (gap G5): per-upstream body-stall budget. The origin only
 		// stamps it onto each Response; the server enforces it as a between-bytes
@@ -737,6 +794,30 @@ func hostAwareOriginFactory(hh HostHeaderPolicy, sni string, disableReuse bool) 
 			opts = append(opts, httporigin.WithBetweenBytes(to.BetweenBytes))
 		}
 		return httporigin.New(baseURL, opts...)
+	}
+}
+
+// originTLSConfig builds the per-upstream origin *tls.Config from the pool's
+// TLSVERIFY/SNI knobs, or returns nil when none is set (so the health probe's
+// default transport is byte-for-byte unchanged). It is applied to BOTH the origin
+// factory (indirectly, via httporigin options) and the health-probe transport, so
+// probes verify the origin with the SAME settings as live fetches — HAProxy
+// `http-check connect ssl` parity (this also fixes the pre-existing miss where the
+// probe transport ignored even `sni`).
+func originTLSConfig(cfg Config) *tls.Config {
+	if cfg.SNI == "" && !cfg.Insecure && cfg.RootCAs == nil && len(cfg.ALPN) == 0 {
+		return nil
+	}
+	// Defense-in-depth (Finding 7): Insecure ⊕ RootCAs (tls_insecure ⊕ ca_file) is a
+	// compile error, so they never co-exist legitimately. If a future plumbing mistake
+	// set both, InsecureSkipVerify=true would win and silently ignore RootCAs — failing
+	// OPEN. Prefer verification: skip only when no private CA pool is configured, so the
+	// mistake fails CLOSED.
+	return &tls.Config{ //nolint:gosec // fields set explicitly; default MinVersion applies
+		ServerName:         cfg.SNI,
+		InsecureSkipVerify: cfg.Insecure && cfg.RootCAs == nil, //nolint:gosec // opt-in per-upstream `tls_insecure`
+		RootCAs:            cfg.RootCAs,
+		NextProtos:         cfg.ALPN,
 	}
 }
 
@@ -777,20 +858,28 @@ func clientForTimeouts(to Timeouts) *http.Client {
 }
 
 // defaultProbeDoer builds a fully-bounded HTTP client for active health probes
-// (a probe must never hang a prober goroutine).
-func defaultProbeDoer(to Timeouts) Doer {
+// (a probe must never hang a prober goroutine). tlsCfg carries the per-upstream
+// origin-TLS settings (SNI / tls_insecure / ca_file / alpn) so probes handshake the
+// HTTPS origin with the SAME verification as live fetches — HAProxy `http-check
+// connect ssl` parity. nil ⇒ the default transport (system roots, Go-default SNI),
+// keeping the no-knob datapath unchanged.
+func defaultProbeDoer(to Timeouts, tlsCfg *tls.Config) Doer {
 	connect := to.Connect
 	if connect <= 0 {
 		connect = 5 * time.Second
 	}
+	tr := &http.Transport{
+		Proxy:               nil, // no ambient proxy (security) — see clientForTimeouts
+		DialContext:         (&net.Dialer{Timeout: connect}).DialContext,
+		TLSHandshakeTimeout: connect,
+		MaxIdleConnsPerHost: 4,
+	}
+	if tlsCfg != nil {
+		tr.TLSClientConfig = tlsCfg
+	}
 	return &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			Proxy:               nil, // no ambient proxy (security) — see clientForTimeouts
-			DialContext:         (&net.Dialer{Timeout: connect}).DialContext,
-			TLSHandshakeTimeout: connect,
-			MaxIdleConnsPerHost: 4,
-		},
+		Timeout:   10 * time.Second,
+		Transport: tr,
 		// SSRF guard (security review #1): a health probe must not follow a 30x off
 		// the configured backend (e.g. to cloud metadata). Treat the redirect status
 		// as the probe result instead of chasing it.

@@ -190,6 +190,139 @@ func TestRoutingWildcardConcreteSubdomainSameNS(t *testing.T) {
 	}
 }
 
+// TestRoutingConcreteListenerUnderForeignWildcard pins the listener-vs-wildcard gap:
+// team-a owns an OLDER `*.example.com` wildcard HTTP listener. team-b declares a YOUNGER
+// CONCRETE listener for app.example.com (a subdomain of team-a's wildcard) plus a route to
+// its own backend. Because a concrete-subdomain exact host wins over a wildcard at serving
+// time, team-b would steal/blackhole app.example.com from team-a. routingHostOwner must
+// award app.example.com's routing to team-a (the older covering wildcard), so team-b's
+// route is REJECTED — exactly as it is when team-b uses a wildcard listener instead of a
+// concrete one (see TestRoutingWildcardConcreteSubdomainOwnership).
+func TestRoutingConcreteListenerUnderForeignWildcard(t *testing.T) {
+	gA := gw("team-a", "ga", "cadish", "*.example.com")
+	atTime(gA, 100)
+	gB := gw("team-b", "gb", "cadish", "app.example.com") // concrete listener under team-a's wildcard
+	atTime(gB, 200)                                       // newer
+
+	rB := httpRoute("team-b", "rb", "gb", "app.example.com", "evil", 80, []match{{"/", gatewayv1.PathMatchPathPrefix}})
+	atTime(rB, 201)
+
+	in := Inputs{
+		Classes:  []*gatewayv1.GatewayClass{gatewayClass("cadish", ControllerName)},
+		Gateways: []*gatewayv1.Gateway{gA, gB},
+		Routes:   []*gatewayv1.HTTPRoute{rB},
+	}
+	r := TranslateResult(in)
+	out := concatSites(r.Sites)
+
+	if strings.Contains(out, "evil") {
+		t.Fatalf("cross-ns hijack: team-b's evil backend leaked into app.example.com routing under team-a's wildcard:\n%s", out)
+	}
+	if r.AcceptedRoutes["team-b/rb"] {
+		t.Errorf("team-b's route to a concrete subdomain of team-a's OLDER wildcard must NOT be Accepted")
+	}
+	if !hasRejectFor(r.Rejects, "team-b/rb") {
+		t.Errorf("expected a reject for team-b/rb (cross-ns concrete-listener-under-wildcard routing claim), got %+v", r.Rejects)
+	}
+}
+
+// TestTLSConcreteListenerUnderForeignWildcard pins the cert-hijack twin of the routing
+// gap: team-a owns an OLDER `*.example.com` HTTPS listener. team-b declares a YOUNGER
+// CONCRETE HTTPS listener for app.example.com with its OWN (e.g. self-signed) cert that
+// covers app.example.com — passing the SAN gate. The exact-host cert wins over the
+// wildcard at serving time, so team-b would terminate TLS for app.example.com. The
+// cross-namespace cert-hijack guard must REFUSE to program team-b's listener because the
+// concrete host falls under team-a's older covering wildcard listener.
+func TestTLSConcreteListenerUnderForeignWildcard(t *testing.T) {
+	gate := fakeGate{certs: map[string][]string{
+		"team-a/wildcert": {"*.example.com"},
+		"team-b/appcert":  {"app.example.com"},
+	}}
+	gA := httpsGW("team-a", "ga", "cadish", "*.example.com", "", "wildcert")
+	atTime(gA, 100)
+	gB := httpsGW("team-b", "gb", "cadish", "app.example.com", "", "appcert")
+	atTime(gB, 200) // newer
+
+	in := Inputs{
+		Classes:      []*gatewayv1.GatewayClass{gatewayClass("cadish", ControllerName)},
+		Gateways:     []*gatewayv1.Gateway{gA, gB},
+		secretUsable: gate.usable,
+		certCovers:   gate.covers,
+	}
+	r := TranslateResult(in)
+	if r.ProgrammedListeners["team-b/gb\x00https"] {
+		t.Errorf("team-b's HTTPS listener for a concrete subdomain of team-a's OLDER wildcard must NOT program (cross-ns cert hijack)")
+	}
+}
+
+// TestRoutingOlderConcreteSurvivesYoungerForeignWildcard pins the SYMMETRIC oldest-wins
+// guard (the routing twin of the Ingress controller's TestTranslateOlderExactSurvivesYounger
+// ForeignWildcard): team-a owns the CONCRETE host app.example.com via the OLDER Gateway+route
+// (first-claim). team-b LATER declares a `*.example.com` wildcard listener + route in a
+// DIFFERENT namespace. Strict oldest-wins must hold: routingHostOwner's Pass 3 reassigns a
+// concrete listener host to a covering wildcard's namespace ONLY when that wildcard is strictly
+// OLDER (lower first-claim rank). team-b's wildcard is YOUNGER, so it must NOT steal team-a's
+// already-established concrete host — team-a keeps routing app.example.com and its route stays
+// Accepted. Without the `rank[w] < hr` condition, a single hostile younger wildcard would
+// capture every existing concrete subdomain under example.com owned by other namespaces.
+func TestRoutingOlderConcreteSurvivesYoungerForeignWildcard(t *testing.T) {
+	gA := gw("team-a", "ga", "cadish", "app.example.com") // older concrete listener
+	atTime(gA, 100)
+	rA := httpRoute("team-a", "ra", "ga", "app.example.com", "web", 80, []match{{"/", gatewayv1.PathMatchPathPrefix}})
+	atTime(rA, 101)
+	// team-b later declares a *.example.com wildcard listener + a route to its own backend.
+	gB := gw("team-b", "gb", "cadish", "*.example.com")
+	atTime(gB, 200) // newer
+	rB := httpRoute("team-b", "rb", "gb", "*.example.com", "evil", 80, []match{{"/", gatewayv1.PathMatchPathPrefix}})
+	atTime(rB, 201)
+
+	in := Inputs{
+		Classes:  []*gatewayv1.GatewayClass{gatewayClass("cadish", ControllerName)},
+		Gateways: []*gatewayv1.Gateway{gA, gB},
+		Routes:   []*gatewayv1.HTTPRoute{rA, rB},
+	}
+	r := TranslateResult(in)
+	out := concatSites(r.Sites)
+
+	if !r.AcceptedRoutes["team-a/ra"] {
+		t.Errorf("team-a's older concrete route for app.example.com must stay Accepted (not stolen by a younger foreign wildcard)")
+	}
+	if hasRejectFor(r.Rejects, "team-a/ra") {
+		t.Fatalf("team-a's older concrete route was rejected by a younger foreign wildcard; rejects=%+v\n%s", r.Rejects, out)
+	}
+	if !strings.Contains(out, "app.example.com {") || !strings.Contains(out, "k8s://web.team-a:80") {
+		t.Fatalf("team-a's concrete host app.example.com was stolen/dropped by a younger foreign wildcard:\n%s", out)
+	}
+}
+
+// TestTLSOlderConcreteSurvivesYoungerForeignWildcard is the cert twin: team-a terminates
+// app.example.com with its OWN cert via the OLDER HTTPS listener. team-b LATER declares a
+// `*.example.com` HTTPS listener in a DIFFERENT namespace. A younger foreign wildcard must NOT
+// displace an already-established concrete cert owner — team-a's listener stays programmed
+// (and at serving time the exact-host cert wins over the wildcard anyway), keeping routing and
+// TLS ownership of app.example.com in the same namespace (team-a).
+func TestTLSOlderConcreteSurvivesYoungerForeignWildcard(t *testing.T) {
+	gate := fakeGate{certs: map[string][]string{
+		"team-a/appcert":  {"app.example.com"},
+		"team-b/wildcert": {"*.example.com"},
+	}}
+	gA := httpsGW("team-a", "ga", "cadish", "app.example.com", "", "appcert")
+	atTime(gA, 100)
+	gB := httpsGW("team-b", "gb", "cadish", "*.example.com", "", "wildcert")
+	atTime(gB, 200) // newer
+
+	in := Inputs{
+		Classes:      []*gatewayv1.GatewayClass{gatewayClass("cadish", ControllerName)},
+		Gateways:     []*gatewayv1.Gateway{gA, gB},
+		secretUsable: gate.usable,
+		certCovers:   gate.covers,
+	}
+	r := TranslateResult(in)
+	if !r.ProgrammedListeners["team-a/ga\x00https"] {
+		t.Errorf("team-a's older concrete HTTPS listener for app.example.com must stay programmed (not displaced by a younger foreign wildcard)")
+	}
+}
+
 func concatSites(sites []ingress.RenderedSite) string {
 	var b strings.Builder
 	for _, s := range sites {

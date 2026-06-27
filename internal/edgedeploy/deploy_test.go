@@ -241,6 +241,35 @@ func TestDeploySurfacesAPIError(t *testing.T) {
 	}
 }
 
+// TestDeployRejectsPathInjectingTarget proves a worker name (or account id) that
+// would alter the REST path is rejected BEFORE any HTTP call — so a mis-derived
+// target cannot clobber an unrelated script.
+func TestDeployRejectsPathInjectingTarget(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  Config
+	}{
+		{"worker-slash", Config{AccountID: "acc-123", WorkerName: "../scripts/victim"}},
+		{"worker-space", Config{AccountID: "acc-123", WorkerName: "my worker"}},
+		{"account-slash", Config{AccountID: "acc/../other", WorkerName: "w"}},
+		{"worker-query", Config{AccountID: "acc-123", WorkerName: "w?x=1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &mockCF{t: t}
+			c, srv := newTestClient(t, m)
+			defer srv.Close()
+			err := c.Deploy(context.Background(), tc.cfg, "x")
+			if err == nil {
+				t.Fatal("expected Deploy to reject a path-injecting target")
+			}
+			if len(m.requests) != 0 {
+				t.Errorf("no HTTP call must be made for an invalid target, got %d", len(m.requests))
+			}
+		})
+	}
+}
+
 // parseUploadMetadata extracts the "metadata" part JSON from a multipart upload body.
 func parseUploadMetadata(t *testing.T, body []byte) scriptMetadata {
 	t.Helper()

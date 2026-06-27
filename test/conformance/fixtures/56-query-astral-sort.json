@@ -1,0 +1,34 @@
+{
+  "name": "56-query-astral-sort",
+  "cadishfile": "example.com {\n    cache_key host query\n    cache_ttl default ttl 1m\n    header +cache_status X-Cache\n    header +cache_key X-Cache-Key raw\n}",
+  "cases": [
+    {
+      "request": {
+        "method": "GET",
+        "host": "example.com",
+        "path": "/",
+        "query": {
+          "x": [
+            "1"
+          ],
+          "x😀": [
+            "2"
+          ],
+          "m": [
+            "",
+            "😀"
+          ]
+        }
+      },
+      "origin": {
+        "status": 200,
+        "header": {
+          "Content-Type": [
+            "text/html"
+          ]
+        }
+      },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

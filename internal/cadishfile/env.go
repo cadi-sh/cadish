@@ -34,6 +34,30 @@ func SubstituteEnv(f *File, lookup func(name string) (string, bool)) {
 	}
 }
 
+// ContainsEnvPlaceholder reports whether s contains an UNESCAPED "{$" env-expansion
+// span — the trigger for SubstituteEnv (including the R07 quoted-literal expansion). A
+// backslash-escaped "\{" is not a placeholder and is skipped. It is the canonical guard
+// for any externally-influenced value (k8s Ingress/Gateway tenant match names, header/
+// query values, methods, paths) concatenated into GENERATED Cadishfile text: such a
+// value must never be allowed to expand against the controller pod's environment when the
+// combined config is loaded (config.loadFromSource -> SubstituteEnv(os.LookupEnv)), which
+// would leak the admin token / any secret. QuoteArg quotes but does not neutralize "{$"
+// (and there is no value-preserving escape — "\{$" survives lexing as a literal backslash),
+// so generation code must REJECT a tenant token for which this returns true rather than
+// emit it.
+func ContainsEnvPlaceholder(s string) bool {
+	for i := 0; i+1 < len(s); i++ {
+		if s[i] == '\\' { // skip the escaped character
+			i++
+			continue
+		}
+		if s[i] == '{' && s[i+1] == '$' {
+			return true
+		}
+	}
+	return false
+}
+
 // substituteNodes applies env substitution to a list of nodes recursively.
 func substituteNodes(nodes []Node, lookup func(string) (string, bool)) {
 	for _, n := range nodes {
@@ -53,12 +77,26 @@ func substituteNodes(nodes []Node, lookup func(string) (string, bool)) {
 
 // substituteArg expands env placeholders within a single argument and updates
 // its Kind to reflect the post-substitution text.
+//
+// An UNQUOTED env span is ArgPlaceholder, expanded and reclassified below. A QUOTED
+// string is ArgLiteral (classifyArg treats every quoted token as a literal so a quoted
+// "@x"/"{device}" is inert), which would otherwise leave a quoted env span "{$VAR}"
+// UNSUBSTITUTED — loading the literal text. For a secret-bearing directive
+// (`auth_token "{$ADMIN_TOKEN}"`, `purge`) that meant a fully PREDICTABLE bearer token,
+// silently and fail-OPEN (the unquoted form fails closed to empty when unset) — R07.
+// So a quoted literal that carries an env span "{$…}" is expanded too (Caddy parity),
+// but kept ArgLiteral: quoting still suppresses RUNTIME placeholders ({device}, {http.*})
+// — only `{$ENV}` spans expand inside quotes. A backslash-escaped "\{$VAR}" passes
+// through (expandEnv honors the escape), so the rare literal-text case stays expressible.
 func substituteArg(a *Arg, lookup func(string) (string, bool)) {
-	if a.Kind != ArgPlaceholder {
+	if a.Kind == ArgPlaceholder {
+		a.Raw = expandEnv(a.Raw, lookup)
+		a.Kind = classifyArg(a.Raw, a.Quoted)
 		return
 	}
-	a.Raw = expandEnv(a.Raw, lookup)
-	a.Kind = classifyArg(a.Raw, a.Quoted)
+	if a.Quoted && strings.Contains(a.Raw, "{$") {
+		a.Raw = expandEnv(a.Raw, lookup) // stays ArgLiteral: runtime placeholders remain inert
+	}
 }
 
 // expandEnv replaces every "{$VAR}" span in s with its looked-up value (empty

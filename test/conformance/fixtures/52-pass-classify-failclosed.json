@@ -1,0 +1,16 @@
+{
+  "name": "52-pass-classify-failclosed",
+  "cadishfile": "example.com {\n    @ungreedy path_regex (?U)^/(gate|block)\n    classify {age} {\n        when @ungreedy -> gate\n        default        -> open\n    }\n    @gated classify {age}==gate\n    pass @gated\n    cache_key host path\n    cache_ttl default ttl 1h\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/gate" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/block" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

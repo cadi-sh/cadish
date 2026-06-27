@@ -199,6 +199,38 @@ func TestCookieJSONFailSafe(t *testing.T) {
 	}
 }
 
+// R18: a value with a complete top-level JSON value followed by TRAILING data
+// (`{"a":1} true`, `1 2`) must fail closed in Go, mirroring the JS edge's strict
+// JSON.parse (which throws on the trailing token). Without this Go's streaming
+// json.Decoder reads only the first value and MATCHES while JS does not → divergence.
+func TestCookieJSONTrailingTopLevelValue(t *testing.T) {
+	// presence test: `{"a":1} true` resolves field a=1 in a naive streaming read.
+	pres := compileSrc(t, "example.com {\n @v cookie_json c a\n pass @v\n}")
+	for _, raw := range []string{
+		`{"a":1} true`,    // object then trailing scalar
+		`{"a":1} {"b":2}`, // object then trailing object
+		`{"a":1}garbage`,  // object then trailing junk
+		`{"a":1} [1,2]`,   // object then trailing array
+	} {
+		if pres.EvalRequest(reqWithCookie(`c=` + raw)).Pass {
+			t.Errorf("trailing top-level data must fail closed: %q", raw)
+		}
+	}
+	// A bare top-level scalar followed by trailing data (value test on a scalar doc).
+	one := compileSrc(t, "example.com {\n @v cookie_json c 0\n pass @v\n}")
+	if one.EvalRequest(reqWithCookie(`c=[1] 2`)).Pass {
+		t.Error("array then trailing scalar must fail closed: [1] 2")
+	}
+	// Sanity: a single well-formed value (no trailing data) STILL matches.
+	if !pres.EvalRequest(reqWithCookie(`c={"a":1}`)).Pass {
+		t.Error("a single well-formed JSON value must still match")
+	}
+	// Sanity: trailing WHITESPACE only is fine (JSON.parse tolerates it).
+	if !pres.EvalRequest(reqWithCookie(`c={"a":1}   `)).Pass {
+		t.Error("trailing whitespace must NOT fail closed")
+	}
+}
+
 // 6. Percent-encoded value decoded once then parsed.
 func TestCookieJSONPercentEncoded(t *testing.T) {
 	p := compileSrc(t, "example.com {\n @v cookie_json nsfwCookie needVerify true\n pass @v\n}")

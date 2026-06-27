@@ -28,6 +28,14 @@ type ObjectMeta struct {
 	// value means 200 — see EffectiveStatus — which keeps pre-existing index
 	// entries (written before this field existed) serving as 200 on reload.
 	Status int `json:"status,omitempty"`
+	// ForcedPrivate records that this object was stored ONLY because `cache_unsafe`
+	// overrode an origin Cache-Control marking it unshareable (private/no-store/no-cache/
+	// s-maxage=0). On a HIT the server must advertise `private, max-age=N` downstream
+	// (not `public`) so a CDN / browser / the Edge tier in front does not cache a response
+	// the origin marked confidential (R13/D96). The original origin Cache-Control is not
+	// otherwise replayed on a HIT, so this one bit carries the "don't say public" signal.
+	// Zero/false (the common case + legacy index entries) ⇒ the normal `public, max-age=N`.
+	ForcedPrivate bool `json:"forced_private,omitempty"`
 	// Tier is an OPTIONAL placement override: "ram" or "disk" forces the object
 	// into that tier instead of the automatic size-based routing. It carries a
 	// `storage <selector> -> ram|disk` decision from the pipeline. Empty ("") means

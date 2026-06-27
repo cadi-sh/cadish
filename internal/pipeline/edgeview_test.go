@@ -90,6 +90,30 @@ func TestEdgeViewKeyTokens(t *testing.T) {
 	}
 }
 
+// TestEdgeViewKeyTokensQueryStrip checks the query_strip token projects its denylist.
+func TestEdgeViewKeyTokensQueryStrip(t *testing.T) {
+	p := compileSite(t, `example.com {
+        cache_key method host path query_strip utm_* gclid
+        cache_ttl default ttl 1m
+    }`)
+	toks := p.EdgeKeyTokens()
+	var found bool
+	for _, tk := range toks {
+		if tk.Kind == "query_strip" {
+			found = true
+			if len(tk.Deny) != 2 {
+				t.Errorf("query_strip deny = %v, want 2 names", tk.Deny)
+			}
+			if len(tk.Allow) != 0 {
+				t.Errorf("query_strip must not carry an allowlist, got %v", tk.Allow)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no query_strip token projected, got %+v", toks)
+	}
+}
+
 // TestEdgeViewDefaultKey confirms the default method/host/path key surfaces when no
 // cache_key is declared.
 func TestEdgeViewDefaultKey(t *testing.T) {
@@ -120,31 +144,32 @@ func TestEdgeViewTTLFromHeader(t *testing.T) {
 	}
 }
 
-// TestEdgeKindNameIPGuard: edgeKindName(kindIP) returns an explicit server-only
-// sentinel (NOT "unknown"), so a future caller that leaks an `ip` matcher toward
-// the edge IR is caught loudly rather than projecting as an "unknown" kind.
-func TestEdgeKindNameIPGuard(t *testing.T) {
-	if got := edgeKindName(kindIP); got == "unknown" || got == "ip" {
-		t.Fatalf("edgeKindName(kindIP) = %q, want an explicit server-only sentinel", got)
+// TestEdgeKindNameIP: edgeKindName(kindIP) returns "ip" — the SERVER-ONLY kind name in
+// serverOnlyEdgeKinds. The projector (projectMatcher) marks an "ip" matcher ServerOnly and
+// delegates / fails open every directive that references it, instead of skipping it and
+// leaving a dangling scope reference the runtime silently mis-evaluates (R02).
+func TestEdgeKindNameIP(t *testing.T) {
+	if got := edgeKindName(kindIP); got != "ip" {
+		t.Fatalf("edgeKindName(kindIP) = %q, want \"ip\" (the server-only kind)", got)
 	}
 }
 
-// TestEdgeViewIPMatcherPanics: projecting an `ip` matcher to the edge view must
-// fail closed (panic) — security is server-only (D49). EdgeMatchers() skips kindIP
-// before reaching edgeView(), so this guards against a future caller bypassing it.
-func TestEdgeViewIPMatcherPanics(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Fatal("edgeView() on a kindIP matcher did not panic (security must never reach the edge IR)")
-		}
-	}()
+// TestEdgeViewIPMatcherNoPanic: projecting an `ip` matcher to the edge view must NOT panic
+// (an inline `pass ip 10.0.0.0/8` would otherwise crash `cadish edge build`, R02). It returns a
+// fields-less `ip` view — no IP/CIDR data leaks to the worker; projectMatcher then marks it
+// ServerOnly.
+func TestEdgeViewIPMatcherNoPanic(t *testing.T) {
 	m := &matcher{kind: kindIP}
-	_ = m.edgeView()
+	em := m.edgeView()
+	if em.Kind != "ip" {
+		t.Fatalf("edgeView(ip).Kind = %q, want \"ip\"", em.Kind)
+	}
 }
 
-// TestEdgeMatchersStillSkipsIP: the public projection path never yields an `ip`
-// (or "unknown") matcher even when the site declares one in the security gate.
-func TestEdgeMatchersStillSkipsIP(t *testing.T) {
+// TestEdgeMatchersProjectsIPServerOnly: a NAMED `ip` matcher IS projected (as kind "ip") so the
+// projector can see it and treat any directive scoping it as fail-closed — it is no longer
+// silently dropped (R02). The ip/cidr values are NOT carried (the edge has no client-IP concept).
+func TestEdgeMatchersProjectsIPServerOnly(t *testing.T) {
 	p := compileSite(t, `example.com {
         @office ip 203.0.113.43/32
         @ru geo country RU
@@ -152,12 +177,14 @@ func TestEdgeMatchersStillSkipsIP(t *testing.T) {
         deny @ru
         cache_ttl default ttl 1m
     }`)
-	for name, em := range p.EdgeMatchers() {
-		if em.Kind == "ip" || em.Kind == "unknown" || em.Kind == "server-only-ip" {
-			t.Errorf("matcher %q leaked to edge IR (kind=%q)", name, em.Kind)
-		}
+	em, ok := p.EdgeMatchers()["office"]
+	if !ok {
+		t.Fatal("@office ip matcher must be projected (as a server-only `ip` view) so an ip-scoped directive fails closed")
 	}
-	if _, ok := p.EdgeMatchers()["office"]; ok {
-		t.Error("@office ip matcher must not be projected to the edge IR")
+	if em.Kind != "ip" {
+		t.Errorf("@office projected with kind=%q, want \"ip\"", em.Kind)
+	}
+	if len(em.Patterns) != 0 || em.Regex != "" {
+		t.Errorf("an `ip` edge view must carry no IP/CIDR data, got %+v", em)
 	}
 }

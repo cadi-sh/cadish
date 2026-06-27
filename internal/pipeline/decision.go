@@ -9,6 +9,13 @@ type RequestDecision struct {
 	// upstream and stream to the client, never storing. Decided in RECV from `pass`
 	// rules. When Pass is true the server skips LOOKUP and storage.
 	Pass bool
+	// Upgrade is true when the request matched an `upgrade @scope` rule: the route
+	// opted into a connection-upgrade (WebSocket / `Connection: Upgrade`) passthrough
+	// tunnel. It always implies Pass (a tunnel is entirely off the caching path).
+	// Whether the request is ACTUALLY tunnelled is decided by the server, which also
+	// requires a GENUINE upgrade (a `Connection: upgrade` token plus an `Upgrade`
+	// header); a non-upgrade request on an upgrade route just Passes as normal.
+	Upgrade bool
 	// Synthetic, when non-nil, is a canned response to return immediately without
 	// touching cache or origin (from a matching `respond` rule). When set, all
 	// other fields except CacheStatus-style delivery are moot.
@@ -125,6 +132,33 @@ type ResponseDecision struct {
 	// Cacheable reports whether a positive cache_ttl rule matched (TTL set). It is
 	// false for hit-for-miss and for the (unusual) case of no matching rule.
 	Cacheable bool
+	// ForcedPrivate reports that this response is Cacheable ONLY because `cache_unsafe`
+	// overrode an origin Cache-Control that marked it unshareable (private/no-store/
+	// no-cache/s-maxage=0). cadish stores it at its OWN tier (the operator's opt-in), but
+	// the server must NOT advertise `public` downstream (R13/D96) — it emits
+	// `private, max-age=N` so downstream SHARED caches (CDN/edge/other users) refuse the
+	// confidential response while cadish's own freshness index (not the emitted header)
+	// still drives its caching. False for a normal public store (public, max-age=N).
+	ForcedPrivate bool
+	// CredentialedStore reports that this response is being stored under a SHARED key in a
+	// `cache_credentialed @scope` (D101) ON A POSITIVE in-scope cache_ttl signal (the sole
+	// storage gate). The signal FORCE-OVERRIDES + STRIPS the per-user `Set-Cookie` AND the weak
+	// Cache-Control/Pragma/Expires refusals (no-store/private/no-cache) — the custom-VCL `if
+	// (X-Cache-Ttl) { unset set-cookie; unset Cache-Control; set ttl }`. The server strips them
+	// from the stored+delivered response (Set-Cookie + Pragma explicitly; Cache-Control +
+	// Expires via setSharedFreshness), so the SHARED entry NEVER carries a per-user Set-Cookie
+	// (the absolute confidentiality invariant) and cadish never replays a no-store it just
+	// cached. Mutually exclusive with ForcedPrivate (cache_credentialed is a deliberate opt-in
+	// to SHARE, never marked private). False outside such a scope.
+	CredentialedStore bool
+	// StripHeaders names the from_header-family control headers a matching cache_ttl
+	// rule CONSUMED from the origin response (the TTL / grace / max_stale header names,
+	// whichever were configured). The server deletes them before storing+delivering so
+	// the origin↔cache control contract (X-Cache-Ttl/X-Cache-Grace/…) never leaks to the
+	// client (Varnish's `unset beresp.http.*`). nil unless a from_header-family rule
+	// actually applied, so a site without the feature pays nothing and the streaming
+	// fast path is untouched.
+	StripHeaders []string
 }
 
 // CacheStatus is the cache-lookup outcome the server feeds into EvalDeliver so the

@@ -58,7 +58,23 @@ const kvHardCapBytes int64 = 25 * 1000 * 1000
 //     bare 502. A stale runtime ignoring these would silently NOT transform / NOT serve
 //     the friendly outage page, so the version is bumped and the runtime refuses a
 //     mismatch.
-const IRVersion = 4
+//
+// v5 (Finding 6) adds Response.ttl[].StripHeaders: the from_header-family control headers
+// (X-Cache-Ttl/X-Cache-Grace/X-Cache-Max-Stale) a cache_ttl rule CONSUMES, so the worker
+// strips them before store + deliver exactly as the server does. A stale runtime ignoring
+// them would LEAK the internal origin↔cache contract headers to the client (the server
+// never does), so the version is bumped and the runtime refuses a mismatch.
+//
+// v6 (D101) adds CacheCredentialed: the `cache_credentialed @scope` set that makes caching
+// ORIGIN-AUTHORITATIVE for the matching credentialed requests. The worker skips the
+// credential bypass for them (caches under the SHARED key, forwards the original cookies to
+// origin) and applies the in-scope EvalResponse precedence: a positive in-scope cache_ttl
+// signal is the SOLE storage gate — it force-stores and FORCE-OVERRIDES + STRIPS the per-user
+// Set-Cookie + weak no-store/private/no-cache/Pragma/Expires (matching the VCL); no signal ⇒
+// not stored (fail-closed). A stale runtime ignoring the field would credential-BYPASS those
+// requests (caching LESS, never wrong) — but to keep Go==JS exact it is a versioned contract,
+// so the runtime refuses a mismatch.
+const IRVersion = 6
 
 // EdgeIR is the versioned, serializable projection of one compiled site. The JSON
 // field names are the contract; the JS interpreter is a faithful port of the
@@ -88,6 +104,19 @@ type EdgeIR struct {
 	// Cache-Control / uncovered Vary) that mirrors Go's EvalResponse behaviour.
 	// Omitted (false) when the site does not set `cache_unsafe`.
 	CacheUnsafe bool `json:"cacheUnsafe,omitempty"`
+
+	// CacheCredentialed is the projected `cache_credentialed @scope` set (D101): the
+	// request scopes for which caching is ORIGIN-AUTHORITATIVE. The worker (a) does NOT
+	// credential-bypass a matching request (it caches under the SHARED key and forwards the
+	// original cookies to origin for auth) and (b) applies the in-scope EvalResponse
+	// precedence — a positive in-scope cache_ttl signal is the SOLE storage gate: it force-
+	// stores and FORCE-OVERRIDES + STRIPS the per-user Set-Cookie + weak no-store/private/
+	// no-cache/Pragma/Expires (matching the VCL); absence of the signal does NOT store
+	// (fail-closed). A scope referencing a
+	// ServerOnly/untranslatable matcher is NEVER projected here: it fails CLOSED (the whole
+	// site fail-open passes + ForcedPass++ so `cadish edge build` fails loud). Omitted when
+	// the site declares no `cache_credentialed`.
+	CacheCredentialed []Scope `json:"cacheCredentialed,omitempty"`
 
 	// CookieAllow is the `cookie_allow` request-cookie allowlist (name patterns, globs
 	// ok). When CookieAllowSet is true the edge worker strips every request cookie not
@@ -208,14 +237,43 @@ type Matcher struct {
 	// non-match (fail-closed) so a site that slipped one through never silently
 	// mis-projects. Distinct from RegexUntranslatable (which is regex-specific).
 	ServerOnly bool `json:"serverOnly,omitempty"`
+
+	// failsClosed is a DERIVED, projection-only flag (deliberately unexported so it never
+	// ships in the IR JSON to the worker): set by Project on a `classify` matcher whose
+	// classifier the edge cannot faithfully resolve — any classifier ROW references a
+	// matcher that itself fails closed (ServerOnly/RegexUntranslatable) or, transitively,
+	// another fail-closed classifier (classifiersFailClosed fixpoint, Finding 1). The
+	// classify matcher carries no ServerOnly/RegexUntranslatable flag of its own, so
+	// without this scopeFailsClosed would judge a pass/cache_ttl/storage/redirect scope
+	// gated on `{C}==v` SAFE and ship it native — over-caching a request the Go server
+	// passes (the edge's classifyResolve skips the fail-closed row → returns the default →
+	// the gate never fires). The runtime needs no equivalent: its classifyResolve naturally
+	// fails the row closed; only the projector's fail-open/delegate decision must account
+	// for it, which this flag drives through matcherFailsClosed.
+	failsClosed bool `json:"-"`
 }
 
 // serverOnlyEdgeKinds is the set of matcher kinds with no edge JavaScript runtime case:
-// the slice-2 Gateway matchers. A site using one is delegated to the Cadish server behind
-// (Fix #4) rather than silently mis-projected.
+// the slice-2 Gateway matchers (`all`/`query`) plus `upstream_healthy` (live lb-pool
+// liveness has no edge analogue, D49). A site using one is delegated to the Cadish server
+// behind (Fix #4) rather than silently mis-projected.
 var serverOnlyEdgeKinds = map[string]bool{
-	"all":   true, // AND-composite (route @gw_match -> u) — Gateway match conjunction
-	"query": true, // named query-param value test — Gateway queryParams Exact
+	"all":              true, // AND-composite (route @gw_match -> u) — Gateway match conjunction
+	"query":            true, // named query-param value test — Gateway queryParams Exact
+	"upstream_healthy": true, // live upstream-pool liveness probe — lb state has no edge analogue (D49)
+	"ip":               true, // IP/CIDR ACL — resolves the trusted-proxy real client IP, no edge analogue (R02)
+}
+
+// ServerOnlyEdgeKinds returns a COPY of the set of matcher kinds that have no edge
+// JavaScript runtime case (the projector marks them serverOnly + delegates; the worker
+// fails closed). Exported so the conformance coverage gate can assert its own mirror set
+// EQUALS this one, making any future drift fail loudly (Finding 7).
+func ServerOnlyEdgeKinds() map[string]bool {
+	out := make(map[string]bool, len(serverOnlyEdgeKinds))
+	for k, v := range serverOnlyEdgeKinds {
+		out[k] = v
+	}
+	return out
 }
 
 // Classifier is `{rows:[{conj:[matcherId], value}], default}` — first-match over
@@ -223,6 +281,17 @@ var serverOnlyEdgeKinds = map[string]bool{
 type Classifier struct {
 	Rows    []ClassifyRow `json:"rows"`
 	Default string        `json:"default"`
+	// DerivesFrom names the request cookies this axis consumes (`derives_from cookie
+	// NAME…`). The worker keeps them through cookie_allow so the classifier reads the
+	// original value and the key is built from it, then strips them post-key before the
+	// credential bypass + origin fetch (the same derive→strip the server does, so the two
+	// runtimes collapse cardinality identically). Omitted when none are declared.
+	DerivesFrom []string `json:"derivesFrom,omitempty"`
+	// DerivesForward is the SUBSET of DerivesFrom declared `forward` (alias `keep`): the
+	// worker FORWARDS these to origin (does NOT strip) and treats them as covered by
+	// {TOKEN} in the credential bypass — the loud opt-in for cookie-reading backends, the
+	// same behavior the server applies. Omitted when no row uses the modifier.
+	DerivesForward []string `json:"derivesForward,omitempty"`
 }
 
 // ClassifyRow is one row: an AND-conjunction of matcher ids yielding a value.
@@ -279,7 +348,8 @@ type Respond struct {
 	Body   string `json:"body"`
 }
 
-// Redirect is a computed 3xx. Exactly one of Regex / Scope selects.
+// Redirect is a computed 3xx. Regex and/or Scope select: the combined scope+regex
+// form carries BOTH (the worker requires the scope AND the regex to match).
 type Redirect struct {
 	Regex string `json:"regex,omitempty"`
 	// RegexFlags is the JS RegExp flag string lifted from a RE2 inline flag group on
@@ -365,7 +435,8 @@ type DeviceFold struct {
 }
 
 // KeyToken is one cache-key component. Kind is the stable token name the JS
-// interpreter switches on; Arg/Ref/Allow carry its parameters. For "sticky", Arg is
+// interpreter switches on; Arg/Ref/Allow/Deny carry its parameters (Allow for the
+// query_allow allowlist, Deny for the query_strip denylist). For "sticky", Arg is
 // the site-level sticky cookie name the worker must read; for "header" it is the
 // header name; for "tenant"/"literal" it is the constant text.
 type KeyToken struct {
@@ -373,6 +444,7 @@ type KeyToken struct {
 	Arg   string   `json:"arg,omitempty"`
 	Ref   string   `json:"ref,omitempty"`
 	Allow []string `json:"allow,omitempty"`
+	Deny  []string `json:"deny,omitempty"`
 }
 
 // Response is the ORIGIN/store-phase projection.
@@ -382,6 +454,14 @@ type Response struct {
 	StripCookies []Scope   `json:"stripCookies,omitempty"`
 	HeaderResp   []Header  `json:"headerResp,omitempty"`
 	CORS         *CORS     `json:"cors,omitempty"`
+
+	// HasStripHeaders is true iff at least one cache_ttl rule declares StripHeaders
+	// (the from_header-family control headers X-Cache-Ttl/Grace/Max-Stale it consumes).
+	// It is a build-time hint so the worker can SKIP the deliver/store-phase evalResponse
+	// walk + delete loop entirely on the common config that has no from_header rule —
+	// the walk runs only when it can actually strip something. Derivable from
+	// TTL[].StripHeaders; surfaced here so the runtime need not scan to learn it.
+	HasStripHeaders bool `json:"hasStripHeaders,omitempty"`
 
 	// Transforms is the ordered `replace OLD NEW` deliver-phase body-substitution
 	// rule list (D75). Each is edge-native within TransformMaxBytes: the worker
@@ -451,15 +531,35 @@ type TTL struct {
 	// value is seconds (Cache-Control max-age style); a unit spelling is a cadish
 	// duration. Absent/unparseable => the rule does not apply (fall through).
 	FromHeader string `json:"fromHeader,omitempty"`
+	// GraceFromHeader / MaxStaleFromHeader name origin response headers the edge reads
+	// the grace / max_stale window from (`grace_from_header NAME` /
+	// `max_stale_from_header NAME`); "" => the static Grace / MaxStale above. Same
+	// parse convention as FromHeader; an absent/unparseable value falls back to the
+	// literal (it does NOT make the rule fall through). The worker mirrors the server's
+	// resolveGraceMaxStale, including the resolved max_stale >= grace clamp.
+	GraceFromHeader    string `json:"graceFromHeader,omitempty"`
+	MaxStaleFromHeader string `json:"maxStaleFromHeader,omitempty"`
+	// RespHeader is an optional RESPONSE-phase `resp_header NAME VALUE` matcher ANDed in
+	// front of the selector: the rule applies only when the origin response carries the
+	// named header value AND the selector matches. nil for every non-resp_header rule. The
+	// worker evaluates it first (selectorMatches), so Go and JS branch freshness on the
+	// origin response identically (a conformance fixture asserts it).
+	RespHeader *Matcher `json:"respHeader,omitempty"`
+	// StripHeaders names the from_header-family control headers this rule CONSUMES from
+	// the origin response (X-Cache-Ttl/X-Cache-Grace/X-Cache-Max-Stale). The worker
+	// removes them before store + deliver, mirroring the server (handler.go), so the
+	// internal origin↔cache contract never leaks to the client. Omitted for a plain rule.
+	StripHeaders []string `json:"stripHeaders,omitempty"`
 }
 
 // Storage is a storage tier rule (ram|disk). The edge maps tiers to its own L1/L2
 // policy later (the `edge {}` block); this preserves the server intent.
 type Storage struct {
-	SelKind string `json:"selKind"`
-	Codes   []int  `json:"codes,omitempty"`
-	Scope   *Scope `json:"scope,omitempty"`
-	Tier    string `json:"tier"`
+	SelKind    string   `json:"selKind"`
+	Codes      []int    `json:"codes,omitempty"`
+	Scope      *Scope   `json:"scope,omitempty"`
+	Tier       string   `json:"tier"`
+	RespHeader *Matcher `json:"respHeader,omitempty"` // optional response-phase resp_header AND-term (see TTL.RespHeader)
 }
 
 // CORS projects a `cors` directive.
@@ -543,6 +643,17 @@ type CoverageReport struct {
 	// value-exposure warnings; `--strict` fails when it is non-zero so a CI pipeline
 	// catches a secret in the bundle. Fix B.
 	ValueExposed int `json:"valueExposed,omitempty"`
+	// ForcedPass counts SELECTING directives (pass / route / redirect / cache_key selector or
+	// token / cache_ttl / storage / edge-tier / upgrade) that could NOT be faithfully projected
+	// because they reference a matcher the edge fails closed on (a ServerOnly Gateway/lb/`ip`
+	// matcher, or an untranslatable RE2 regex), so the projector forced the SAFE fallback —
+	// a site-wide fail-open `pass` (the edge caches nothing) or a delegated redirect chain.
+	// The runtime direction is safe, but the operator's PRECISE intent is silently coarsened, so
+	// `cadish edge build` fails NON-ZERO on a non-zero ForcedPass EVEN WITHOUT -strict (R02/R16) —
+	// the operator must consciously keep that directive on the Cadish server behind, not discover
+	// at runtime that their whole site is being passed. Distinct from Delegated (server-only
+	// directives like rewrite/encode/purge/security that have no SELECTING/cache effect).
+	ForcedPass int `json:"forcedPass,omitempty"`
 }
 
 // DelegatedItem is one entry in the coverage report's delegate list.
@@ -577,7 +688,7 @@ func Project(p *pipeline.Pipeline) (EdgeIR, CoverageReport, error) {
 			for _, r := range c.Rows {
 				rows = append(rows, ClassifyRow{Conj: r.Conj, Value: r.Value})
 			}
-			ir.Classifiers[name] = Classifier{Rows: rows, Default: c.Default}
+			ir.Classifiers[name] = Classifier{Rows: rows, Default: c.Default, DerivesFrom: c.DerivesFrom, DerivesForward: c.DerivesForward}
 			// BUG-2: merge the matchers synthesized for inline (unnamed) matchers in
 			// `when` rows into the matcher map, under the synthetic names already placed in
 			// the rows' Conj. Without this an inline classify matcher projects to an empty
@@ -613,6 +724,36 @@ func Project(p *pipeline.Pipeline) (EdgeIR, CoverageReport, error) {
 			d.Folds = append(d.Folds, DeviceFold{From: f.From, Into: f.Into})
 		}
 		ir.Device = d
+	}
+
+	// Finding 1: a `classify`-token matcher (`@gated classify {C}==v`) carries NO
+	// ServerOnly/RegexUntranslatable flag of its own, but the classifier C it reads may
+	// have a ROW whose AND-conjunction references a fail-closed matcher (an untranslatable
+	// `(?U)`/`(?i:…)` regex, or a server-only Gateway/lb matcher). At the edge that row is
+	// skipped by classifyResolve → the classifier silently returns its default where the Go
+	// server (full RE2 / live lb state) would have matched the row → a scope gated on
+	// `{C}==v` mis-decides. Compute a per-classifier fail-closed flag to a FIXPOINT (a
+	// classifier is fail-closed if any row references a fail-closed matcher OR a fail-closed
+	// classifier — covering nested classify indirection), then propagate it onto every
+	// `classify` matcher that reads such a classifier so scopeFailsClosed (matcherFailsClosed)
+	// treats it as fail-closed and the existing pass/cache_ttl/storage fail-open + redirect
+	// delegation fire. A classifier whose rows are ALL edge-translatable is never marked, so
+	// legit configs still ship native (no over-reaction). Done after the classifier merge so
+	// synthesized inline matchers in `when` rows are covered.
+	// clsFC is hoisted to function scope so the KEY projection (cache_key recipes +
+	// tokens, Findings 1 & 2) can consult the SAME classifier fail-closed fixpoint the
+	// matcher pass uses — a `classify` cache-key TOKEN reading a fail-closed classifier
+	// must fail-open exactly like a directive SCOPE gated on such a classifier. nil when
+	// the site has no classifiers (a nil-map lookup is false, so the guards no-op).
+	var clsFC map[string]bool
+	if len(ir.Classifiers) > 0 {
+		clsFC = classifiersFailClosed(ir.Classifiers, ir.Matchers)
+		for name, m := range ir.Matchers {
+			if m.Kind == "classify" && clsFC[m.ClassifyToken] {
+				m.failsClosed = true
+				ir.Matchers[name] = m
+			}
+		}
 	}
 
 	// BUG-1: a path_regex/host_regex matcher (named OR synthesized for an inline
@@ -660,8 +801,48 @@ func Project(p *pipeline.Pipeline) (EdgeIR, CoverageReport, error) {
 	}
 
 	// RECV.
+	// failOpenPass trips when a scoped pass / cache_ttl / storage / upgrade rule
+	// references a matcher the edge fails CLOSED on (scopeFailsClosed). The edge then
+	// CANNOT identify which requests the scope selects, so it cannot reproduce the
+	// server's per-path pass/no-cache decision. The only SAFE representable choice — the
+	// edge is an additive tier and must NEVER cache a request the server passes/treats
+	// specially — is to fail OPEN: pass the WHOLE site unconditionally (one Always pass,
+	// appended once below). The edge then over-passes (caches less) but never caches
+	// wrong. Findings 2 & 3.
+	failOpenPass := false
 	for _, sc := range p.EdgePassRules() {
-		ir.Recv.Pass = append(ir.Recv.Pass, projectScope(sc))
+		s := projectScope(sc)
+		if fc, _ := directiveScopeOrTokensFailClosed(s, nil, ir.Matchers, clsFC); fc {
+			// The pass scope fails closed at the edge: without protection the edge would NOT
+			// bypass the cache for the operator-marked never-cache path and could store +
+			// serve it cross-user. Fail open (site-wide pass) instead. Finding 2.
+			failOpenPass = true
+			rep.ForcedPass++
+			rep.Warnings = append(rep.Warnings, "PASS-FAIL-OPEN: a `pass` scope references a matcher the edge cannot evaluate (a server-only Gateway/lb/`ip` matcher or an untranslatable RE2 regex); the edge passes ALL traffic for this site rather than risk caching a passed path. `cadish edge build` fails (non-zero) — keep this `pass` on the Cadish server behind.")
+			continue
+		}
+		ir.Recv.Pass = append(ir.Recv.Pass, s)
+		rep.EdgeNative++
+	}
+	// cache_credentialed (D101): origin-authoritative scopes. Route each through the SAME
+	// fail-closed chokepoint as pass/cache_ttl/storage: a scope referencing a ServerOnly or
+	// untranslatable matcher CANNOT be evaluated at the edge, so the worker could neither
+	// reproduce the credential-bypass opt-out nor apply the in-scope store precedence — it
+	// would silently diverge from the server (e.g. credential-bypass a request the server
+	// origin-authoritatively caches, or vice-versa). The only SAFE choice is to fail OPEN:
+	// pass the WHOLE site (one Always pass, appended once below) so EVERY request reaches the
+	// Cadish server behind, which has the full matcher set — and bump ForcedPass so `cadish
+	// edge build` fails loud (non-zero). A translatable scope is projected so the worker
+	// applies the identical origin-authoritative precedence.
+	for _, sc := range p.EdgeCredentialedRules() {
+		s := projectScope(sc)
+		if fc, _ := directiveScopeOrTokensFailClosed(s, nil, ir.Matchers, clsFC); fc {
+			failOpenPass = true
+			rep.ForcedPass++
+			rep.Warnings = append(rep.Warnings, "CACHE-CREDENTIALED-FAIL-OPEN: a `cache_credentialed` scope references a matcher the edge cannot evaluate (a server-only Gateway/lb/`ip` matcher or an untranslatable RE2 regex); the edge passes ALL traffic for this site rather than risk diverging from the server's origin-authoritative cache decision. `cadish edge build` fails (non-zero) — keep this `cache_credentialed` on the Cadish server behind.")
+			continue
+		}
+		ir.CacheCredentialed = append(ir.CacheCredentialed, s)
 		rep.EdgeNative++
 	}
 	for _, r := range p.EdgeRespondRules() {
@@ -677,28 +858,60 @@ func Project(p *pipeline.Pipeline) (EdgeIR, CoverageReport, error) {
 		ir.Delegate = append(ir.Delegate, d)
 		addDelegate(&rep, d)
 	}
+	// redirectDelegated trips the first time any redirect rule is delegated. After
+	// that, EVERY later redirect rule (in source order) is also delegated rather than
+	// appended natively (Finding 5): `redirect` is first-match-wins, so if an earlier
+	// rule runs on the server behind, the edge must NOT terminally answer a request
+	// whose true first match is that delegated rule — it would silently wrong-redirect.
+	redirectDelegated := false
 	for _, r := range p.EdgeRedirectRules() {
-		er := Redirect{Status: r.Status, Target: r.Target}
-		if r.Regex == "" {
-			s := projectScope(r.Scope)
-			er.Scope = &s
-			ir.Recv.Redirect = append(ir.Recv.Redirect, er)
-			rep.EdgeNative++
-			continue
-		}
-		// BUG-1: a regex redirect (e.g. `redirect (?i)^/cams/?$ …`) carries the raw RE2
-		// source — lift inline flags so the worker compiles `new RegExp(regex, flags)`.
-		pat, flags, ok := splitRE2Flags(r.Regex)
-		if !ok {
-			// Untranslatable RE2 construct: never ship a pattern that crashes/mismatches.
-			// Delegate the redirect (loud) to the Cadish server behind, which has full RE2.
-			d := Delegated{Directive: "redirect", Reason: "redirect regex uses a RE2 construct with no faithful JavaScript RegExp equivalent (e.g. ungreedy `(?U)`, a scoped `(?i:…)` group, or a mid-pattern inline flag); delegated to the Cadish server behind so the edge never ships a crashing or divergent pattern"}
+		if redirectDelegated {
+			d := Delegated{Directive: "redirect", Reason: "a preceding redirect rule is delegated to the Cadish server behind; to preserve `redirect` first-match-wins semantics this later rule is also delegated, so the edge never terminally answers a request whose true first match runs on the server (additive-tier limitation)"}
 			ir.Delegate = append(ir.Delegate, d)
 			addDelegate(&rep, d)
 			continue
 		}
-		er.Regex = pat
-		er.RegexFlags = flags
+		er := Redirect{Status: r.Status, Target: r.Target}
+		// Scope selector (scope-only or the combined scope+regex form).
+		if r.HasScope {
+			s := projectScope(r.Scope)
+			// Finding 1: if the redirect's SCOPE references a matcher the edge fails closed on
+			// (a server-only matcher or an untranslatable regex), the scope never matches at
+			// the edge — so this redirect silently never fires and a LATER redirect wrongly
+			// becomes the edge's first match, while the Go server (full matcher set,
+			// first-match-wins) picks THIS one. Treat it exactly like an untranslatable OWN
+			// regex: delegate this redirect AND, via redirectDelegated, every later one — so
+			// the edge defers the whole chain from here to the Cadish server behind, which
+			// produces the correct first-match redirect.
+			if fc, _ := directiveScopeOrTokensFailClosed(s, nil, ir.Matchers, clsFC); fc {
+				d := Delegated{Directive: "redirect", Reason: "redirect scope references a matcher the edge cannot evaluate (a server-only Gateway/lb matcher or an untranslatable RE2 regex such as `(?U)`/`(?i:…)`); it fails CLOSED at the edge, so a later redirect would wrongly become the first match — the redirect chain from here is delegated to the Cadish server behind to preserve first-match-wins"}
+				ir.Delegate = append(ir.Delegate, d)
+				addDelegate(&rep, d)
+				rep.ForcedPass++ // a redirect SCOPE referencing a fail-closed matcher → delegated chain (R16)
+				redirectDelegated = true
+				continue
+			}
+			er.Scope = &s
+		}
+		// Path-regex selector (regex-only or the combined form). BUG-1: a regex
+		// redirect (e.g. `redirect (?i)^/cams/?$ …`) carries the raw RE2 source — lift
+		// inline flags so the worker compiles `new RegExp(regex, flags)`.
+		if r.Regex != "" {
+			pat, flags, ok := splitRE2Flags(r.Regex)
+			if !ok {
+				// Untranslatable RE2 construct: never ship a pattern that crashes/mismatches.
+				// Delegate the whole redirect (loud) — including the combined form — to the
+				// Cadish server behind, which has full RE2.
+				d := Delegated{Directive: "redirect", Reason: "redirect regex uses a RE2 construct with no faithful JavaScript RegExp equivalent (e.g. ungreedy `(?U)`, a scoped `(?i:…)` group, or a mid-pattern inline flag); delegated to the Cadish server behind so the edge never ships a crashing or divergent pattern"}
+				ir.Delegate = append(ir.Delegate, d)
+				addDelegate(&rep, d)
+				rep.ForcedPass++ // a redirect's OWN untranslatable RE2 regex → delegated chain (R16), same as the scope-fail-closed branch above
+				redirectDelegated = true
+				continue
+			}
+			er.Regex = pat
+			er.RegexFlags = flags
+		}
 		ir.Recv.Redirect = append(ir.Recv.Redirect, er)
 		rep.EdgeNative++
 	}
@@ -754,7 +967,24 @@ func Project(p *pipeline.Pipeline) (EdgeIR, CoverageReport, error) {
 		}
 	}
 	for _, r := range p.EdgeRouteRules() {
-		ir.Recv.Route = append(ir.Recv.Route, Route{Scope: projectScope(r.Scope), Upstream: r.Upstream})
+		s := projectScope(r.Scope)
+		// AUDIT (same fail-closed class as the findings): `route @scope upstream` is
+		// first-match-wins (resolveUpstream). A route whose SCOPE fails closed at the edge
+		// never matches there → the edge skips it and resolves a LATER route or the default
+		// upstream → it fetches from the WRONG origin and CACHES that body under the key,
+		// while the Go server (full matcher set) routes to the scoped upstream → cross-origin
+		// cache poisoning. Route the scope through the SAME guard and fail OPEN (site-wide
+		// pass) so the edge never CACHES a wrong-origin body it cannot route. (The implied
+		// pass still fetches via resolveUpstream, so a passed request may proxy the default
+		// origin — an additive-tier limitation shared with the pass/upgrade fail-open — but it
+		// is never stored/served cross-variant, preserving the edge's "never cache wrong" invariant.)
+		if fc, _ := directiveScopeOrTokensFailClosed(s, nil, ir.Matchers, clsFC); fc {
+			failOpenPass = true
+			rep.ForcedPass++
+			rep.Warnings = append(rep.Warnings, "ROUTE-FAIL-OPEN: a `route` scope references a matcher the edge cannot evaluate (a server-only Gateway/lb/`ip` matcher or an untranslatable RE2 regex); the edge cannot reproduce the upstream selection, so it passes ALL traffic for this site rather than cache a wrong-origin body. `cadish edge build` fails (non-zero) — keep this `route` on the Cadish server behind.")
+			continue
+		}
+		ir.Recv.Route = append(ir.Recv.Route, Route{Scope: s, Upstream: r.Upstream})
 		rep.EdgeNative++
 	}
 	for _, h := range p.EdgeReqHeaderRules() {
@@ -768,7 +998,7 @@ func Project(p *pipeline.Pipeline) (EdgeIR, CoverageReport, error) {
 	// server's. Other tokens carry their own Arg/Ref/Allow.
 	stickyCookie := p.EdgeStickyCookie()
 	projectToken := func(tk pipeline.EdgeKeyToken) KeyToken {
-		kt := KeyToken{Kind: tk.Kind, Arg: tk.Arg, Ref: tk.Ref, Allow: tk.Allow}
+		kt := KeyToken{Kind: tk.Kind, Arg: tk.Arg, Ref: tk.Ref, Allow: tk.Allow, Deny: tk.Deny}
 		if tk.Kind == "sticky" {
 			kt.Arg = stickyCookie
 		}
@@ -776,8 +1006,21 @@ func Project(p *pipeline.Pipeline) (EdgeIR, CoverageReport, error) {
 	}
 	// Catch-all (default/unscoped) recipe: kept as Key.Tokens for backward compatibility
 	// and as the worker's fallback when there are no scoped recipes.
+	var defaultKeyTokens []KeyToken // nil-preserving (an empty cache_key marshals to null, as before)
 	for _, tk := range p.EdgeKeyTokens() {
-		ir.Key.Tokens = append(ir.Key.Tokens, projectToken(tk))
+		defaultKeyTokens = append(defaultKeyTokens, projectToken(tk))
+	}
+	// Finding 2: if the default recipe reads a `classify {C}` TOKEN whose classifier the
+	// edge fails closed on (clsFC), the edge resolves that token to the classifier DEFAULT
+	// while the Go server returns the matched row → a divergent key COMPONENT → the edge
+	// would store one variant and serve it cross-variant. Fail OPEN (the trailing site-wide
+	// pass) rather than ship a divergently-keyed default — mirroring cache_ttl/storage.
+	if fc, cls := directiveScopeOrTokensFailClosed(Scope{Always: true}, defaultKeyTokens, ir.Matchers, clsFC); fc {
+		failOpenPass = true
+		rep.ForcedPass++
+		rep.Warnings = append(rep.Warnings, "CACHE_KEY-FAIL-OPEN: the default `cache_key` reads a `classify {"+cls+"}` token whose classifier references a matcher the edge cannot evaluate (a server-only Gateway/lb/`ip` matcher or an untranslatable RE2 regex); rather than key on the classifier's edge DEFAULT (a divergent key → cross-variant serving), the edge passes ALL traffic for this site. `cadish edge build` fails (non-zero) — keep the precise key on the Cadish server behind.")
+	} else {
+		ir.Key.Tokens = defaultKeyTokens
 	}
 	// Scoped cache_key v2 (D70): project the FULL ordered recipe list + selectors so the
 	// worker evaluates the SAME first-match-wins selection the Go pipeline does
@@ -790,19 +1033,89 @@ func Project(p *pipeline.Pipeline) (EdgeIR, CoverageReport, error) {
 		for _, tk := range rc.Tokens {
 			kr.Tokens = append(kr.Tokens, projectToken(tk))
 		}
+		// Findings 1 & 2: a non-catch-all recipe whose SELECTOR fails closed at the edge never
+		// matches there → selectKeyTokens falls through to a later/catch-all recipe → a
+		// DIFFERENT key than Go (full matcher set, first-match-wins); and a recipe whose TOKENS
+		// read a fail-closed classifier resolves to the classifier DEFAULT at the edge → again a
+		// divergent key component. Either way the edge would store one variant and serve it
+		// cross-variant, so do NOT ship the recipe; fail OPEN (the trailing site-wide pass) — the
+		// precise scoped key still runs on the Cadish server behind. Same guard as cache_ttl/storage.
+		if fc, cls := directiveScopeOrTokensFailClosed(kr.Selector, kr.Tokens, ir.Matchers, clsFC); fc {
+			failOpenPass = true
+			rep.ForcedPass++
+			reason := "references a matcher the edge cannot evaluate (a server-only Gateway/lb/`ip` matcher or an untranslatable RE2 regex such as `(?U)`/`(?i:…)`)"
+			if cls != "" {
+				reason = "reads a `classify {" + cls + "}` token whose classifier the edge cannot faithfully resolve (a row references a server-only or untranslatable matcher)"
+			}
+			rep.Warnings = append(rep.Warnings, "CACHE_KEY-FAIL-OPEN: a scoped `cache_key` recipe "+reason+"; rather than key on a divergent fallback recipe (→ cross-variant serving), the edge passes ALL traffic for this site. The precise scoped key still runs on the Cadish server behind.")
+			continue
+		}
 		ir.Key.Recipes = append(ir.Key.Recipes, kr)
 	}
 	rep.EdgeNative++ // the cache_key (incl. all scoped recipes) as one edge-native directive
 
 	// RESPONSE/store.
 	for _, r := range p.EdgeTTLRules() {
-		ir.Response.TTL = append(ir.Response.TTL, projectTTL(r))
+		// Finding 2: a SCOPED cache_ttl rule whose scope references a matcher the edge fails
+		// closed on never matches at the edge, so the edge silently falls through to the
+		// `default` rule — caching the path with a DIFFERENT (typically longer) TTL than the
+		// server's scoped rule intended. Do not emit such a rule (it cannot be honored), and
+		// fail OPEN to non-caching (site-wide pass) so the edge never caches a fail-closed
+		// path differently than the server.
+		if fc, _ := directiveScopeOrTokensFailClosed(projectScope(r.Scope), nil, ir.Matchers, clsFC); r.SelKind == "scope" && fc {
+			failOpenPass = true
+			rep.ForcedPass++
+			rep.Warnings = append(rep.Warnings, "CACHE_TTL-FAIL-OPEN: a scoped `cache_ttl` references a matcher the edge cannot evaluate (a server-only Gateway/lb/`ip` matcher or an untranslatable RE2 regex); rather than silently apply the `default` TTL, the edge passes ALL traffic for this site (caches nothing) so it never caches a path longer/differently than the server intended. `cadish edge build` fails (non-zero) — keep the scoped TTL on the Cadish server behind.")
+			continue
+		}
+		t := projectTTL(r)
+		if len(t.StripHeaders) > 0 {
+			// At least one cache_ttl rule consumes from_header control headers; arm the
+			// build-time hint so the worker runs the strip walk (Finding 5).
+			ir.Response.HasStripHeaders = true
+		}
+		ir.Response.TTL = append(ir.Response.TTL, t)
 		rep.EdgeNative++
 	}
 	for _, r := range p.EdgeStorageRules() {
+		// Finding 2: like cache_ttl, a SCOPED storage rule whose scope fails closed at the
+		// edge silently falls through to the `default` tier — storing the path in a
+		// different tier than the server's scoped rule intended. Do not emit it; fail OPEN
+		// to non-caching (site-wide pass) so the edge never caches it under the wrong tier.
+		if fc, _ := directiveScopeOrTokensFailClosed(projectScope(r.Scope), nil, ir.Matchers, clsFC); r.SelKind == "scope" && fc {
+			failOpenPass = true
+			rep.ForcedPass++
+			rep.Warnings = append(rep.Warnings, "STORAGE-FAIL-OPEN: a scoped `storage` references a matcher the edge cannot evaluate (a server-only Gateway/lb/`ip` matcher or an untranslatable RE2 regex); rather than silently apply the `default` tier, the edge passes ALL traffic for this site (caches nothing). `cadish edge build` fails (non-zero) — keep the scoped storage tier on the Cadish server behind.")
+			continue
+		}
 		ir.Response.Storage = append(ir.Response.Storage, projectStorage(r))
 		rep.EdgeNative++
 	}
+
+	// EDGE TIER POLICY — the LAST store-decision surface. The `edge {}` block's per-scope
+	// `local | distribute | skip @scope` policies tell the worker which tier (or none, for
+	// `skip`) to store an object in. A policy whose scope references a matcher the edge fails
+	// CLOSED on cannot be evaluated by resolveEdgeTier, which then falls the request to the
+	// `default` tier — caching a `skip @x` path the operator marked never-cache-at-edge, or
+	// mis-tiering a `local`/`distribute` object into the default tier. Route EVERY policy
+	// scope through the SAME fail-closed chokepoint as `storage` (just above): on a trip, drop
+	// the policy and fail OPEN to non-caching (site-wide pass) so the `skip` is honored and the
+	// edge never stores an object it cannot correctly tier. A fully edge-translatable scope
+	// still projects native (no over-reaction). The scoped tier policy still runs on the
+	// Cadish server behind. All three tiers fail open identically — mirroring `storage`, which
+	// already fails open on ANY scoped tier it cannot evaluate (an unevaluatable scope is just
+	// as unsafe for `local`/`distribute` mis-tiering as it is for `skip`).
+	for _, pol := range p.EdgeTierPolicies() {
+		s := projectScope(pol.Scope)
+		if fc, _ := directiveScopeOrTokensFailClosed(s, nil, ir.Matchers, clsFC); fc {
+			failOpenPass = true
+			rep.ForcedPass++
+			rep.Warnings = append(rep.Warnings, "EDGE-TIER-FAIL-OPEN: an `edge {"+pol.Tier+" @…}` tier policy references a matcher the edge cannot evaluate (a server-only Gateway/lb/`ip` matcher or an untranslatable RE2 regex); rather than fall the path to the `default` tier (caching a `skip` path or mis-tiering a local/distribute object), the edge passes ALL traffic for this site (caches nothing). `cadish edge build` fails (non-zero) — keep the scoped edge tier policy on the Cadish server behind.")
+			continue
+		}
+		ir.Edge.Policies = append(ir.Edge.Policies, EdgePolicy{Scope: s, Tier: pol.Tier})
+	}
+
 	for _, sc := range p.EdgeStripRules() {
 		ir.Response.StripCookies = append(ir.Response.StripCookies, projectScope(sc))
 		rep.EdgeNative++
@@ -880,6 +1193,43 @@ func Project(p *pipeline.Pipeline) (EdgeIR, CoverageReport, error) {
 		d := Delegated{Directive: "encode", Reason: "on-the-fly response compression (encode) is not edge-native in v1; Cloudflare compresses at its own edge and the Cadish server applies encode for origin fetches"}
 		ir.Delegate = append(ir.Delegate, d)
 		addDelegate(&rep, d)
+	}
+	// `upgrade @scope` is inherently server-only: it hosts a live, hijacked
+	// connection-upgrade (WebSocket) tunnel to the origin, which a stateless edge
+	// worker cannot hold open. Record one Delegate per rule so it surfaces in the
+	// coverage report and trips `--strict` — never silently dropped.
+	for _, sc := range p.EdgeUpgradeScopes() {
+		d := Delegated{Directive: "upgrade", Reason: "a connection-upgrade (WebSocket / Connection: Upgrade) passthrough tunnel is a live, hijacked bidirectional connection the Cadish server holds open; an edge worker cannot host it, so an upgrade route runs on the Cadish server behind"}
+		s := projectScope(sc)
+		d.Scope = &s
+		ir.Delegate = append(ir.Delegate, d)
+		addDelegate(&rep, d)
+		// Finding 3: `upgrade @scope` IMPLIES pass on the server for EVERY matching request
+		// (the whole upgrade scope is uncacheable; only a genuine upgrade tunnels). The
+		// connection hijack is delegated above, but the implied PASS must also reach the
+		// edge — otherwise a cookieless cacheable GET to an upgrade-scope path is STORED +
+		// served cross-user at the edge while the server passes it. Project the scope into
+		// recv.pass so the edge reproduces the server's "whole upgrade scope is uncacheable".
+		// If the upgrade scope itself fails closed at the edge, fall back to the Finding-2
+		// site-wide fail-open pass (the edge cannot evaluate the scope, so it cannot pass
+		// only that path).
+		if fc, _ := directiveScopeOrTokensFailClosed(s, nil, ir.Matchers, clsFC); fc {
+			failOpenPass = true
+			rep.ForcedPass++
+			rep.Warnings = append(rep.Warnings, "UPGRADE-FAIL-OPEN: an `upgrade` scope references a matcher the edge cannot evaluate (a server-only Gateway/lb/`ip` matcher or an untranslatable RE2 regex); the edge passes ALL traffic for this site so it never caches an upgrade-scope path the server passes. `cadish edge build` fails (non-zero) — keep the `upgrade` route on the Cadish server behind.")
+		} else {
+			ir.Recv.Pass = append(ir.Recv.Pass, s)
+		}
+	}
+
+	// Finding 2/3 fail-open: if any scoped pass / cache_ttl / storage / upgrade rule
+	// referenced a matcher the edge fails closed on, append ONE unconditional pass so the
+	// edge bypasses the cache for the whole site rather than cache a request the server
+	// would pass / treat under a rule the edge cannot evaluate. Appended once (idempotent)
+	// regardless of how many rules tripped it.
+	if failOpenPass {
+		ir.Recv.Pass = append(ir.Recv.Pass, Scope{Always: true})
+		rep.EdgeNative++
 	}
 
 	// Visibility (D34): warn about every header/cookie matcher whose literal VALUE
@@ -1014,8 +1364,9 @@ var envValues = func() map[string]struct{} {
 	return set
 }
 
-// envValueExposureWarnings scans every IR string field whose source could be an
-// unquoted `{$VAR}` env placeholder — request/response header op values, `replace`
+// envValueExposureWarnings scans every IR string field whose source could be a
+// `{$VAR}` env placeholder (quoted OR unquoted — both expand since R07/D94) —
+// request/response header op values, `replace`
 // transform OLD/NEW, `respond on_error` bodies, `redirect` targets, and cache_key
 // `literal:` tokens — and flags any value that EQUALS or CONTAINS a non-empty
 // process-env value (the env-expanded secret). Mirrors the matcher value-exposure
@@ -1053,7 +1404,7 @@ func envValueExposureWarnings(ir EdgeIR) []string {
 		for _, h := range hs {
 			for _, op := range h.Ops {
 				if exposed(op.Value) {
-					warns = append(warns, phase+" header op `"+op.Op+" "+op.Name+"` ships an environment-expanded value in the IR to the public edge — confirm it is not a secret (quote the `{$VAR}` to keep it server-side)")
+					warns = append(warns, phase+" header op `"+op.Op+" "+op.Name+"` ships an environment-expanded value in the IR to the public edge — confirm it is not a secret (a `{$VAR}` expands whether quoted or not; keep secrets out of edge-projected directives)")
 				}
 			}
 		}
@@ -1167,6 +1518,132 @@ func projectScope(s pipeline.EdgeScope) Scope {
 	return out
 }
 
+// scopeFailsClosed reports whether a (projected) scope references ANY matcher the edge
+// runtime evaluates as fail-closed: a ServerOnly Gateway/lb matcher (`all`/`query`/
+// `upstream_healthy`) or a RegexUntranslatable path/host/header_regex (e.g. ungreedy
+// `(?U)`, a scoped `(?i:…)` group, a mid-pattern inline flag). At the edge such a matcher
+// returns false (matchOne), so the WHOLE scope can silently fail to match — a directive
+// gated on it then behaves DIFFERENTLY than on the Go server (which evaluates the matcher
+// fully). The projector calls this to delegate (redirect, where the origin server still
+// produces the correct answer) or fail-open (pass / cache_ttl / storage / upgrade, where a
+// missing rule would let the edge cache a request the server passes / treats specially)
+// rather than ship a rule whose scope the edge cannot honor. matchers is the
+// already-projected ir.Matchers (for named lookups); inline matchers carry their own
+// ServerOnly/RegexUntranslatable flags from projectMatcher. An Always scope never fails
+// closed (it has no matcher to evaluate). Shared by the redirect/pass/cache_ttl/storage/
+// upgrade projection loops (Findings 1–3).
+func scopeFailsClosed(s Scope, matchers map[string]Matcher) bool {
+	if s.Always {
+		return false
+	}
+	for _, name := range s.Names {
+		if m, ok := matchers[name]; ok && matcherFailsClosed(m) {
+			return true
+		}
+	}
+	for _, m := range s.Inline {
+		if matcherFailsClosed(m) {
+			return true
+		}
+	}
+	return false
+}
+
+// matcherFailsClosed reports whether the edge runtime evaluates a projected matcher as
+// fail-closed (matchOne returns false / non-match): a ServerOnly Gateway/lb matcher, a
+// RegexUntranslatable path/host/header_regex, OR a `classify` matcher reading a classifier
+// the edge cannot faithfully resolve (failsClosed, set by Project after the
+// classifiersFailClosed fixpoint — Finding 1). The single predicate shared by
+// scopeFailsClosed so the redirect/pass/cache_ttl/storage/upgrade fail-open + delegation
+// all account for classify indirection identically.
+func matcherFailsClosed(m Matcher) bool {
+	return m.ServerOnly || m.RegexUntranslatable || m.failsClosed
+}
+
+// directiveScopeOrTokensFailClosed is the SINGLE fail-closed guard EVERY scoped or
+// token-bearing edge rule routes through, so a future scoped/token surface cannot
+// silently skip the check — the recurring "a scope/token that fails closed at the edge
+// → divergent edge behavior" class (pass/cache_ttl/storage/redirect/upgrade and, as of
+// Findings 1 & 2, the cache_key recipe SELECTORS and classify TOKENS). It folds the two
+// fail-closed vectors a directive can carry:
+//
+//   - the directive SCOPE (selector) references a matcher the edge fails closed on
+//     (scopeFailsClosed → a ServerOnly Gateway/lb matcher, a RegexUntranslatable
+//     path/host/header_regex, or a `classify` matcher reading a fail-closed classifier); and
+//   - a cache_key TOKEN reads a fail-closed classifier (a `classify` key token whose
+//     classifier resolves to its DEFAULT at the edge while Go returns the matched row —
+//     a divergent key component, Finding 2).
+//
+// Scope-only directives (pass/cache_ttl/storage/redirect/upgrade) pass a nil token slice;
+// token-only ones (the default cache_key) pass an Always scope. Returns whether the rule
+// fails closed and, when a classify TOKEN is the cause, that classifier's name (so the
+// caller can name it in the warning; "" for a scope-driven failure). matchers is the
+// projected ir.Matchers; clsFC the classifiersFailClosed fixpoint (nil when the site has
+// no classifiers — a nil-map lookup is false, so the token vector no-ops).
+func directiveScopeOrTokensFailClosed(s Scope, tokens []KeyToken, matchers map[string]Matcher, clsFC map[string]bool) (bool, string) {
+	if scopeFailsClosed(s, matchers) {
+		return true, ""
+	}
+	for _, tk := range tokens {
+		if tk.Kind == "classify" && clsFC[tk.Ref] {
+			return true, tk.Ref
+		}
+	}
+	return false, ""
+}
+
+// classifiersFailClosed computes, for every classifier, whether the edge cannot faithfully
+// resolve it. A classifier is fail-closed when ANY of its rows' AND-conjunctions references
+// a matcher that itself fails closed at the edge — a ServerOnly or RegexUntranslatable
+// matcher — OR (transitively) a `classify` matcher reading a fail-closed classifier. Such a
+// row is SKIPPED by classifyResolve at the edge (matchOne returns false for the fail-closed
+// matcher), so the classifier silently returns its default where the Go server (full RE2 /
+// live lb state) would have matched the row — and a pass/cache_ttl/storage/redirect scope
+// gated on `{C}==v` then mis-decides. The transitive case is iterated to a FIXPOINT so
+// nested classify indirection (a classifier whose row reads another classifier) is covered.
+// A classifier whose rows are ALL edge-translatable is never marked, so legit configs still
+// project native (Finding 1 — no over-reaction).
+func classifiersFailClosed(classifiers map[string]Classifier, matchers map[string]Matcher) map[string]bool {
+	fc := make(map[string]bool, len(classifiers))
+	for {
+		changed := false
+		for name, c := range classifiers {
+			if fc[name] {
+				continue
+			}
+			if classifierRowsFailClosed(c, matchers, fc) {
+				fc[name] = true
+				changed = true
+			}
+		}
+		if !changed {
+			return fc
+		}
+	}
+}
+
+// classifierRowsFailClosed reports whether any row of c references a directly fail-closed
+// matcher (ServerOnly/RegexUntranslatable) or a `classify` matcher whose classifier is
+// ALREADY known fail-closed (fc) — the step relation classifiersFailClosed iterates to a
+// fixpoint, so a classifier that reads another classifier resolves transitively.
+func classifierRowsFailClosed(c Classifier, matchers map[string]Matcher, fc map[string]bool) bool {
+	for _, row := range c.Rows {
+		for _, id := range row.Conj {
+			m, ok := matchers[id]
+			if !ok {
+				continue
+			}
+			if m.ServerOnly || m.RegexUntranslatable {
+				return true
+			}
+			if m.Kind == "classify" && fc[m.ClassifyToken] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func projectHeader(h pipeline.EdgeHeaderRule) Header {
 	ops := make([]HeaderOp, 0, len(h.Ops))
 	for _, op := range h.Ops {
@@ -1176,10 +1653,16 @@ func projectHeader(h pipeline.EdgeHeaderRule) Header {
 }
 
 func projectTTL(r pipeline.EdgeTTL) TTL {
-	t := TTL{SelKind: r.SelKind, Codes: r.Codes, IsHFM: r.IsHFM, FromHeader: r.FromHeader}
+	t := TTL{SelKind: r.SelKind, Codes: r.Codes, IsHFM: r.IsHFM, FromHeader: r.FromHeader,
+		GraceFromHeader: r.GraceFromHeader, MaxStaleFromHeader: r.MaxStaleFromHeader,
+		StripHeaders: r.StripHeaders}
 	if r.SelKind == "scope" {
 		s := projectScope(r.Scope)
 		t.Scope = &s
+	}
+	if r.RespHeader != nil {
+		m := projectMatcher(*r.RespHeader)
+		t.RespHeader = &m
 	}
 	if r.IsHFM {
 		t.HitForMiss = r.HitForMiss.String()
@@ -1200,17 +1683,19 @@ func projectTTL(r pipeline.EdgeTTL) TTL {
 	return t
 }
 
-// projectEdge projects the `edge {}` block's cache-tier policies into the worker
-// IR (per-scope local/distribute/skip + a default). Deploy identity (account/zone/
-// worker/routes/kv) is intentionally NOT projected here — it is management-plane
-// metadata that must not ship to the public worker; the CLI reads it from
-// pipeline.EdgeDeployConfig() directly. With no `edge {}` block, Default is "local"
-// and there are no policies (the prior stub behavior).
+// projectEdge projects the `edge {}` block's default tier + KV guardrails into the
+// worker IR. Deploy identity (account/zone/worker/routes/kv) is intentionally NOT
+// projected here — it is management-plane metadata that must not ship to the public
+// worker; the CLI reads it from pipeline.EdgeDeployConfig() directly. With no `edge {}`
+// block, Default is "local" and there are no policies (the prior stub behavior).
+//
+// The per-scope `local | distribute | skip @scope` tier POLICIES are intentionally NOT
+// projected here: they are a store-decision surface and must route through the single
+// fail-closed chokepoint (directiveScopeOrTokensFailClosed), which needs ir.Matchers +
+// the classifier fail-closed fixpoint (clsFC) — both computed later in Project. The
+// gated policy projection therefore lives inline in Project (mirroring `storage`).
 func projectEdge(p *pipeline.Pipeline) Edge {
 	e := Edge{Default: p.EdgeDefaultTier()}
-	for _, pol := range p.EdgeTierPolicies() {
-		e.Policies = append(e.Policies, EdgePolicy{Scope: projectScope(pol.Scope), Tier: pol.Tier})
-	}
 	if d, ok := p.EdgeKVTTL(); ok {
 		// KV's expirationTtl is whole seconds; round up so a sub-second cap still
 		// keeps the entry for at least the requested window (the 60s KV floor is
@@ -1230,6 +1715,10 @@ func projectStorage(r pipeline.EdgeStorage) Storage {
 	if r.SelKind == "scope" {
 		sc := projectScope(r.Scope)
 		s.Scope = &sc
+	}
+	if r.RespHeader != nil {
+		m := projectMatcher(*r.RespHeader)
+		s.RespHeader = &m
 	}
 	return s
 }

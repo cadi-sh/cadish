@@ -17,7 +17,7 @@ directive here is documented there.
 Don't translate by hand from scratch — let cadish do the mechanical 80%:
 
 ```sh
-cadish adapt your.vcl -o Cadishfile
+cadish adapt -o Cadishfile your.vcl
 ```
 
 `cadish adapt` parses a Varnish VCL and emits a **best-effort Cadishfile
@@ -105,7 +105,7 @@ low-level glue. cadish makes sticky a directive:
 
 ```
 upstream web {
-    to       k8s://varnish-ingress:8080     # DNS re-resolved, no reloads
+    to       k8s://varnish-ingress.default:8080   # re-resolved, no reloads
     sticky   by cookie PHPSESSID else client_ip
     health   GET / expect 301 interval 5s window 6 threshold 3
     timeout  connect 5s first_byte 600s

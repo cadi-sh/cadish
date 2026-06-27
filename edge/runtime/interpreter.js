@@ -13,7 +13,7 @@
 // Keep this in lockstep with the Go pipeline: a change to the Go matcher/eval
 // semantics must be mirrored here, and the conformance suite must stay green.
 
-export const IR_VERSION = 4;
+export const IR_VERSION = 6;
 
 // ---------------------------------------------------------------------------
 // Header / cookie / host helpers (port of net/http + request.go semantics).
@@ -66,6 +66,10 @@ export function newRequest(input) {
     query,
     header,
     clientIP: input.clientIP || "",
+    // scheme backs the {proto}/{scheme} token: "https" when the original request
+    // reached the edge over TLS, else "http". Accept an explicit scheme string or
+    // a boolean `tls` flag (the conformance fixture / worker shapes); default http.
+    scheme: input.scheme || (input.tls ? "https" : "http"),
     device: input.device || "",
     geo: input.geo || "",
     geoContinent: input.geoContinent || "",
@@ -111,10 +115,17 @@ function queryGet(req, name) {
 }
 
 // parseCookies parses the request "Cookie" header into [{name, value}], mirroring
-// net/http's readCookies closely enough for matching: split on ';', trim, split
-// on the first '=', strip surrounding quotes from the value.
+// pipeline.parseLenientCookies: split on ';', trim, split on the first '=', strip
+// surrounding quotes from the value. CRITICAL: a request may carry MULTIPLE Cookie
+// header lines; Go's lenientCookies joins them ALL with "; " before parsing (request.go),
+// so a cookie on a 2nd/Nth line is still seen. Reading only headerGet's FIRST value here
+// silently HID later-line cookies — diverging from the server on the cookie matcher,
+// cookie_json, the cache-key cookie token, and the credential-coverage gate (a request
+// the server passes/keys gets edge-cached under a cookie-less key → cross-user serving).
+// Join every Cookie line the same way Go does.
 function parseCookies(req) {
-  const raw = headerGet(req, "Cookie");
+  const lines = req.header.get(canonicalHeaderKey("Cookie"));
+  const raw = lines && lines.length ? (lines.length === 1 ? lines[0] : lines.join("; ")) : "";
   if (!raw) return [];
   const out = [];
   for (let part of raw.split(";")) {
@@ -641,6 +652,17 @@ function matchOne(ir, m, ctx) {
       if (ct === "") return false;
       return (m.contentTypes || []).some((want) => ct.includes(want));
     }
+    case "resp_header": {
+      // RESPONSE-phase: a named origin response header value (exact or `*`-glob). Mirrors
+      // the Go matcher (matcher.go kindRespHeader): nil respHeader (request/origin-error
+      // phase) never fires; name match is case-insensitive (respHeaderValues canonicalizes);
+      // multi-valued header matches if ANY value matches; no values => presence. Values are
+      // matched with the SAME name-glob engine (nameGlobMatch) the server's respValues uses.
+      if (!ctx.respHeader) return false;
+      const vals = respHeaderValues(ctx.respHeader, m.name);
+      if (!m.values || m.values.length === 0) return vals.length > 0;
+      return vals.some((v) => nameGlobMatch(m.values, v));
+    }
     case "cookie": {
       if (m.glob) return cookieNamePrefixPresent(req, m.name);
       if (!m.values || m.values.length === 0) return cookiePresent(req, m.name);
@@ -652,7 +674,13 @@ function matchOne(ir, m, ctx) {
       return jsonFieldMatch(c.value, c.present, splitJSONPath(m.jsonPath), m.values);
     }
     case "header_json": {
-      return jsonFieldMatch(headerGet(req, m.name), headerPresent(req, m.name), splitJSONPath(m.jsonPath), m.values);
+      // OR across ALL header values (mirrors Go's kindHeaderJSON: it iterates
+      // c.req.Header.Values(name)). A client can split a header across lines with a
+      // benign first line to hide a malicious JSON value on a later line from a
+      // deny/respond/pass gate (the header_json twin of the cookie_json evasion the Go
+      // server closed); checking only headerGet's first value re-opened it at the edge.
+      const segs = splitJSONPath(m.jsonPath);
+      return headerValues(req, m.name).some((raw) => jsonFieldMatch(raw, true, segs, m.values));
     }
     case "set_cookie": {
       if (!ctx.respHeader) return false;
@@ -696,6 +724,28 @@ function scopeMatches(ir, scope, ctx) {
     if (matchOne(ir, m, ctx)) return true;
   }
   return false;
+}
+
+// cacheCredentialedMatches mirrors Go's Pipeline.cacheCredentialedMatches (D101): an OR over
+// the projected `cache_credentialed` scopes. When true, caching is ORIGIN-AUTHORITATIVE for
+// the request — the worker skips the credential bypass (caches under the SHARED key, forwards
+// the original cookies to origin) and evalResponse applies the in-scope store precedence.
+// Empty (no directive) ⇒ false (zero cost). Used by evalResponse (the precedence) and by
+// entry.js (the bypass/forward decision via cacheCredentialedMatchesReq).
+function cacheCredentialedMatches(ir, ctx) {
+  for (const sc of ir.cacheCredentialed || []) {
+    if (scopeMatches(ir, sc, ctx)) return true;
+  }
+  return false;
+}
+
+// cacheCredentialedMatchesReq is the request-only entrypoint the worker (entry.js) uses to
+// decide whether to skip the credential bypass + forward original cookies. It builds the
+// request-phase context the same way the Go server's CacheCredentialedMatches does.
+export function cacheCredentialedMatchesReq(ir, req) {
+  if (!ir.cacheCredentialed || ir.cacheCredentialed.length === 0) return false;
+  const ctx = { req, upstream: resolveUpstream(ir, req), respHeader: null };
+  return cacheCredentialedMatches(ir, ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -822,6 +872,24 @@ function classifyDevice(ir, req) {
 
 const utf8 = new TextEncoder();
 
+// utf8ByteCompare orders two strings by their UTF-8 byte sequences — the SAME order Go's
+// sort.Strings uses (Go compares strings byte-wise over their UTF-8 encoding). JS's default
+// Array.sort orders by UTF-16 code UNIT, which DIVERGES for supplementary-plane (astral)
+// characters: a surrogate (0xD800–0xDFFF) sorts before a BMP char like U+E000 under UTF-16,
+// but its UTF-8 bytes (0xF0…) sort AFTER U+E000's (0xEE…) — so the same request would canonicalize
+// its query to a DIFFERENT cache key on Go vs JS (collision/fragmentation, R22). Encoding both
+// and comparing byte-by-byte keeps the edge query canonicalization byte-identical to the server.
+function utf8ByteCompare(a, b) {
+  if (a === b) return 0;
+  const ba = utf8.encode(a);
+  const bb = utf8.encode(b);
+  const n = ba.length < bb.length ? ba.length : bb.length;
+  for (let i = 0; i < n; i++) {
+    if (ba[i] !== bb[i]) return ba[i] - bb[i];
+  }
+  return ba.length - bb.length;
+}
+
 // goQueryEscape mirrors Go's url.QueryEscape (encodeQueryComponent): unreserved
 // bytes [A-Za-z0-9-_.~] pass through, space becomes '+', everything else is %XX
 // (upper-case hex), byte-wise over the UTF-8 encoding.
@@ -848,21 +916,24 @@ function goQueryEscape(s) {
 }
 
 // canonicalQuery renders the query with keys+values sorted, each escaped, exactly
-// like the Go {query}/{url}/{query_allow} tokens. allow (an array of name
-// patterns) keeps only matching params; a null allow keeps every param. prefix
-// emits a leading '?' iff at least one pair is written.
-function canonicalQuery(req, prefix, allow) {
+// like the Go {query}/{url}/{query_allow}/{query_strip} tokens. allow (an array of
+// name patterns) keeps only matching params; deny (an array of name patterns) drops
+// every matching param; a null allow & deny keeps every param. allow and deny are
+// mutually exclusive (compile rejects both), so at most one is set. prefix emits a
+// leading '?' iff at least one pair is written.
+function canonicalQuery(req, prefix, allow, deny) {
   if (req.query.size === 0) return "";
   const keys = [];
   for (const k of req.query.keys()) {
     if (allow && !nameGlobMatch(allow, k)) continue;
+    if (deny && nameGlobMatch(deny, k)) continue;
     keys.push(k);
   }
-  keys.sort();
+  keys.sort(utf8ByteCompare); // UTF-8 byte order, matching Go's sort.Strings (R22)
   let out = "";
   let first = true;
   for (const k of keys) {
-    const vals = (req.query.get(k) || []).slice().sort();
+    const vals = (req.query.get(k) || []).slice().sort(utf8ByteCompare);
     const ek = goQueryEscape(k);
     for (const v of vals) {
       if (first && prefix) out += "?";
@@ -897,6 +968,20 @@ function selectKeyTokens(ir, ctx) {
   return (ir.key && ir.key.tokens) || [];
 }
 
+// resolvedKeyTokens returns the cache-key recipe SELECTED for ctx.req: the selection
+// captured by evalRequest (computed on the PRE-derives_from-strip request) when present,
+// else a fresh selectKeyTokens for callers that run before/without evalRequest. Reusing the
+// captured selection is the Finding 1 (round-3) safety fix and mirrors Go's resolvedKeyTokens:
+// the cache key, the cookie-coverage check, and the Vary check all reference the recipe that
+// BUILT the key, so a derives_from cookie stripped AFTER evalRequest can never flip the
+// selection to a different recipe than the one that built the stored key (a cross-user /
+// cross-variant leak). The returned tokens may be empty; callers apply the DEFAULT_KEY_TOKENS
+// fallback exactly as for a fresh selectKeyTokens result.
+function resolvedKeyTokens(ir, ctx) {
+  if (ctx.req && ctx.req._selKey !== undefined) return ctx.req._selKey;
+  return selectKeyTokens(ir, ctx);
+}
+
 // keyHeaderNamesForTokens returns the lower-cased request header names a token list keys on
 // (only `header:NAME` tokens). Mirrors Go's keyHeaderNamesForTokens. Used to judge Vary
 // coverage against the SELECTED recipe — not the global union of every recipe's headers.
@@ -908,24 +993,42 @@ function keyHeaderNamesForTokens(tokens) {
   return names;
 }
 
-// keyCoversAllCookies reports whether a token list isolates EVERY cookie name a request
+// keyCoversAllCookies reports whether a token list isolates EVERY cookie a request
 // carries: either a whole-`header:Cookie` token, or a `cookie:NAME` token for each name.
 // Mirrors Go's keyCoversAllCookies — the name-aware coverage that the credential bypass uses.
-function keyCoversAllCookies(tokens, cookieNames) {
+// `cookies` is the parsed request cookies ([{name, value}] in header order, ALL occurrences)
+// so the same-value duplicate rule below sees every occurrence's value. forwardCovered (a
+// Set) names cookies a `derives_from … forward` axis SELECTED for this request keys via
+// {TOKEN}; such a cookie is covered HERE even with no raw cookie:NAME token.
+//
+// Duplicate occurrences (fail-closed except the one proven-safe case, matching Go):
+//   - RAW cookie:NAME-keyed, sent >1 → NOT covered (the token keys the FIRST value while the
+//     origin sees all → genuine collision risk).
+//   - FORWARD-covered ONLY, sent >1 → covered IFF every occurrence is byte-identical (the
+//     key is a DERIVED axis, occurrence-independent, and the origin sees N identical values
+//     → no divergence). Differing occurrences → ambiguous → bypass.
+//   - BOTH raw-keyed AND forward-covered, sent >1 → raw-keyed rule WINS → bypass.
+function keyCoversAllCookies(tokens, cookies, forwardCovered) {
   const keyed = new Set();
   for (const t of tokens || []) {
     if (t.kind === "header" && String(t.arg).toLowerCase() === "cookie") return true;
     if (t.kind === "cookie") keyed.add(t.arg);
   }
-  if (!cookieNames || cookieNames.length === 0) return false;
-  // A cookie:NAME token keys on the FIRST occurrence's value while the origin sees all
-  // of them, so a keyed cookie sent more than once is NOT safely covered (mirrors the Go
-  // keyCoversAllCookies). Require every cookie keyed AND sent exactly once.
-  const counts = new Map();
-  for (const n of cookieNames) counts.set(n, (counts.get(n) || 0) + 1);
-  for (const [n, c] of counts) {
-    if (!keyed.has(n)) return false;
-    if (c > 1) return false;
+  if (!cookies || cookies.length === 0) return false;
+  // Group all occurrence VALUES per name (header order), so the same-value duplicate test
+  // below compares every occurrence — not just the first.
+  const values = new Map();
+  for (const c of cookies) {
+    if (!values.has(c.name)) values.set(c.name, []);
+    values.get(c.name).push(c.value);
+  }
+  for (const [n, vals] of values) {
+    const isKeyed = keyed.has(n);
+    if (!isKeyed && !(forwardCovered && forwardCovered.has(n))) return false;
+    if (vals.length <= 1) continue; // single occurrence → covered
+    if (isKeyed) return false; // raw value enters the key (first occ only) → bypass
+    // Forward-covered only: safe iff every occurrence is byte-identical.
+    if (!vals.every((v) => v === vals[0])) return false;
   }
   return true;
 }
@@ -933,21 +1036,107 @@ function keyCoversAllCookies(tokens, cookieNames) {
 // selectedKeyCoversAllCookies reports whether the recipe SELECTED for this request keys every
 // cookie the request carries. Used by the edge worker's credential decision under cookie_allow:
 // an allow-listed-but-unkeyed cookie must still bypass the shared edge cache (a kept cookie is
-// only safe to cache if the key isolates it — mirrors the server's BypassForCredentials).
+// only safe to cache if the key isolates it — mirrors the server's BypassForCredentials). A
+// `derives_from … forward` cookie keyed via {TOKEN} (under the same recipe gate) counts as
+// covered, so forward traffic caches while any OTHER kept-but-unkeyed cookie still bypasses.
 export function selectedKeyCoversAllCookies(ir, req) {
   const ctx = { req, upstream: resolveUpstream(ir, req), respHeader: null };
-  let tokens = selectKeyTokens(ir, ctx);
+  // resolvedKeyTokens reuses the recipe evalRequest captured (Finding 1) — NOT a fresh
+  // re-selection on the now-derives_from-stripped request, which could pick a different
+  // recipe than the stored key's and validate coverage against the wrong key (a leak).
+  let tokens = resolvedKeyTokens(ir, ctx);
   if (!tokens || tokens.length === 0) tokens = DEFAULT_KEY_TOKENS;
-  const names = parseCookies(req).map((c) => c.name);
-  return keyCoversAllCookies(tokens, names);
+  const cookies = parseCookies(req); // [{name, value}] — ALL occurrences, for the dup rule
+  const fwd = selectedDerivedForwardCookies(ir, req);
+  return keyCoversAllCookies(tokens, cookies, fwd.length ? new Set(fwd) : null);
 }
 
 function buildKey(ir, req, ctx) {
-  let tokens = selectKeyTokens(ir, ctx);
-  if (!tokens || tokens.length === 0) tokens = DEFAULT_KEY_TOKENS;
+  const selected = selectKeyTokens(ir, ctx);
+  // Capture the SELECTED recipe on the request (Finding 1): the authoritative selection,
+  // computed on the PRE-derives_from-strip request, that the later credential-coverage and
+  // Vary gates reuse via resolvedKeyTokens — so they judge the recipe that BUILT the key,
+  // never a fresh re-selection on the post-strip request. Mirrors Go's Request.selKey.
+  if (req) req._selKey = selected;
+  const tokens = selected && selected.length ? selected : DEFAULT_KEY_TOKENS;
   const parts = [];
   for (const t of tokens) parts.push(renderToken(ir, t, req, ctx));
   return parts.join(KEY_SEP);
+}
+
+// selectedDerivedStripCookies returns the sorted request cookies the ACTIVE
+// `derives_from` axes consume for this request — the cookies declared by every classify
+// {TOKEN} present in the SELECTED cache_key recipe. These are read to derive + key, then
+// stripped from the request before the credential bypass + origin fetch (Varnish's
+// `unset req.http.Cookie`). A faithful port of pipeline.SelectedDerivedStripCookies, so
+// Go and JS strip the identical set. Empty when no derives_from token is in the recipe.
+export function selectedDerivedStripCookies(ir, req) {
+  if (!ir.classifiers) return [];
+  const ctx = { req, upstream: resolveUpstream(ir, req), respHeader: null };
+  // Finding 1: reuse the recipe evalRequest captured (resolvedKeyTokens), NOT a fresh
+  // selectKeyTokens on the (possibly already derives_from-stripped) request — a fresh
+  // re-selection could pick a DIFFERENT recipe than the one that built the key, so the
+  // strip set would be computed against the wrong recipe. Mirrors Go's
+  // SelectedDerivedStripCookies, which uses resolvedKeyTokens (pipeline.go ~417). Before
+  // evalRequest (_selKey undefined) this falls back to selectKeyTokens, identical.
+  let tokens = resolvedKeyTokens(ir, ctx);
+  if (!tokens || tokens.length === 0) tokens = DEFAULT_KEY_TOKENS;
+  const seen = new Set();
+  const out = [];
+  for (const t of tokens) {
+    if (t.kind !== "classify") continue;
+    const cl = ir.classifiers[t.ref];
+    if (!cl || !cl.derivesFrom) continue;
+    const fwd = new Set(cl.derivesForward || []);
+    for (const c of cl.derivesFrom) {
+      // A `forward` (alias `keep`) cookie is NOT stripped — it is forwarded to origin and
+      // covered by {TOKEN}. Only strip-mode cookies leave here (mirrors Go).
+      if (fwd.has(c)) continue;
+      if (!seen.has(c)) {
+        seen.add(c);
+        out.push(c);
+      }
+    }
+  }
+  out.sort();
+  return out;
+}
+
+// selectedDerivedForwardCookies returns the sorted request cookies the ACTIVE
+// `derives_from … forward` axes FORWARD to origin for this request — the forward-mode
+// cookies declared by every classify {TOKEN} present in the SELECTED cache_key recipe.
+// These are read to derive + key but, unlike strip-mode cookies, are KEPT in the request
+// (forwarded to origin) and treated as COVERED by {TOKEN} in the credential bypass. A
+// faithful port of pipeline.SelectedDerivedForwardCookies. Empty when no forward axis is in
+// the selected recipe — so a forward cookie whose axis is NOT selected is never covered.
+export function selectedDerivedForwardCookies(ir, req) {
+  if (!ir.classifiers) return [];
+  const ctx = { req, upstream: resolveUpstream(ir, req), respHeader: null };
+  // Finding 1 (SAFETY): use the recipe evalRequest captured (resolvedKeyTokens), NOT a
+  // fresh selectKeyTokens. The credential gate (selectedKeyCoversAllCookies) calls this
+  // on the POST-strip request; a fresh re-selection there could pick a DIFFERENT recipe
+  // than the one that BUILT the key, marking a forward cookie "covered" under the wrong
+  // recipe and letting the edge cache an F-personalized origin body under a key lacking
+  // F's axis (cross-user leak). resolvedKeyTokens reuses the EvalRequest-captured _selKey
+  // so JS matches Go's SelectedDerivedForwardCookies (pipeline.go:458). Pre-evalRequest
+  // (_selKey undefined) it falls back to selectKeyTokens, identical.
+  let tokens = resolvedKeyTokens(ir, ctx);
+  if (!tokens || tokens.length === 0) tokens = DEFAULT_KEY_TOKENS;
+  const seen = new Set();
+  const out = [];
+  for (const t of tokens) {
+    if (t.kind !== "classify") continue;
+    const cl = ir.classifiers[t.ref];
+    if (!cl || !cl.derivesForward) continue;
+    for (const c of cl.derivesForward) {
+      if (!seen.has(c)) {
+        seen.add(c);
+        out.push(c);
+      }
+    }
+  }
+  out.sort();
+  return out;
 }
 
 // sanitizeKeyValue removes the 0x1f key SEPARATOR byte from a request-derived token
@@ -967,11 +1156,13 @@ function renderToken(ir, t, req, ctx) {
     case "path":
       return sanitizeKeyValue(req.path);
     case "url":
-      return sanitizeKeyValue(req.path) + canonicalQuery(req, true, null);
+      return sanitizeKeyValue(req.path) + canonicalQuery(req, true, null, null);
     case "query":
-      return canonicalQuery(req, false, null);
+      return canonicalQuery(req, false, null, null);
     case "query_allow":
-      return canonicalQuery(req, false, t.allow || []);
+      return canonicalQuery(req, false, t.allow || [], null);
+    case "query_strip":
+      return canonicalQuery(req, false, null, t.deny || []);
     case "header":
       return sanitizeKeyValue(headerCombined(req, t.arg));
     case "cookie":
@@ -1142,10 +1333,68 @@ export function cacheKeyHeaderValue(rawKey, raw) {
 // Template expansion (port of template.go expandTemplate).
 // ---------------------------------------------------------------------------
 
+// BASE_SUFFIXES is the JS half of cadish's small built-in public-suffix table — it
+// MUST stay byte-for-byte in sync with pipeline/hostparts.go baseSuffixes so the
+// {host.base}/{host.sub} tokens render IDENTICALLY on the Go server and at the edge
+// (cross-runtime conformance). It lists MULTI-label public suffixes only; a single
+// unlisted final label is treated as a one-label suffix (the PSL default rule).
+const BASE_SUFFIXES = new Set([
+  // ICANN multi-label ccTLD suffixes (common).
+  "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "net.uk", "sch.uk",
+  "com.au", "net.au", "org.au", "edu.au", "gov.au",
+  "com.br", "net.br", "org.br",
+  "com.mx", "org.mx",
+  "com.cn", "net.cn", "org.cn",
+  "co.jp", "ne.jp", "or.jp",
+  "co.nz", "net.nz", "org.nz",
+  "co.za", "org.za",
+  "co.in", "co.kr", "com.tr", "com.sg", "com.hk", "com.tw",
+  // Private / whitelabel suffixes (PSL "PRIVATE DOMAINS" idiom).
+  "tech555.io",
+]);
+
+const MAX_SUFFIX_LABELS = 4;
+
+// hostParts splits a host into its registrable base domain and leading subdomain
+// label(s), public-suffix aware. A line-for-line port of pipeline/hostparts.go
+// hostParts — keep the two in lockstep.
+function hostParts(host) {
+  let h = host || "";
+  const ci = h.indexOf(":");
+  if (ci >= 0) h = h.slice(0, ci); // strip :port defensively
+  if (h.endsWith(".")) h = h.slice(0, -1); // strip a trailing root dot
+  h = h.toLowerCase();
+  if (h === "") return ["", ""];
+  const labels = h.split(".");
+  const n = labels.length;
+  if (n <= 1) return [h, ""];
+  let suffixLabels = 1;
+  const maxK = n > MAX_SUFFIX_LABELS ? MAX_SUFFIX_LABELS : n;
+  for (let k = maxK; k >= 2; k--) {
+    if (BASE_SUFFIXES.has(labels.slice(n - k).join("."))) {
+      suffixLabels = k;
+      break;
+    }
+  }
+  const baseStart = n - suffixLabels - 1;
+  if (baseStart < 0) return [h, ""];
+  const base = labels.slice(baseStart).join(".");
+  const sub = baseStart > 0 ? labels.slice(0, baseStart).join(".") : "";
+  return [base, sub];
+}
+
 function templateNamed(env, name, classifyFn) {
   switch (name) {
     case "host":
       return [env.host, true];
+    case "host.base":
+      // Registrable base domain of {host} (es.nudity.tv -> nudity.tv). env.host is the
+      // VALIDATED redirect host on the redirect path (open-redirect parity, F12).
+      return [hostParts(env.host)[0], true];
+    case "host.sub":
+      // Leading subdomain label(s) below the registrable domain (es/www/pt), empty for
+      // a bare base host.
+      return [hostParts(env.host)[1], true];
     case "path":
       return [env.path, true];
     case "query":
@@ -1160,6 +1409,13 @@ function templateNamed(env, name, classifyFn) {
       return [env.geoContinent || "", true];
     case "geo.region":
       return [env.geoRegion || "", true];
+    case "proto":
+    case "scheme":
+      // {proto}/{scheme}: "https" when the original request reached the edge over
+      // TLS, else "http" (mirrors Go template.go). The header, cache_key AND redirect
+      // envs all populate env.scheme from req.scheme, so this reflects TLS on every
+      // path; it falls back to "http" only when scheme is genuinely unset.
+      return [env.scheme === "https" ? "https" : "http", true];
   }
   if (name.startsWith("http.") && name.length > 5) {
     if (!env.header) return ["", true];
@@ -1244,6 +1500,7 @@ function headerTemplateEnv(ctx) {
     geo: ctx.req.geo,
     geoContinent: ctx.req.geoContinent,
     geoRegion: ctx.req.geoRegion,
+    scheme: ctx.req.scheme,
     capture: null,
   };
 }
@@ -1374,25 +1631,49 @@ function redirectHost(ir, req) {
 
 function evalRedirect(ir, r, ctx) {
   const req = ctx.req;
+  // Populate the request-scoped derived-token sources ({http.NAME}/{client_ip}/{geo*})
+  // so they resolve in the Location, matching the Go server (redirect.go eval). CRITICAL:
+  // host stays redirectHost(ir, req) — the VALIDATED redirect host — NOT normalizeHost,
+  // so an attacker Host cannot be reflected (open-redirect defense, F12 parity).
   const env = {
     host: redirectHost(ir, req),
     path: req.path,
     query: canonicalQuery(req, false, null),
     capture: null,
-    header: null,
-    clientIP: "",
+    header: req.header,
+    clientIP: req.clientIP,
+    geo: req.geo,
+    geoContinent: req.geoContinent,
+    geoRegion: req.geoRegion,
+    // scheme backs {proto}/{scheme} in the redirect Location, mirroring the Go server
+    // (redirectRule.eval populates TemplateEnv.Scheme from req.TLS). Without it a
+    // `redirect … {proto}://…` over TLS would wrongly emit "http" — a Go↔edge divergence.
+    scheme: req.scheme,
   };
+  // Scope and regex are ANDed: the combined scope+regex form (both present) fires
+  // only when the scope matches AND the regex matches the path; the scope-only and
+  // regex-only forms degenerate to a single condition. Mirrors redirectRule.eval.
+  if (r.scope && !scopeMatches(ir, r.scope, ctx)) return null;
   if (r.regex) {
     const m = compiledRegExp(r.regex, r.regexFlags).exec(req.path);
     if (!m) return null;
     env.capture = m;
-  } else if (!scopeMatches(ir, r.scope, ctx)) {
-    return null;
   }
-  return { status: r.status, location: expandTemplate(r.target, env, null) };
+  // Live classify resolver (same as the header/cache_key path) so {classify.NAME}
+  // resolves in the Location instead of expanding empty.
+  const classifyFn = (name) => {
+    if (!ir.classifiers || !ir.classifiers[name]) return ["", false];
+    return [classifyResolve(ir, name, ctx), true];
+  };
+  return { status: r.status, location: expandTemplate(r.target, env, classifyFn) };
 }
 
 function selectorMatches(rule, status, ir, ctx) {
+  // An optional RESPONSE-phase `resp_header NAME VALUE` term is ANDed in front of the
+  // kind selector (mirrors Go's selector.matches): the rule applies only when the origin
+  // response carries the named header value AND the selector matches. Absent for every
+  // non-resp_header rule.
+  if (rule.respHeader && !matchOne(ir, rule.respHeader, ctx)) return false;
   switch (rule.selKind) {
     case "status_in":
       return (rule.codes || []).includes(status);
@@ -1510,10 +1791,45 @@ function stripCookiesMatches(ir, ctx) {
   return false;
 }
 
+// resolveWindowNs mirrors the Go server's resolveGraceMaxStale for ONE window: it
+// returns the literal duration (ns) unless the rule names an origin response header
+// whose value parses (same parseHeaderTTL convention as the header TTL — seconds-as-int,
+// non-positive rejection, one-year clamp), in which case the header value wins. An
+// absent/unparseable header falls back to the literal (it does NOT make the rule fall
+// through, unlike the header TTL).
+function resolveWindowNs(literal, headerName, respHeader) {
+  let ns = parseGoDuration(literal);
+  if (headerName) {
+    const hv = respHeaderValues(respHeader, headerName);
+    const hns = parseHeaderTTL(hv.length ? hv[0] : "");
+    if (hns > 0) ns = hns;
+  }
+  return ns;
+}
+
+// setGraceMaxStale writes dec.graceNs / dec.maxStaleNs for a matched TTL rule, resolving
+// each window from its literal or its configured origin response header, then enforcing
+// the max_stale >= grace invariant against the RESOLVED values (an effective max_stale
+// below the effective grace is IGNORED — grace already serves that span). Mirrors the Go
+// server's resolveGraceMaxStale so Go and JS decide identically (conformance).
+function setGraceMaxStale(dec, r, respHeader) {
+  const graceNs = resolveWindowNs(r.grace, r.graceFromHeader, respHeader);
+  let maxStaleNs = resolveWindowNs(r.maxStale, r.maxStaleFromHeader, respHeader);
+  if (maxStaleNs > 0 && maxStaleNs < graceNs) maxStaleNs = 0;
+  dec.graceNs = graceNs;
+  dec.maxStaleNs = maxStaleNs;
+}
+
 export function evalResponse(ir, req, status, respHeader) {
   const upstream = resolveUpstream(ir, req);
   const ctx = { req, upstream, respHeader: respHeader || null };
   const dec = { ttlNs: 0, graceNs: 0, maxStaleNs: 0, hitForMissNs: 0, storeTier: "", cacheable: false };
+  // perResponseSignal mirrors Go's EvalResponse: true only when the cache_ttl rule that decided
+  // cacheable derived its TTL from a PER-RESPONSE ORIGIN SIGNAL (a `from_header NAME` the origin
+  // actually SENT). A STATIC operator `ttl N` (default or scoped) is NOT a per-response signal.
+  // It is the SOLE gate that may authorize a cache_credentialed share — a static TTL must never
+  // let a per-user body be stored under the shared key.
+  let perResponseSignal = false;
   for (const r of (ir.response && ir.response.ttl) || []) {
     if (!selectorMatches(r, status, ir, ctx)) continue;
     if (r.isHFM) {
@@ -1533,16 +1849,23 @@ export function evalResponse(ir, req, status, respHeader) {
       const ns = parseHeaderTTL(hv.length ? hv[0] : "");
       if (ns <= 0) continue;
       dec.ttlNs = ns;
-      dec.graceNs = parseGoDuration(r.grace);
-      dec.maxStaleNs = parseGoDuration(r.maxStale);
+      setGraceMaxStale(dec, r, respHeader);
+      // Surface the from_header-family control headers this rule CONSUMES (Finding 6),
+      // so entry.js removes them before store + deliver and the conformance golden
+      // proves Go and JS strip the identical set. omitted when the rule sources nothing.
+      if (r.stripHeaders && r.stripHeaders.length) dec.stripHeaders = r.stripHeaders;
       dec.cacheable = true;
+      // The origin SENT the header — this IS a per-response origin signal (may authorize a
+      // cache_credentialed share), mirroring Go's EvalResponse from_header branch.
+      perResponseSignal = true;
       break;
     }
     dec.ttlNs = parseGoDuration(r.ttl);
-    dec.graceNs = parseGoDuration(r.grace);
-    // max_stale (D60): the stale-on-error window beyond ttl+grace. Carried on the
-    // decision so the entry bounds its salvage path (D70). Zero when unset.
-    dec.maxStaleNs = parseGoDuration(r.maxStale);
+    // grace/max_stale (D60): each either a literal or sourced from an origin response
+    // header (grace_from_header/max_stale_from_header), mirroring the Go server's
+    // resolveGraceMaxStale (literal fallback + resolved max_stale >= grace clamp).
+    setGraceMaxStale(dec, r, respHeader);
+    if (r.stripHeaders && r.stripHeaders.length) dec.stripHeaders = r.stripHeaders;
     dec.cacheable = true;
     break;
   }
@@ -1557,18 +1880,39 @@ export function evalResponse(ir, req, status, respHeader) {
     // dropped before store/deliver (Varnish's `unset beresp.http.Set-Cookie`), so the
     // cached representation carries no cookie. That explicit per-class opt-in is the only
     // way to cache a cookie-stamping origin; without it the Set-Cookie response is refused.
-    const setCookieBlocks = hasSetCookie(respHeader) && !stripCookiesMatches(ir, ctx);
     // Vary coverage is judged against the recipe SELECTED for THIS request, NOT the global
     // union of every recipe's key headers (ir.keyHeaderNames) — mirroring the Go server
     // (keyHeaderNamesForTokens(selectKeyTokens(ctx))). A header keyed only by a DIFFERENT
     // recipe must not be treated as covered here, or the edge would cache a Vary variant the
-    // server refuses and serve it cross-variant/cross-tenant.
-    const keyHeaders = keyHeaderNamesForTokens(selectKeyTokens(ir, ctx));
-    if (varyStar(respHeader) || setCookieBlocks || (!ir.cacheUnsafe && !safelyShareable(respHeader, keyHeaders))) {
-      dec.cacheable = false;
-      dec.ttlNs = 0;
-      dec.graceNs = 0;
-      dec.maxStaleNs = 0;
+    // server refuses and serve it cross-variant/cross-tenant. resolvedKeyTokens reuses the
+    // recipe evalRequest captured (Finding 1), NOT a fresh re-selection on the post-strip
+    // request — so the Vary is judged against the recipe that BUILT this request's key.
+    const keyHeaders = keyHeaderNamesForTokens(resolvedKeyTokens(ir, ctx));
+    // cache_credentialed (D101): in an ORIGIN-AUTHORITATIVE scope caching matches the custom VCL
+    // EXACTLY — a credentialed store requires a PER-RESPONSE ORIGIN CACHE SIGNAL (perResponseSignal:
+    // a `from_header` the origin SENT, or an origin max-age/s-maxage), fail-closed, and it does NOT
+    // consult cache_unsafe (Guard B). The positive signal force-overrides and STRIPS Set-Cookie +
+    // the weak Cache-Control/Pragma/Expires (applied by the worker's store+deliver path, mirroring
+    // the server's Set-Cookie/Pragma delete + setSharedFreshness). We do NOT refuse on Set-Cookie or
+    // an uncovered/`*` Vary (the signal is the operator's explicit "this is shared, drop the cookie"
+    // opt-in). A STATIC operator `ttl N` (default or scoped) makes dec.cacheable true but is NOT a
+    // per-response signal: it FALLS THROUGH to the normal shareability refusal — never authorizing a
+    // credentialed share — so a per-user response (Set-Cookie, no X-Cache-Ttl) under a co-existing
+    // `cache_ttl default ttl 60s` is refused, not leaked cross-user (mirrors Go's EvalResponse).
+    if (perResponseSignal && cacheCredentialedMatches(ir, ctx)) {
+      // dec.cacheable stays true; the worker strips Set-Cookie + weak headers on store+deliver.
+      // credentialedStore is surfaced on the decision so the Go==JS conformance golden distinguishes
+      // a per-response-signal credentialed share (true) from a static-TTL-only refusal (cacheable
+      // flips false in the else branch). Mirrors the Go ResponseDecision.CredentialedStore field.
+      dec.credentialedStore = true;
+    } else {
+      const setCookieBlocks = hasSetCookie(respHeader) && !stripCookiesMatches(ir, ctx);
+      if (varyStar(respHeader) || setCookieBlocks || (!ir.cacheUnsafe && !safelyShareable(respHeader, keyHeaders))) {
+        dec.cacheable = false;
+        dec.ttlNs = 0;
+        dec.graceNs = 0;
+        dec.maxStaleNs = 0;
+      }
     }
   }
   for (const r of (ir.response && ir.response.storage) || []) {
@@ -1810,6 +2154,32 @@ export function parseGoDuration(s) {
 // Convenience: the full neutral decision used by the conformance suite.
 // ---------------------------------------------------------------------------
 
+// withStrippedCookies returns a shallow copy of req whose Cookie header has the named
+// cookies removed — the post-derive→strip request the credential/forward gate runs on. The
+// copy carries req._selKey (the recipe captured PRE-strip), so resolvedKeyTokens still
+// resolves to the recipe that BUILT the key (NOT a fresh re-selection on the stripped
+// request). Mirrors the server's StripDerivedCookies seam for the conformance probe.
+function withStrippedCookies(req, names) {
+  const header = new Map();
+  for (const [k, v] of req.header) header.set(k, v.slice());
+  const ck = canonicalHeaderKey("Cookie");
+  const raw = header.has(ck) ? header.get(ck)[0] || "" : "";
+  if (raw) {
+    const drop = new Set(names);
+    const kept = [];
+    for (let part of raw.split(";")) {
+      part = part.trim();
+      if (part === "") continue;
+      const eq = part.indexOf("=");
+      const n = eq < 0 ? part : part.slice(0, eq).trim();
+      if (!drop.has(n)) kept.push(part);
+    }
+    if (kept.length) header.set(ck, [kept.join("; ")]);
+    else header.delete(ck);
+  }
+  return { ...req, header };
+}
+
 // decide runs all three phases over a plain input and returns the runtime-neutral
 // decision the conformance suite compares against the Go reference. input:
 //   { method, host, path, query, header, clientIP, device, geo, geoContinent,
@@ -1824,6 +2194,33 @@ export function decide(ir, input) {
   const respHeader = origin.header || null;
   const cacheStatus = input.cacheStatus || "MISS";
   const request = evalRequest(ir, req);
+  // COOKIE-NORM derive→strip probe: surface the cookies the active derives_from axes
+  // consume for this request (stripped post-key, pre-credential/origin). Present only
+  // when non-empty so the golden matches Go's omitempty SelectedDerivedStripCookies.
+  const derivedStrip = selectedDerivedStripCookies(ir, req);
+  if (derivedStrip.length) request.derivedStrip = derivedStrip;
+  // COOKIE-NORM forward probe: the cookies the active forward axes FORWARD to origin (kept,
+  // covered by {TOKEN}). Present only when non-empty so the golden matches Go's omitempty
+  // SelectedDerivedForwardCookies — proving Go and JS partition strip vs forward identically.
+  const derivedForward = selectedDerivedForwardCookies(ir, req);
+  if (derivedForward.length) request.derivedForward = derivedForward;
+  // Finding-2 SEAM probe: reproduce the derive→strip seam the credential/forward gate runs
+  // on. evalRequest captured the SELECTED recipe (req._selKey) on the PRE-strip request and
+  // built the key; the worker (handle()) then STRIPS the active derives_from cookies and the
+  // gate recomputes the strip/forward partition — which MUST still reference req._selKey
+  // (resolvedKeyTokens), not re-select on the now-stripped request. Recompute on a copy of the
+  // request with the strip cookies removed (selKey preserved) so the golden FLIPS if the gate
+  // ever regresses to a fresh selectKeyTokens: with the strip cookie gone, a fresh re-selection
+  // on a scoped config lands on a DIFFERENT recipe and the partition diverges. Without this the
+  // fixture is byte-identical for the correct and buggy code and proves nothing. Mirrors the Go
+  // reference's StripDerivedCookies→Selected* recompute; omitempty matches its omitted fields.
+  if (derivedStrip.length) {
+    const sreq = withStrippedCookies(req, derivedStrip);
+    const stripPost = selectedDerivedStripCookies(ir, sreq);
+    const fwdPost = selectedDerivedForwardCookies(ir, sreq);
+    if (stripPost.length) request.derivedStripPostStrip = stripPost;
+    if (fwdPost.length) request.derivedForwardPostStrip = fwdPost;
+  }
   const deliver = evalDeliver(ir, req, respHeader, cacheStatus);
   // Materialize the `header +cache_key` emitted value from the cache key the
   // request phase built (the key is server/request-held, not in the deliver match

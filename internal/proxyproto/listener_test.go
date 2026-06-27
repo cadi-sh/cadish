@@ -57,9 +57,22 @@ func driveOne(t *testing.T, ln *Listener, peerAddr net.Addr, wire []byte) (net.C
 	var rejected error
 	ln.onReject = func(e error) { rejected = e }
 	conn, err := ln.Accept()
-	// After a rejection the single-shot inner listener has no next connection, so
-	// Accept surfaces its "closed" error; prefer the recorded rejection reason.
-	if err != nil && rejected != nil {
+	// The PROXY header is now read LAZILY (R34): Accept returns a trusted conn without
+	// reading the header. Trigger the deferred read here (via RemoteAddr) so the header
+	// is validated exactly as a server touching the connection would — this consumes the
+	// client's write (so wg.Wait below does not deadlock on the net.Pipe) and surfaces any
+	// REQUIRE-policy rejection (missing/malformed header) through onReject. onReject runs
+	// synchronously on THIS goroutine (handshake is inline in RemoteAddr), so reading
+	// `rejected` is race-free.
+	if err == nil && conn != nil {
+		_ = conn.RemoteAddr()
+	}
+	// A rejection (untrusted peer at Accept, or a missing/malformed header surfaced by the
+	// triggered handshake) is reported via onReject; prefer it as the error.
+	if rejected != nil {
+		if err == nil && conn != nil {
+			_ = conn.Close()
+		}
 		err = rejected
 	}
 	wg.Wait()
@@ -67,6 +80,9 @@ func driveOne(t *testing.T, ln *Listener, peerAddr net.Addr, wire []byte) (net.C
 		t.Cleanup(func() { _ = conn.Close() })
 	}
 	t.Cleanup(func() { _ = clientSide.Close() })
+	if err != nil {
+		return nil, err
+	}
 	return conn, err
 }
 
@@ -160,6 +176,74 @@ func TestListenerLocalFallsBackToPeer(t *testing.T) {
 	}
 	if got := conn.RemoteAddr().String(); got != "10.1.2.3:55000" {
 		t.Fatalf("RemoteAddr = %q, want the socket peer 10.1.2.3:55000 for LOCAL", got)
+	}
+}
+
+// chanListener yields the connections queued on its channel, then blocks until Close.
+type chanListener struct {
+	conns  chan net.Conn
+	closed chan struct{}
+}
+
+func (l *chanListener) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.conns:
+		return c, nil
+	case <-l.closed:
+		return nil, errors.New("closed")
+	}
+}
+func (l *chanListener) Close() error   { close(l.closed); return nil }
+func (l *chanListener) Addr() net.Addr { return tcpAddrStatic }
+
+// TestListenerSlowPeerDoesNotBlockAccept is the R34 pin: a trusted peer that has NOT yet
+// sent its PROXY header must not block the single accept loop from returning OTHER
+// connections. We queue several trusted peers whose header bytes never arrive and a
+// generous readTimeout; with the old synchronous handshake the first Accept would block
+// for the whole readTimeout before returning, starving the rest. With the lazy handshake
+// every Accept returns promptly (the header read is deferred to first use).
+func TestListenerSlowPeerDoesNotBlockAccept(t *testing.T) {
+	inner := &chanListener{conns: make(chan net.Conn, 8), closed: make(chan struct{})}
+	ln, err := NewListener(inner, Config{
+		Trust:       mustPrefixes(t, "10.0.0.0/8"),
+		ReadTimeout: 30 * time.Second, // huge: the old code would block this long per peer
+	})
+	if err != nil {
+		t.Fatalf("NewListener: %v", err)
+	}
+
+	const n = 5
+	var partners []net.Conn
+	for i := 0; i < n; i++ {
+		clientSide, serverSide := net.Pipe() // clientSide never writes → header never arrives
+		partners = append(partners, clientSide)
+		inner.conns <- &fakeConn{Conn: serverSide, remote: tcpAddr(t, "10.1.2.3:55000")}
+	}
+	t.Cleanup(func() {
+		for _, p := range partners {
+			_ = p.Close()
+		}
+		_ = ln.Close()
+	})
+
+	// Every Accept must return well within the readTimeout (the slow headers are deferred).
+	for i := 0; i < n; i++ {
+		type res struct {
+			c net.Conn
+			e error
+		}
+		ch := make(chan res, 1)
+		go func() { c, e := ln.Accept(); ch <- res{c, e} }()
+		select {
+		case r := <-ch:
+			if r.e != nil {
+				t.Fatalf("Accept %d returned error: %v", i, r.e)
+			}
+			conn := r.c
+			t.Cleanup(func() { _ = conn.Close() })
+		case <-time.After(3 * time.Second):
+			t.Fatalf("Accept %d blocked: a slow-header trusted peer starved the accept loop", i)
+		}
 	}
 }
 

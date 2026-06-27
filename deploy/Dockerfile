@@ -17,7 +17,10 @@ COPY . .
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG DATE=unknown
-RUN CGO_ENABLED=0 go build -trimpath \
+# -buildvcs=false: the build-args fully stamp version/commit/date, and .dockerignore
+# excludes .git from the context, so VCS stamping is neither possible nor needed
+# (and would otherwise error with "error obtaining VCS status").
+RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false \
       -ldflags "-s -w \
         -X github.com/cadi-sh/cadish/internal/version.Version=${VERSION} \
         -X github.com/cadi-sh/cadish/internal/version.Commit=${COMMIT} \
@@ -37,5 +40,9 @@ COPY --from=build /src/LICENSE /src/NOTICE /usr/share/doc/cadish/
 # (Kubernetes: the chart/manifests set securityContext fsGroup: 65532.) See deploy/README.md.
 VOLUME ["/var/lib/cadish", "/var/cache/cadish"]
 EXPOSE 80 443
+# Run as the distroless nonroot user (uid:gid 65532). The :nonroot base tag already
+# defaults to this; set it explicitly so the guarantee survives a base-image swap
+# and so k8s `runAsNonRoot` validation has an unambiguous numeric uid.
+USER 65532:65532
 ENTRYPOINT ["/usr/bin/cadish"]
 CMD ["run", "-config", "/etc/cadish/Cadishfile"]

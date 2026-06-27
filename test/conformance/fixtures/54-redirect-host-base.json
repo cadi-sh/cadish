@@ -1,0 +1,31 @@
+{
+  "name": "54-redirect-host-base",
+  "cadishfile": "es.nudity.tv, www.amateur.tv, nudity.tv, cam4you.tech555.io {\n    redirect ^/(.*)$ 302 https://www.{host.base}/lang/{host.sub}/$1\n    cache_key host path\n    cache_ttl default ttl 1m\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "es.nudity.tv", "path": "/p" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "www.amateur.tv", "path": "/p" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "nudity.tv", "path": "/p" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "cam4you.tech555.io", "path": "/p" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "evil.attacker.test", "path": "/p" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

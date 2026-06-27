@@ -1,0 +1,11 @@
+{
+  "name": "48-redirect-scope-failclosed",
+  "cadishfile": "example.com {\n    @ungreedy path_regex (?U)^/(foo|bar)\n    redirect @ungreedy 302 https://blocked.example/\n    redirect (?i)^/foo 301 https://new.example/\n    cache_key host path\n    cache_ttl default ttl 1m\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/unrelated" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

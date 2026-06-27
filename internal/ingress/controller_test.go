@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +28,23 @@ import (
 type applierFunc func(*config.Config) error
 
 func (f applierFunc) ApplyConfig(c *config.Config) error { return f(c) }
+
+// warmApplier is an Applier that ALSO implements Warmer, recording ApplyConfig + MarkWarm
+// call counts so a test can assert the warm-readiness gate flips (only) after a successful
+// reconcile. applyErr, when set, makes ApplyConfig fail (a first-reconcile failure must NOT
+// mark warm).
+type warmApplier struct {
+	applyErr error
+	applied  atomic.Int32
+	warmed   atomic.Int32
+}
+
+func (w *warmApplier) ApplyConfig(*config.Config) error {
+	w.applied.Add(1)
+	return w.applyErr
+}
+
+func (w *warmApplier) MarkWarm() { w.warmed.Add(1) }
 
 // hasSiteHost reports whether cfg has a site serving host.
 func hasSiteHost(cfg *config.Config, host string) bool {
@@ -182,6 +200,71 @@ func TestControllerSalvagesBadSite(t *testing.T) {
 	}
 }
 
+// TestControllerMarksWarmAfterFirstReconcile proves the warm-readiness gate flips once the
+// first successful reconcile builds the routing table: the controller calls MarkWarm on the
+// Warmer applier only AFTER ApplyConfig succeeds.
+func TestControllerMarksWarmAfterFirstReconcile(t *testing.T) {
+	ready := true
+	cs := fake.NewSimpleClientset(
+		ingress("prod", "site", "example.com", []pathRule{{path: "/", pathType: prefix, svc: "web", port: 80}}),
+		sliceFor("web", "prod", []epSpec{{ip: "10.0.0.1", ready: &ready}}, portSpec{name: "", num: 80}),
+	)
+	applier := &warmApplier{}
+	ctrl := New(cs, applier, ``, Config{ClassName: "cadish", ResyncDebounce: 10 * time.Millisecond})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = ctrl.Run(ctx) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if applier.warmed.Load() > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("controller never marked warm (applied=%d warmed=%d)", applier.applied.Load(), applier.warmed.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if applier.applied.Load() == 0 {
+		t.Fatal("marked warm without ever applying a config")
+	}
+}
+
+// TestControllerDoesNotMarkWarmOnFailedFirstReconcile is the fail-safe guard: when the very
+// first ApplyConfig fails, the controller keeps the last good config AND must NOT mark warm
+// — the pod stays NOT-ready (503) until a reconcile succeeds.
+func TestControllerDoesNotMarkWarmOnFailedFirstReconcile(t *testing.T) {
+	ready := true
+	cs := fake.NewSimpleClientset(
+		ingress("prod", "site", "example.com", []pathRule{{path: "/", pathType: prefix, svc: "web", port: 80}}),
+		sliceFor("web", "prod", []epSpec{{ip: "10.0.0.1", ready: &ready}}, portSpec{name: "", num: 80}),
+	)
+	applier := &warmApplier{applyErr: errors.New("apply boom")}
+	ctrl := New(cs, applier, ``, Config{ClassName: "cadish", ResyncDebounce: 10 * time.Millisecond})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = ctrl.Run(ctx) }()
+
+	// Wait until the controller has attempted (and failed) at least one ApplyConfig.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if applier.applied.Load() > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("controller never attempted ApplyConfig")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Give the reconcile loop a few more cycles; a failing apply must NEVER mark warm.
+	time.Sleep(200 * time.Millisecond)
+	if w := applier.warmed.Load(); w != 0 {
+		t.Fatalf("controller marked warm %d time(s) despite a failing first reconcile", w)
+	}
+}
+
 // TestClusterEventDedup proves RenderFailed/ApplyFailed cluster Events are delta-deduped:
 // an identical standing failure emits one Event, not one per reconcile.
 func TestClusterEventDedup(t *testing.T) {
@@ -265,6 +348,36 @@ func TestEmitEventRealErrorWarns(t *testing.T) {
 	ctrl.emitEvent("prod", "ing", corev1.EventTypeWarning, "Rejected", "boom")
 	if !strings.Contains(buf.String(), "emit event") {
 		t.Fatalf("a real create error must still WARN, got:\n%s", buf.String())
+	}
+}
+
+// TestEventNamesAreContentAddressed (R39): Event names must be a deterministic function
+// of the event's stable content (kind/ns/name/reason/message), not a per-process counter.
+// Two independent controllers (simulating two replicas) emitting the SAME reject must
+// produce the SAME Event name (so the second Create dedups via AlreadyExists), while a
+// DIFFERENT reject must produce a DIFFERENT name (so no warning is suppressed).
+func TestEventNamesAreContentAddressed(t *testing.T) {
+	emit := func() string {
+		cs := fake.NewSimpleClientset()
+		ctrl := New(cs, applierFunc(func(*config.Config) error { return nil }), "", Config{ClassName: "cadish"})
+		ctrl.emitEvent("prod", "ing", corev1.EventTypeWarning, "Rejected", "duplicate path")
+		evs, _ := cs.CoreV1().Events("prod").List(context.Background(), metav1.ListOptions{})
+		if len(evs.Items) != 1 {
+			t.Fatalf("want exactly one Event, got %d", len(evs.Items))
+		}
+		return evs.Items[0].Name
+	}
+	a, b := emit(), emit()
+	if a != b {
+		t.Fatalf("same reject on two replicas must yield the same Event name: %q != %q", a, b)
+	}
+	// A different reject (different message) must NOT collide on the name.
+	cs := fake.NewSimpleClientset()
+	ctrl := New(cs, applierFunc(func(*config.Config) error { return nil }), "", Config{ClassName: "cadish"})
+	ctrl.emitEvent("prod", "ing", corev1.EventTypeWarning, "Rejected", "a different reason entirely")
+	evs, _ := cs.CoreV1().Events("prod").List(context.Background(), metav1.ListOptions{})
+	if evs.Items[0].Name == a {
+		t.Fatalf("a different reject must produce a different Event name; both were %q", a)
 	}
 }
 

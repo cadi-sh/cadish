@@ -114,6 +114,13 @@ type Tier interface {
 	// returned writer (instead of Close) to discard a partial/failed write.
 	Writer(meta ObjectMeta) (TierWriter, error)
 
+	// Delete removes key from the tier (dropping the in-memory entry and, for the
+	// disk tier, its blob). It is a no-op when the key is absent. Used by the Store
+	// to keep a key in at most ONE tier: when a re-store routes a key to a different
+	// tier than a prior copy, the sibling tier's now-superseded copy is deleted so a
+	// GET can never serve the stale shadow (cross-tier dedup).
+	Delete(key string)
+
 	// Len returns the number of cached objects.
 	Len() int
 
@@ -122,6 +129,12 @@ type Tier interface {
 
 	// Close releases tier resources (flushing disk metadata, etc.).
 	Close() error
+
+	// Reset drops every cached object from the tier (and, for the disk tier, removes
+	// the blob files and persists an emptied index). Used by the reload flush path
+	// (Store.Reset) when a site's cache-key scheme changed, against a store not yet
+	// serving traffic.
+	Reset()
 }
 
 // TierWriter receives a streamed object body. Either Commit or Abort must be
@@ -132,4 +145,11 @@ type TierWriter interface {
 	Commit() error
 	// Abort discards the in-progress write and releases any temp resources.
 	Abort() error
+	// Stored reports whether the most recent Commit ACTUALLY installed the object in
+	// the tier. A nil Commit error does NOT imply storage: a RAM overflow (per-object
+	// cap / global in-flight budget / shard cap) or a disk oversize discard returns nil
+	// without installing anything. Only meaningful after Commit; false before it. The
+	// cross-tier dedup (R14) gates the sibling delete on this so an overflowed re-store
+	// never destroys the only real cached copy.
+	Stored() bool
 }

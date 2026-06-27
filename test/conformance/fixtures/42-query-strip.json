@@ -1,0 +1,26 @@
+{
+  "name": "42-query-strip",
+  "cadishfile": "qs.example.com {\n    cache_key method host path query_strip utm_* a_mute gclid fbclid\n    cache_ttl default ttl 1m\n    header +cache_status X-Cache\n    header +cache_key X-Cache-Key\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "qs.example.com", "path": "/list", "query": { "genre": ["drama"], "age": ["18"], "utm_source": ["a"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "qs.example.com", "path": "/list", "query": { "genre": ["drama"], "age": ["18"], "utm_source": ["b"], "gclid": ["xyz"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "HIT"
+    },
+    {
+      "request": { "method": "GET", "host": "qs.example.com", "path": "/list", "query": { "genre": ["drama"], "age": ["21"], "utm_source": ["a"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "qs.example.com", "path": "/list", "query": { "a_mute": ["1"], "fbclid": ["q"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

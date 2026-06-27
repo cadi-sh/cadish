@@ -827,6 +827,35 @@ func TestTranslateSameNamespaceWildcardSubdomainWorks(t *testing.T) {
 	}
 }
 
+// TestTranslateOlderExactSurvivesYoungerForeignWildcard (Fix 2, security regression):
+// team-a owns the concrete host `app.example.com` via the OLDEST Ingress. team-b then
+// creates a YOUNGER `*.example.com` wildcard in a DIFFERENT namespace. Oldest-wins must
+// hold: team-a's established concrete host MUST NOT be reassigned to (stolen by) team-b's
+// younger wildcard. Otherwise a single hostile wildcard Ingress captures every existing
+// concrete subdomain under example.com owned by other namespaces.
+func TestTranslateOlderExactSurvivesYoungerForeignWildcard(t *testing.T) {
+	t0 := time.Unix(1000, 0) // oldest → team-a owns app.example.com
+	t1 := time.Unix(2000, 0)
+	victim := ingressAt("team-a", "exact", "app.example.com", t0, []pathRule{
+		{path: "/", pathType: prefix, svc: "owner-svc", port: 80},
+	})
+	attacker := ingressAt("team-b", "wild", "*.example.com", t1, []pathRule{
+		{path: "/", pathType: prefix, svc: "evil-svc", port: 80},
+	})
+
+	out, rej := Translate(Inputs{Ingresses: []*networkingv1.Ingress{victim, attacker}, ClassName: "cadish"})
+	mustCompile(t, out)
+
+	for _, r := range rej {
+		if r.Ingress == "team-a/exact" {
+			t.Fatalf("victim's older exact Ingress was rejected by a younger foreign wildcard; rejects=%v\n%s", rej, out)
+		}
+	}
+	if !strings.Contains(out, "k8s://owner-svc.team-a:80") {
+		t.Fatalf("victim's concrete host app.example.com was stolen/dropped by a younger foreign wildcard:\n%s", out)
+	}
+}
+
 func TestCombine(t *testing.T) {
 	got := Combine("cache { ram 64MiB }", "example.com {\n}\n")
 	if !strings.HasPrefix(got, "cache { ram 64MiB }\n") {
@@ -834,5 +863,44 @@ func TestCombine(t *testing.T) {
 	}
 	if !strings.Contains(got, "example.com {") {
 		t.Fatalf("generated sites missing:\n%s", got)
+	}
+}
+
+// TestTranslateRejectsEnvPlaceholderPath (FIX 2) pins the multi-tenant env-exfiltration
+// guard on the Ingress path surface: a tenant path carrying an unescaped "{$VAR}" must be
+// REJECTED, not quoted into a `path` matcher. QuoteArg quotes but does not neutralize
+// "{$", so without the guard such a path would expand against the CONTROLLER POD's
+// environment at config load (config.SubstituteEnv), leaking a secret.
+func TestTranslateRejectsEnvPlaceholderPath(t *testing.T) {
+	ing := ingress("prod", "leak", "example.com", []pathRule{
+		{"/p/{$SECRET}", exact, "web", 80},
+	})
+	out, rej := Translate(Inputs{Ingresses: []*networkingv1.Ingress{ing}, ClassName: "cadish"})
+	if len(rej) != 1 {
+		t.Fatalf("expected exactly 1 reject for the env-placeholder path, got %d: %+v", len(rej), rej)
+	}
+	if !strings.Contains(rej[0].Reason, "environment-variable placeholder") {
+		t.Fatalf("reject reason = %q, want it to mention environment-variable placeholder", rej[0].Reason)
+	}
+	if strings.Contains(out, "{$") || strings.Contains(out, "SECRET") {
+		t.Fatalf("rendered config must not carry the tenant env placeholder:\n%s", out)
+	}
+}
+
+// TestTranslateAllowsBraceNonEnvPath confirms the Ingress guard does NOT over-fire: a path
+// containing a literal "{" not followed by "$" (a regex quantifier "{1,3}") is legitimate
+// and must render, not be rejected.
+func TestTranslateAllowsBraceNonEnvPath(t *testing.T) {
+	ing := ingress("prod", "ok", "example.com", []pathRule{
+		{"/x{1,3}", exact, "web", 80},
+	})
+	out, rej := Translate(Inputs{Ingresses: []*networkingv1.Ingress{ing}, ClassName: "cadish"})
+	for _, r := range rej {
+		if strings.Contains(r.Reason, "environment-variable placeholder") {
+			t.Fatalf("legitimate brace (non-env) path must not be rejected: %+v", r)
+		}
+	}
+	if !strings.Contains(out, "x{1,3}") {
+		t.Fatalf("expected the literal-brace path to render:\n%s", out)
 	}
 }

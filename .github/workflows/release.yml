@@ -50,6 +50,10 @@ jobs:
   # release above.
   docker:
     runs-on: ubuntu-latest
+    # Gate the image push on the goreleaser job, whose `before` hooks run
+    # `go test ./...`. Without this the image would publish even if the test gate
+    # failed (the two jobs are otherwise independent) — i.e. ship an untested image.
+    needs: goreleaser
     permissions:
       contents: read  # checkout only
       packages: write # push the multi-arch image + SBOM/provenance attestations to GHCR
@@ -57,9 +61,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Derive version from the tag
+      - name: Derive version + build date from the tag
         id: ver
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          # Commit date of the tagged commit (RFC3339), what internal/version.Date
+          # expects. Deterministic, unlike github.event.head_commit.timestamp, which
+          # can be empty on a tag push and would silently stamp the date "unknown".
+          echo "date=$(git log -1 --format=%cI)" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
@@ -86,7 +95,7 @@ jobs:
           build-args: |
             VERSION=v${{ steps.ver.outputs.version }}
             COMMIT=${{ github.sha }}
-            DATE=${{ github.event.head_commit.timestamp }}
+            DATE=${{ steps.ver.outputs.date }}
           tags: |
             ghcr.io/cadi-sh/cadish:${{ steps.ver.outputs.version }}
             ghcr.io/cadi-sh/cadish:latest

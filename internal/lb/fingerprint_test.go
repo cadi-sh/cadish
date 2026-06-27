@@ -66,6 +66,9 @@ func TestFingerprintFlipsPerField(t *testing.T) {
 		{"timeout-betweenbytes", func(c *Config) { c.Timeouts.BetweenBytes = 4 * time.Second }},
 		{"sni", func(c *Config) { c.SNI = "vhost.internal" }},
 		{"disable-reuse", func(c *Config) { c.DisableReuse = true }},
+		{"resolve-interval", func(c *Config) { c.ResolveInterval = 10 * time.Second }},
+		{"nameservers", func(c *Config) { c.Nameservers = []string{"10.0.0.1:53"} }},
+		{"capem", func(c *Config) { c.CAPEMHash = "deadbeef" }},
 		{"health-added", func(c *Config) {
 			c.Health = &HealthSpec{Method: "GET", Path: "/", ExpectCode: 200, Interval: time.Second, Window: 2, Threshold: 2}
 		}},
@@ -103,6 +106,62 @@ func TestFingerprintHealthFieldsFlip(t *testing.T) {
 		if withHealth(h).fingerprint() == baseFP {
 			t.Errorf("health mod %d did not change fingerprint", i)
 		}
+	}
+}
+
+// TestFingerprintResolveKnobs pins Finding 2: the `resolve` knobs (interval +
+// nameserver set, with ORDER significant) are part of the pool identity, so editing
+// them and reloading rebuilds the resolver instead of transplanting the stale one.
+func TestFingerprintResolveKnobs(t *testing.T) {
+	withNS := func(ns ...string) Config {
+		c := baseFingerprintCfg(t)
+		c.Nameservers = ns
+		return c
+	}
+	// Identical nameserver lists hash equal.
+	if withNS("10.0.0.1:53", "10.0.0.2:53").fingerprint() != withNS("10.0.0.1:53", "10.0.0.2:53").fingerprint() {
+		t.Fatal("identical nameserver lists must hash equal")
+	}
+	// ORDER is meaningful (DNS fall-through) — a reorder must FLIP the fingerprint.
+	if withNS("10.0.0.1:53", "10.0.0.2:53").fingerprint() == withNS("10.0.0.2:53", "10.0.0.1:53").fingerprint() {
+		t.Fatal("nameserver ORDER must change the fingerprint (fall-through order is significant)")
+	}
+	// A split-point difference must not alias (length-prefixed hashing): ["ab","c"] vs
+	// ["a","bc"] concatenate to the same bytes only without the length prefix.
+	if withNS("ab", "c").fingerprint() == withNS("a", "bc").fingerprint() {
+		t.Fatal("distinct nameserver lists must not alias (length prefix required)")
+	}
+	// Interval alone differing flips it; identical intervals match.
+	a := baseFingerprintCfg(t)
+	a.ResolveInterval = 5 * time.Second
+	b := baseFingerprintCfg(t)
+	b.ResolveInterval = 5 * time.Second
+	if a.fingerprint() != b.fingerprint() {
+		t.Fatal("identical resolve intervals must hash equal")
+	}
+	b.ResolveInterval = 7 * time.Second
+	if a.fingerprint() == b.fingerprint() {
+		t.Fatal("a different resolve interval must flip the fingerprint")
+	}
+}
+
+// TestFingerprintCAPEMContent pins Finding 4: the same ca_file PATH with DIFFERENT PEM
+// bytes (an in-place CA rotation) must flip the fingerprint, so the pool is rebuilt with
+// the rotated RootCAs rather than transplanting the old pool across a reload.
+func TestFingerprintCAPEMContent(t *testing.T) {
+	c1 := baseFingerprintCfg(t)
+	c1.CAFile = "/etc/cadish/ca.pem"
+	c1.CAPEMHash = "hash-of-old-pem"
+	c2 := baseFingerprintCfg(t)
+	c2.CAFile = "/etc/cadish/ca.pem" // SAME path
+	c2.CAPEMHash = "hash-of-new-pem" // ROTATED content
+	if c1.fingerprint() == c2.fingerprint() {
+		t.Fatal("same ca_file path with different PEM content must flip the fingerprint (in-place CA rotation honored on reload)")
+	}
+	// Same path AND same content still match (transplant preserved for the no-change case).
+	c2.CAPEMHash = "hash-of-old-pem"
+	if c1.fingerprint() != c2.fingerprint() {
+		t.Fatal("same ca_file path and content must still hash equal")
 	}
 }
 

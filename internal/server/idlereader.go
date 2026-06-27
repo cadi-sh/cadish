@@ -116,13 +116,24 @@ const minSweepInterval = 250 * time.Millisecond
 type idleSweeper struct {
 	baseInterval time.Duration // derived from the GLOBAL idle timeout (the upper bound)
 
-	mu       sync.Mutex
-	active   map[*idleTimeoutReader]struct{}
-	interval time.Duration // current desired scan period
-	started  bool
-	stop     chan struct{}
-	wake     chan struct{} // signals the run loop to re-arm its timer
-	now      func() int64
+	mu     sync.Mutex
+	active map[*idleTimeoutReader]struct{}
+	// timeoutCounts is the count of currently-active readers per idleTimeout value
+	// (R06). The min-timeout that drives the scan period is derived by iterating THIS
+	// map, whose size is bounded by the number of DISTINCT timeout values in the config
+	// (effectively a small constant: the global idle plus each upstream's between_bytes)
+	// — NOT by the number of active readers. So register/deregister stay O(distinct
+	// timeouts) instead of the old O(N) scan of the whole active set, which made
+	// stream setup/teardown O(N^2) and serialized at high concurrency. Membership is
+	// kept in lockstep with `active`: a reader's bucket is incremented exactly when it
+	// enters `active` and decremented exactly when it leaves (register / deregister /
+	// collectStale), via addLocked/removeLocked, so the counts never drift.
+	timeoutCounts map[time.Duration]int
+	interval      time.Duration // current desired scan period
+	started       bool
+	stop          chan struct{}
+	wake          chan struct{} // signals the run loop to re-arm its timer
+	now           func() int64
 }
 
 // sweepInterval derives the scan period from the idle timeout: half the timeout,
@@ -151,18 +162,19 @@ func newIdleSweeper(interval time.Duration) *idleSweeper {
 		interval = minSweepInterval
 	}
 	return &idleSweeper{
-		baseInterval: interval,
-		interval:     interval,
-		active:       make(map[*idleTimeoutReader]struct{}),
-		stop:         make(chan struct{}),
-		wake:         make(chan struct{}, 1),
-		now:          func() int64 { return time.Now().UnixNano() },
+		baseInterval:  interval,
+		interval:      interval,
+		active:        make(map[*idleTimeoutReader]struct{}),
+		timeoutCounts: make(map[time.Duration]int),
+		stop:          make(chan struct{}),
+		wake:          make(chan struct{}, 1),
+		now:           func() int64 { return time.Now().UnixNano() },
 	}
 }
 
 func (s *idleSweeper) register(r *idleTimeoutReader) {
 	s.mu.Lock()
-	s.active[r] = struct{}{}
+	s.addLocked(r)
 	changed := s.recomputeIntervalLocked()
 	if !s.started {
 		s.started = true
@@ -176,7 +188,7 @@ func (s *idleSweeper) register(r *idleTimeoutReader) {
 
 func (s *idleSweeper) deregister(r *idleTimeoutReader) {
 	s.mu.Lock()
-	delete(s.active, r)
+	s.removeLocked(r)
 	changed := s.recomputeIntervalLocked()
 	s.mu.Unlock()
 	if changed {
@@ -184,15 +196,43 @@ func (s *idleSweeper) deregister(r *idleTimeoutReader) {
 	}
 }
 
+// addLocked inserts r into the active set and increments its timeout bucket EXACTLY
+// once (idempotent if r is already present). Caller holds s.mu.
+func (s *idleSweeper) addLocked(r *idleTimeoutReader) {
+	if _, exists := s.active[r]; exists {
+		return
+	}
+	s.active[r] = struct{}{}
+	s.timeoutCounts[r.idleTimeout]++
+}
+
+// removeLocked deletes r from the active set and decrements its timeout bucket EXACTLY
+// once (no-op if r was already removed — e.g. reaped by collectStale before its Read
+// errored and called deregister). Dropping a bucket to zero deletes the key so the
+// map stays bounded by the live distinct-timeout set. Caller holds s.mu.
+func (s *idleSweeper) removeLocked(r *idleTimeoutReader) {
+	if _, ok := s.active[r]; !ok {
+		return
+	}
+	delete(s.active, r)
+	if s.timeoutCounts[r.idleTimeout] <= 1 {
+		delete(s.timeoutCounts, r.idleTimeout)
+	} else {
+		s.timeoutCounts[r.idleTimeout]--
+	}
+}
+
 // recomputeIntervalLocked sets s.interval to the scan period for the SMALLEST
-// active reader timeout, never exceeding the global baseInterval. Returns true when
+// active reader timeout, never exceeding the global baseInterval. It derives the min
+// by iterating timeoutCounts (bounded by the number of DISTINCT active timeouts), so
+// it is O(distinct timeouts), not O(active readers) — the R06 fix. Returns true when
 // the interval changed (so the run loop must re-arm). Caller holds s.mu.
 func (s *idleSweeper) recomputeIntervalLocked() bool {
 	want := s.baseInterval
 	var minTimeout time.Duration
-	for r := range s.active {
-		if minTimeout == 0 || r.idleTimeout < minTimeout {
-			minTimeout = r.idleTimeout
+	for d := range s.timeoutCounts {
+		if minTimeout == 0 || d < minTimeout {
+			minTimeout = d
 		}
 	}
 	if minTimeout > 0 {
@@ -254,7 +294,7 @@ func (s *idleSweeper) collectStale() []*idleTimeoutReader {
 	for r := range s.active {
 		if now-r.lastProgressNanos.Load() > int64(r.idleTimeout) {
 			stale = append(stale, r)
-			delete(s.active, r)
+			s.removeLocked(r) // keep timeoutCounts in lockstep with the active set
 		}
 	}
 	return stale

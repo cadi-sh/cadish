@@ -308,7 +308,11 @@ func TestParseTargetRejectsLinkLocal(t *testing.T) {
 		"169.254.169.254:80",
 		"http://[fe80::1]:80",
 		"dns://169.254.169.254:80",
-		"k8s://169.254.169.254:80", // host is not a valid svc.ns but the IP guard catches it
+		"k8s://169.254.169.254:80",  // host is not a valid svc.ns but the IP guard catches it
+		"http://[fd00:ec2::254]:80", // AWS IPv6 IMDS endpoint (Finding 5) — a ULA, not link-local
+		"https://[fd00:ec2::254]",   // same endpoint, no port
+		"[fd00:ec2::254]:80",        // scheme-less
+		"dns://[fd00:ec2::254]:53",  // as a nameserver target
 	}
 	for _, tok := range blocked {
 		if _, err := parseTarget(tok, cadishfile.Pos{}); err == nil {

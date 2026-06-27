@@ -1,0 +1,16 @@
+{
+  "name": "43-redirect-proto-tls",
+  "cadishfile": "edge.example.com {\n    redirect ^/go/(.*)$ 302 {proto}://{host}/landing/$1\n    cache_key host path\n    cache_ttl default ttl 1m\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "edge.example.com", "path": "/go/home", "tls": true },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "edge.example.com", "path": "/go/home", "tls": false },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

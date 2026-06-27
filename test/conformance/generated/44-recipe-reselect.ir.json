@@ -1,0 +1,124 @@
+{
+  "irVersion": 6,
+  "site": {
+    "hosts": [
+      "example.com"
+    ],
+    "redirectHosts": [
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "premium": {
+      "kind": "cookie",
+      "name": "premium",
+      "values": [
+        "1"
+      ]
+    }
+  },
+  "classifiers": {
+    "tier": {
+      "rows": [
+        {
+          "conj": [
+            "premium"
+          ],
+          "value": "p"
+        }
+      ],
+      "default": "f",
+      "derivesFrom": [
+        "premium"
+      ]
+    }
+  },
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "url"
+      },
+      {
+        "kind": "cookie",
+        "arg": "uid"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "names": [
+            "premium"
+          ]
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "url"
+          },
+          {
+            "kind": "classify",
+            "ref": "tier"
+          }
+        ]
+      },
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "url"
+          },
+          {
+            "kind": "cookie",
+            "arg": "uid"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache"
+  },
+  "cookieAllow": [
+    "premium",
+    "uid"
+  ],
+  "cookieAllowSet": true,
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

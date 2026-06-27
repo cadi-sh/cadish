@@ -1,0 +1,21 @@
+{
+  "name": "45-cookie-forward",
+  "cadishfile": "example.com {\n    @strip   cookie StripMe yes\n    @forward cookie KeepMe yes\n    classify {axis} {\n        derives_from cookie StripMe\n        derives_from cookie KeepMe forward\n        when @strip   -> 1\n        when @forward -> 2\n        default       -> 0\n    }\n    cookie_allow\n    cache_key default host url {axis}\n    cache_ttl default ttl 60s\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/p", "header": { "Cookie": ["StripMe=yes; KeepMe=yes; _ga=X"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/p", "header": { "Cookie": ["KeepMe=yes"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/p" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

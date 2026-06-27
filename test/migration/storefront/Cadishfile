@@ -45,7 +45,7 @@ example.com, *.example.com {
     cluster peers {
         to        k8s://cache-peers.default:6081
         shard_by  url
-        health    GET /health-check interval 1s window 5 threshold 3
+        health    GET /health-check expect 200 interval 1s window 5 threshold 3
     }
 
     # -- Two-tier cache ------------------------------------------------------

@@ -1,0 +1,31 @@
+{
+  "name": "46-redirect-scoped-regex",
+  "cadishfile": "example.com {\n    @lang_es header_regex Accept-Language (?i)^es\n    @lang_en header_regex Accept-Language (?i)^en\n    classify {langredir} { when @lang_es -> es ; when @lang_en -> en ; default -> none }\n    @es_target classify {langredir}==es\n    @en_target classify {langredir}==en\n    redirect @es_target (?i)^(.*)/(couples|parejas)/?$ 301 https://{host}$1/parejas\n    redirect @en_target (?i)^(.*)/(couples|parejas)/?$ 301 https://{host}$1/couples\n\n    cache_key host path\n    cache_ttl default ttl 1m grace 5m\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/section/couples", "header": { "Accept-Language": ["es-ES,es;q=0.9"] } },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/section/parejas", "header": { "Accept-Language": ["en-US,en;q=0.9"] } },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/deep/nested/couples", "header": { "Accept-Language": ["es"] } },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/about", "header": { "Accept-Language": ["es-ES,es;q=0.9"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/section/couples" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

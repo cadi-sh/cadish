@@ -164,6 +164,41 @@ func TestFetch_200OK_BodyAndHeaders(t *testing.T) {
 	}
 }
 
+// TestFetch_EmptyObject_ContentLengthZero guards that a 0-byte S3 object is
+// surfaced as a KNOWN length of 0 — not -1 ("unknown"). The server only emits a
+// downstream Content-Length and records a definite cache Size when
+// Response.ContentLength >= 0 (handler.go), so a 0 collapsed to -1 drops the
+// Content-Length: 0 header and caches the empty object with an unknown size.
+func TestFetch_EmptyObject_ContentLengthZero(t *testing.T) {
+	o, _ := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", testCT)
+		w.Header().Set("ETag", testETag)
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusOK)
+		// no body
+	})
+
+	resp, err := o.Fetch(context.Background(), req("empty.bin", ""))
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d want 200", resp.StatusCode)
+	}
+	if resp.ContentLength != 0 {
+		t.Fatalf("ContentLength = %d want 0 (known empty object, not -1/unknown)", resp.ContentLength)
+	}
+	if got := resp.Header.Get("Content-Length"); got != "0" {
+		t.Fatalf("Content-Length header = %q want \"0\"", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) != 0 {
+		t.Fatalf("body len = %d want 0", len(body))
+	}
+}
+
 func TestFetch_206PartialContent_RangeForwarded(t *testing.T) {
 	const (
 		part       = "4567"

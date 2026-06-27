@@ -15,7 +15,10 @@
       "maxStaleNs": 0,
       "hitForMissNs": 0,
       "storeTier": "ram",
-      "cacheable": true
+      "cacheable": true,
+      "stripHeaders": [
+        "X-Cache-Ttl"
+      ]
     },
     "deliver": {
       "respHeaderOps": [

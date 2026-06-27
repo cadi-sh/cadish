@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cadi-sh/cadish/internal/cadishfile"
 	"github.com/cadi-sh/cadish/internal/ingress"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -28,6 +29,16 @@ func ruleMatches(rt *gatewayv1.HTTPRoute, ri int, rule *gatewayv1.HTTPRouteRule)
 		if m.Path != nil {
 			if m.Path.Value != nil {
 				gm.path = normalizePath(*m.Path.Value)
+				// Env-exfiltration guard (parity with the Ingress policy-fragment surface):
+				// a tenant path carrying an unescaped "{$VAR}" would, once quoted into the
+				// `path` matcher, expand against the CONTROLLER POD's environment when the
+				// combined config is loaded (config.SubstituteEnv) — leaking secrets. QuoteArg
+				// quotes but does not neutralize "{$", so reject the match rather than emit it.
+				if cadishfile.ContainsEnvPlaceholder(gm.path) {
+					rejects = append(rejects, Reject{Kind: "HTTPRoute", Object: rk,
+						Reason: fmt.Sprintf("rule %d match %d path contains an environment-variable placeholder ({$VAR}), which is not allowed", ri, mi)})
+					continue
+				}
 			}
 			if m.Path.Type != nil {
 				switch *m.Path.Type {
@@ -51,15 +62,21 @@ func ruleMatches(rt *gatewayv1.HTTPRoute, ri int, rule *gatewayv1.HTTPRouteRule)
 			if name == "" {
 				continue
 			}
+			if cadishfile.ContainsEnvPlaceholder(name) || cadishfile.ContainsEnvPlaceholder(h.Value) {
+				rejects = append(rejects, Reject{Kind: "HTTPRoute", Object: rk,
+					Reason: fmt.Sprintf("rule %d match %d header %q contains an environment-variable placeholder ({$VAR}), which is not allowed", ri, mi, name)})
+				ok = false
+				continue
+			}
 			ht := gatewayv1.HeaderMatchExact
 			if h.Type != nil {
 				ht = *h.Type
 			}
 			switch ht {
 			case gatewayv1.HeaderMatchExact:
-				gm.conds = append(gm.conds, matcherSpec{typ: "header", args: []string{name, quoteArg(h.Value)}})
+				gm.conds = append(gm.conds, matcherSpec{typ: "header", args: []string{cadishfile.QuoteArg(name), cadishfile.QuoteArg(h.Value)}})
 			case gatewayv1.HeaderMatchRegularExpression:
-				gm.conds = append(gm.conds, matcherSpec{typ: "header_regex", args: []string{name, quoteArg(h.Value)}})
+				gm.conds = append(gm.conds, matcherSpec{typ: "header_regex", args: []string{cadishfile.QuoteArg(name), cadishfile.QuoteArg(h.Value)}})
 			default:
 				rejects = append(rejects, Reject{Kind: "HTTPRoute", Object: rk,
 					Reason: fmt.Sprintf("rule %d match %d header %q type %q is unsupported", ri, mi, name, ht)})
@@ -73,13 +90,19 @@ func ruleMatches(rt *gatewayv1.HTTPRoute, ri int, rule *gatewayv1.HTTPRouteRule)
 			if name == "" {
 				continue
 			}
+			if cadishfile.ContainsEnvPlaceholder(name) || cadishfile.ContainsEnvPlaceholder(q.Value) {
+				rejects = append(rejects, Reject{Kind: "HTTPRoute", Object: rk,
+					Reason: fmt.Sprintf("rule %d match %d queryParam %q contains an environment-variable placeholder ({$VAR}), which is not allowed", ri, mi, name)})
+				ok = false
+				continue
+			}
 			qt := gatewayv1.QueryParamMatchExact
 			if q.Type != nil {
 				qt = *q.Type
 			}
 			switch qt {
 			case gatewayv1.QueryParamMatchExact:
-				gm.conds = append(gm.conds, matcherSpec{typ: "query", args: []string{name, quoteArg(q.Value)}})
+				gm.conds = append(gm.conds, matcherSpec{typ: "query", args: []string{cadishfile.QuoteArg(name), cadishfile.QuoteArg(q.Value)}})
 			default:
 				rejects = append(rejects, Reject{Kind: "HTTPRoute", Object: rk,
 					Reason: fmt.Sprintf("rule %d match %d queryParam %q type %q is unsupported (RegularExpression query matching is deferred — UnsupportedValue)", ri, mi, name, qt)})
@@ -88,7 +111,13 @@ func ruleMatches(rt *gatewayv1.HTTPRoute, ri int, rule *gatewayv1.HTTPRouteRule)
 		}
 		// Method.
 		if m.Method != nil {
-			gm.conds = append(gm.conds, matcherSpec{typ: "method", args: []string{string(*m.Method)}})
+			if cadishfile.ContainsEnvPlaceholder(string(*m.Method)) {
+				rejects = append(rejects, Reject{Kind: "HTTPRoute", Object: rk,
+					Reason: fmt.Sprintf("rule %d match %d method contains an environment-variable placeholder ({$VAR}), which is not allowed", ri, mi)})
+				ok = false
+			} else {
+				gm.conds = append(gm.conds, matcherSpec{typ: "method", args: []string{cadishfile.QuoteArg(string(*m.Method))}})
+			}
 		}
 
 		if !ok {
@@ -184,15 +213,9 @@ func collectFilterRejects(rt *gatewayv1.HTTPRoute, ri int, rule *gatewayv1.HTTPR
 	return nil, rejects
 }
 
-// quoteArg returns a Cadishfile token for an arbitrary value: if it contains whitespace it
-// is double-quoted so it tokenizes as one arg; otherwise returned verbatim. (Header/query
-// values are operator-controlled; this keeps the generated Cadishfile well-formed.)
-func quoteArg(s string) string {
-	if s == "" {
-		return `""`
-	}
-	if strings.ContainsAny(s, " \t\"") {
-		return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
-	}
-	return s
-}
+// NOTE: tenant-authored match names, values, methods, and paths are rendered through the
+// canonical cadishfile.QuoteArg (force-quoting whitespace/quotes/semicolons/leading-#/
+// trailing-backslash AND the block-structural braces) so a hostile HTTPRoute value can
+// never break out of its directive or its host block (R01/R24/R25; see ADR D90). The old
+// hand-rolled quoteArg that quoted only on space/tab/" has been removed — never add a
+// bespoke quoter; always route generated text through cadishfile.QuoteArg.

@@ -65,6 +65,14 @@ type Metrics struct {
 	rlMonitor  atomic.Int64
 	rlPass     atomic.Int64
 
+	// upgradesActive is a GAUGE (not a monotonic counter): the number of currently-open
+	// connection-upgrade (WebSocket / `Connection: Upgrade`) passthrough tunnels. A live
+	// tunnel is long-lived and bidirectional, so it does not fit the request/response
+	// latency histogram; it is tracked as an up/down gauge instead — incremented when a
+	// tunnel is established (the 101 hijack) and decremented when either side tears it
+	// down. Lock-free / nil-safe like every other meter.
+	upgradesActive atomic.Int64
+
 	// latency histogram: one atomic counter per bucket plus an overflow bucket,
 	// and a running sum (nanoseconds) + count for the mean.
 	latBuckets []atomic.Int64 // len == len(latencyBucketsMs)+1
@@ -206,6 +214,25 @@ func (m *Metrics) RecordLatency(d time.Duration) {
 	m.latSumNs.Add(int64(d))
 }
 
+// IncUpgrade records one newly-established connection-upgrade tunnel (the 101
+// hijack). Paired one-to-one with DecUpgrade on teardown so upgradesActive is an
+// accurate live gauge. Nil-safe (a non-admin server pays nothing).
+func (m *Metrics) IncUpgrade() {
+	if m == nil {
+		return
+	}
+	m.upgradesActive.Add(1)
+}
+
+// DecUpgrade records one torn-down connection-upgrade tunnel. Must be called exactly
+// once per IncUpgrade (the tunnel's Close path guards single-call). Nil-safe.
+func (m *Metrics) DecUpgrade() {
+	if m == nil {
+		return
+	}
+	m.upgradesActive.Add(-1)
+}
+
 // Snapshot reads a consistent-enough point-in-time copy of the counters. Because
 // reads are independent atomics it is not a single linearizable instant, but for a
 // monotonic-counter dashboard that is fine (and never blocks the datapath).
@@ -232,6 +259,7 @@ func (m *Metrics) Snapshot() Snapshot {
 		RateLimitThrottle: m.rlThrottle.Load(),
 		RateLimitMonitor:  m.rlMonitor.Load(),
 		RateLimitPass:     m.rlPass.Load(),
+		UpgradesActive:    m.upgradesActive.Load(),
 		LatencyCount:      m.latCount.Load(),
 		latSumNs:          m.latSumNs.Load(),
 		UptimeSeconds:     float64(time.Now().UnixNano()-m.startNanos) / float64(time.Second),
@@ -273,6 +301,9 @@ type Snapshot struct {
 	RateLimitThrottle int64 `json:"rate_limit_throttle"`
 	RateLimitMonitor  int64 `json:"rate_limit_monitor"`
 	RateLimitPass     int64 `json:"rate_limit_pass"`
+
+	// UpgradesActive is a GAUGE: connection-upgrade (WebSocket) tunnels currently open.
+	UpgradesActive int64 `json:"upgrades_active"`
 
 	// LatencyBucketBoundsMs are the inclusive upper bounds (ms) of LatencyBuckets;
 	// LatencyBuckets has one extra trailing overflow bucket.

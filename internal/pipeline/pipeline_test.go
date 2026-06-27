@@ -454,6 +454,37 @@ func TestEvalRequestDynamicHeaderValues(t *testing.T) {
 	}
 }
 
+// TestEvalRequestProtoToken covers the {proto}/{scheme} dynamic-header token
+// (FWDHDR part b): it resolves to "https" when cadish terminated TLS (Request.TLS)
+// and "http" otherwise — the HAProxy `X-Forwarded-Proto https if { ssl_fc }`
+// equivalent expressed as `header +X-Forwarded-Proto {proto}`.
+func TestEvalRequestProtoToken(t *testing.T) {
+	p := compileSrc(t, `x {
+		header X-Forwarded-Proto {proto}
+		header X-Scheme {scheme}
+		cache_key path
+	}
+`)
+	t.Run("tls", func(t *testing.T) {
+		dec := p.EvalRequest(&Request{Path: "/", TLS: true})
+		if !hasSetOp(dec.ReqHeaderOps, "X-Forwarded-Proto", "https") {
+			t.Errorf("{proto} under TLS should be https, got %+v", dec.ReqHeaderOps)
+		}
+		if !hasSetOp(dec.ReqHeaderOps, "X-Scheme", "https") {
+			t.Errorf("{scheme} under TLS should be https, got %+v", dec.ReqHeaderOps)
+		}
+	})
+	t.Run("plain", func(t *testing.T) {
+		dec := p.EvalRequest(&Request{Path: "/", TLS: false})
+		if !hasSetOp(dec.ReqHeaderOps, "X-Forwarded-Proto", "http") {
+			t.Errorf("{proto} without TLS should be http, got %+v", dec.ReqHeaderOps)
+		}
+		if !hasSetOp(dec.ReqHeaderOps, "X-Scheme", "http") {
+			t.Errorf("{scheme} without TLS should be http, got %+v", dec.ReqHeaderOps)
+		}
+	})
+}
+
 // TestEvalDeliverUnknownHTTPToken: an unknown {http.X} (absent header) resolves
 // to empty, and an unknown {name} that is not a request token is kept verbatim.
 func TestEvalDeliverUnknownHTTPToken(t *testing.T) {

@@ -16,6 +16,10 @@ composition* / *LB routing-key seam* sections below).
 
 ```
 ServeHTTP(w, r)
+  0. READYZ          reserved /.cadish/readyz warm-readiness probe, intercepted at the
+                     very top — before site select / security / ACL / cache / access log.
+                     200 "ok" once Server.MarkWarm() has been called, else 503 "warming".
+                     Host-agnostic, any method, never reaches an origin (see below).
   1. SELECT SITE     by Host (exact → "*." wildcard → single-site fallback)
   2. EvalRequest     respond | purge | pass | request header ops | cache_key
        • respond     → write the synthetic response, done (no cache, no origin)
@@ -33,6 +37,18 @@ ServeHTTP(w, r)
                      cache-status header (HIT/MISS/HIT-STALE)
   6. ACCESS LOG      one slog line: method host path status bytes cache upstream dur
 ```
+
+### Warm-readiness gate (`/.cadish/readyz`)
+
+The reserved `/.cadish/readyz` path (step 0 above) is a warm-readiness gate for the
+Kubernetes ingress/gateway controllers. A `Server`/`Handler` starts **not warm**;
+`Server.MarkWarm()` (idempotent, a single atomic store) flips it. The controllers call it
+after their **first successful reconcile** builds the routing table from synced listers;
+`cadish run` calls it once the server is serving (its startup config was applied at
+construction). The probe is intercepted before host routing, the security gate, the `ip`
+ACL, rate-limit, the cache, and the access log/trace, so it is never gated, cached, or
+logged and never touches an origin. The controller manifests' `startupProbe`/
+`readinessProbe` use it (`httpGet`); `livenessProbe` stays TCP (process-alive, not warm).
 
 ### Freshness index (why it exists)
 
@@ -298,7 +314,7 @@ by redirecting the consumer (`cadish logs > access.log`).
 
 | Flag | Effect |
 |---|---|
-| `-log-socket PATH` | The unix socket `cadish run` listens on (and `cadish logs` dials) for the live access-log stream. Default `${TMPDIR}/cadish-access.sock` (fallback `/tmp/cadish-access.sock`); local-only, created `0600`. Always on unless `access_log off`. |
+| `-log-socket PATH` | The unix socket `cadish run` listens on (and `cadish logs` dials) for the live access-log stream. Default: a **per-instance** path under `${TMPDIR}` keyed on the listen address — `${TMPDIR}/cadish-access-<hash>.sock` (fallback dir `/tmp`) — so two co-located instances don't clash on one socket; override with `$CADISH_ACCESS_SOCKET`. Local-only, created `0600`. Always on unless `access_log off`. |
 | `-access-log off` | Disable the in-memory access-log hub entirely — even an attached `cadish logs` consumer receives nothing, and the hot path's only cost is the idle atomic check. (Also settable as the global `access_log off` Cadishfile option.) **The old `-access-log FILE` form is removed**: the server no longer writes the access log to a file; persist via `cadish logs > access.log`. |
 | `-trace` | Emit a **per-request decision trace** to stderr: the matched route, computed cache key, LOOKUP outcome, `EvalResponse` ttl/grace/hit-for-miss, pass reason, routed upstream, and body transforms — one transaction block per request. Opt-in only; the trace seam is a nil-checked pointer with **zero cost when off** (mirrors the metrics seam). `CADISH_TRACE=1` is an env alias. |
 

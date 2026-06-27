@@ -65,6 +65,17 @@ type RedirectInjector interface {
 	SetForceRedirectHosts([]string)
 }
 
+// Warmer is the OPTIONAL seam the controller uses to flip the data plane's warm-readiness
+// flag AFTER its FIRST successful reconcile builds the routing table from synced listers.
+// *server.Server satisfies it via MarkWarm. Until marked warm the reserved /.cadish/readyz
+// probe returns 503, so the pod's readiness/startup probe keeps Kubernetes from routing to
+// a not-yet-reconciled pod (no rollout 502). A bare-Applier test fake that does not
+// implement it simply has no warm gate. MarkWarm is idempotent, so calling it on every
+// successful reconcile is safe.
+type Warmer interface {
+	MarkWarm()
+}
+
 // Config tunes the controller.
 type Config struct {
 	// ClassName is the IngressClass this controller serves (e.g. "cadish").
@@ -127,6 +138,7 @@ type Controller struct {
 	applier  Applier
 	tlsInj   TLSInjector      // nil when the applier cannot accept BYO Secret certs
 	redirInj RedirectInjector // nil when the applier cannot accept force-redirect hosts
+	warmer   Warmer           // nil when the applier cannot be marked warm (a bare-Applier test fake)
 	base     string
 	opts     Config
 	debounce time.Duration
@@ -162,7 +174,6 @@ type Controller struct {
 	mu          sync.Mutex
 	lastGood    string            // last successfully applied rendered text (no-op swap avoidance)
 	lastRejects map[string]Reject // rejects surfaced as Events last reconcile (delta de-dup)
-	evSeq       atomic.Uint64     // monotonic Event name suffix (the fake clientset ignores GenerateName)
 
 	// lastCertErrs de-dups present-but-corrupt TLS-Secret warning Events across the
 	// cluster-wide reconciles (like lastRejects). Guarded by mu.
@@ -277,7 +288,23 @@ func New(cs kubernetes.Interface, applier Applier, base string, opts Config) *Co
 	if ri, ok := applier.(RedirectInjector); ok {
 		c.redirInj = ri
 	}
+	// The live server can be marked warm-ready after the first reconcile; a bare-Applier
+	// test fake that does not implement Warmer simply has no warm gate.
+	if wm, ok := applier.(Warmer); ok {
+		c.warmer = wm
+	}
 	return c
+}
+
+// markWarm flips the data plane's warm-readiness flag once the routing table reflects the
+// synced cluster state (a successful or no-op reconcile). Idempotent, and a no-op when the
+// applier is not a Warmer. A FAILED reconcile (list error, un-salvageable compile, failed
+// ApplyConfig) never reaches a markWarm call, so the pod stays NOT-ready (503) until a
+// reconcile succeeds — fail-safe.
+func (c *Controller) markWarm() {
+	if c.warmer != nil {
+		c.warmer.MarkWarm()
+	}
 }
 
 // ValidateLabelSelector reports whether selector is a parseable Kubernetes label selector
@@ -573,6 +600,9 @@ func (c *Controller) reconcile(ctx context.Context) {
 		// still surface (FIX 3): don't let a no-op routing reconcile hide it.
 		c.surfaceRejects(rejects)
 		c.recordErr(injErr)
+		// A no-op reconcile means the routing already reflects the synced cluster state
+		// (lastGood is live), so the data plane is warm-ready.
+		c.markWarm()
 		return
 	}
 
@@ -629,6 +659,9 @@ func (c *Controller) reconcile(ctx context.Context) {
 	c.lastClusterEvents = map[string]string{}
 	c.mu.Unlock()
 	c.log.Info("ingress: applied config", "ingresses", len(matched), "rejects", len(rejects))
+	// The routing table is now built from synced listers — mark the data plane warm-ready
+	// so the reserved /.cadish/readyz probe returns 200 (idempotent on later reconciles).
+	c.markWarm()
 }
 
 // joinSites concatenates the rendered site blocks in order (their concatenation is the
@@ -823,7 +856,7 @@ func (c *Controller) emitSecretEvent(ns, name, reason, msg string) {
 	}
 	ev := &corev1.Event{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("cadish-ingress-secret-%s.%d", name, c.evSeq.Add(1)),
+			Name:      fmt.Sprintf("cadish-ingress-secret-%s.%s", name, eventNameHash("Secret", ns, name, reason, msg)),
 			Namespace: ns,
 		},
 		InvolvedObject: corev1.ObjectReference{Kind: "Secret", Namespace: ns, Name: name, APIVersion: "v1"},
@@ -927,9 +960,28 @@ func splitNN(s string) (ns, name string) {
 	return "", s
 }
 
+// eventNameHash derives a STABLE, content-addressed Event name suffix from the event's
+// stable identity (kind, namespace, object name, reason, message). The same logical event
+// hashes to the same suffix on every controller replica and across process restarts, so
+// (a) two replicas reconciling the same reject race to Create the identically-named Event
+// and the loser's AlreadyExists is a correct no-op (cross-replica dedup), and (b) two
+// DIFFERENT rejects never collide on a name (no suppressed warnings). It replaces the
+// former per-process evSeq counter, whose value drifted across replicas (duplicate Events)
+// and reset on restart (a new reject could collide with an old reject's name) (R39). The
+// suffix is lowercase hex — a valid DNS-1123 Event-name component. A NUL separator keeps
+// the hash unambiguous across field boundaries.
+func eventNameHash(parts ...string) string {
+	h := fnv.New64a()
+	for _, p := range parts {
+		_, _ = h.Write([]byte(p))
+		_, _ = h.Write([]byte{0})
+	}
+	return fmt.Sprintf("%016x", h.Sum64())
+}
+
 // createEvent writes an Event best-effort. An AlreadyExists is NOT a failure:
-// Event names are derived deterministically per reject/secret/failure, so when
-// two controller replicas reconcile the same rejected object in the same window
+// Event names are derived deterministically per reject/secret/failure (eventNameHash),
+// so when two controller replicas reconcile the same rejected object in the same window
 // they race to create the identically-named Event — the loser's create returns
 // AlreadyExists. The Event already exists (the winner wrote it), so the loser
 // treats it as a no-op rather than logging a WARN that reads like a real
@@ -950,7 +1002,7 @@ func (c *Controller) emitEvent(ns, name, etype, reason, msg string) {
 	}
 	ev := &corev1.Event{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("cadish-ingress-%s.%d", name, c.evSeq.Add(1)),
+			Name:      fmt.Sprintf("cadish-ingress-%s.%s", name, eventNameHash("Ingress", ns, name, reason, msg)),
 			Namespace: ns,
 		},
 		InvolvedObject: corev1.ObjectReference{
@@ -1011,7 +1063,7 @@ func (c *Controller) emitClusterEvent(etype, reason, msg string) {
 	}
 	ev := &corev1.Event{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("cadish-ingress-controller.%d", c.evSeq.Add(1)),
+			Name:      fmt.Sprintf("cadish-ingress-controller.%s", eventNameHash("IngressClass", c.opts.ClassName, reason, msg)),
 			Namespace: ns,
 		},
 		InvolvedObject: involved,

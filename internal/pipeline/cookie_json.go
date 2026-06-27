@@ -161,15 +161,29 @@ func resolveJSONField(raw string, segs []jsonPathSeg) jsonFieldResult {
 // document (or one that nests too deeply) yields false → the matcher fails closed
 // identically on both runtimes. depth counts containers from the root: the
 // outermost object/array is depth 1.
+//
+// PARITY (R18): it ALSO requires a SINGLE top-level value. json.Decoder.Token streams
+// a SEQUENCE of values, so `{"a":1} true` (a complete object followed by trailing data)
+// decodes without error and descend() reads only the first value — a Go MATCH where the
+// JS edge's strict JSON.parse THROWS on the trailing token (no match). Rejecting any
+// token after the top-level value closes (a container returning to depth 0, or a bare
+// top-level scalar) makes Go fail closed on the exact inputs JSON.parse rejects, so the
+// two runtimes stay in lockstep.
 func jsonDocDepthValid(raw string) bool {
 	dec := json.NewDecoder(strings.NewReader(raw))
 	depth := 0
+	complete := false // the single top-level value has finished; any further token is trailing data
 	for {
 		tok, err := dec.Token()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
+			return false
+		}
+		if complete {
+			// A token after the top-level value completed → trailing data (`{"a":1} true`,
+			// `1 2`). Strict JSON.parse rejects this; mirror it (fail closed).
 			return false
 		}
 		if delim, ok := tok.(json.Delim); ok {
@@ -181,7 +195,13 @@ func jsonDocDepthValid(raw string) bool {
 				}
 			case '}', ']':
 				depth--
+				if depth == 0 {
+					complete = true // outermost container closed
+				}
 			}
+		} else if depth == 0 {
+			// A bare top-level scalar (`true`, `42`, `"x"`) is itself the whole document.
+			complete = true
 		}
 	}
 	return true

@@ -1,0 +1,32 @@
+{
+  "name": "62-multi-cookie-lines",
+  "cadishfile": "example.com {\n    @hassid cookie sid\n    pass @hassid\n\n    cache_key host path cookie:sid\n\n    cache_ttl default ttl 60s\n\n    header +cache_key X-Key raw\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": {
+        "method": "GET",
+        "host": "example.com",
+        "path": "/p",
+        "header": { "Cookie": ["a=1", "sid=secret"] }
+      },
+      "origin": {
+        "status": 200,
+        "header": { "Content-Type": ["text/html"] }
+      },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": {
+        "method": "GET",
+        "host": "example.com",
+        "path": "/p",
+        "header": { "Cookie": ["a=1; sid=secret"] }
+      },
+      "origin": {
+        "status": 200,
+        "header": { "Content-Type": ["text/html"] }
+      },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

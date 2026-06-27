@@ -24,6 +24,15 @@ example.com, *.example.com {
   wildcard (suffix match at any depth, e.g. `*.example.com` matches `a.example.com`
   *and* `a.b.example.com`, but not bare `example.com`). When exactly one site is configured,
   it also serves any Host as a lenient fallback (handy for tests / IP access).
+  - **Wrapping the address list over multiple lines:** put a `,` after **every** address
+    (including at the end of each wrapped line). cadish reads the whole comma-separated list
+    up to the `{`. A line that *doesn't* end every element with a comma — or that wraps with
+    no commas at all — is a **loud parse error** (never a silent truncation), with one
+    inherent exception: a list whose **first** address is a bare dot-less single label (e.g.
+    `intranet`, but not `localhost`) is syntactically indistinguishable from a directive, so if
+    you also omit the commas it may be mis-read — always comma-separate, or lead with a dotted
+    host. (A static TLS cert is issued for the parsed address set, so a dropped address would
+    fail that host's SNI — hence the loud error.)
 - **Statements** are either `@name` **matcher definitions** or **directives**.
 
 ### Matchers vs directives
@@ -42,10 +51,10 @@ Directives run in a fixed **request lifecycle** (see [pipeline.md](pipeline.md))
 
 | Phase | When | Directives |
 |---|---|---|
-| **SETUP** | parsed once, not per request | `tls`, `cache`, `upstream`, `cluster`, `origin`, `normalize`, `classify` |
-| **RECV** | on receiving the request | `respond`, `redirect`, `purge`, `route`, `pass`, `rewrite`, `cookie_allow` (request-cookie allowlist), `header` (request-side) |
+| **SETUP** | parsed once, not per request | `tls`, `cache`, `upstream`, `cluster`, `origin`, `normalize`, `classify`, `cache_unsafe` (opt out of safe-by-default caching), `client_cache_control` (opt out of honoring client-forced revalidation) |
+| **RECV** | on receiving the request | `respond`, `redirect`, `purge`, `route`, `pass`, `cache_credentialed` (origin-authoritative caching of credentialed requests), `rewrite`, `cookie_allow` (request-cookie allowlist), `header` (request-side) |
 | **KEY** | build the cache key | `cache_key` |
-| **ORIGIN** | on a miss, against the response | `cache_ttl`, `cache_unsafe` (opt out of safe-by-default caching), `storage`, `respond on_error` (origin-error fallback) |
+| **ORIGIN** | on a miss, against the response | `cache_ttl`, `storage`, `respond on_error` (origin-error fallback) |
 | **DELIVER** | just before responding | `header` (response-side), `strip_cookies`, `cors`, `replace`, `encode` |
 
 Within a phase, directives run **top-to-bottom**. The selection directives
@@ -70,8 +79,8 @@ response-side if **after** (so put response-header edits below your `cache_key`)
 ### Global options block
 
 A Cadishfile may begin with a single global `{ … }` block (before any site),
-Block-structured, for process-wide options: the optional `admin`, `security` and
-`proxy_protocol` blocks and the `access_log` / `strict_host` options.
+Block-structured, for process-wide options: the optional `admin`, `security`,
+`proxy_protocol` and `server` blocks and the `access_log` / `strict_host` options.
 
 ```
 {
@@ -87,6 +96,11 @@ Block-structured, for process-wide options: the optional `admin`, `security` and
     }
     proxy_protocol {
         trust 10.0.0.0/8 192.0.2.7/32  # REQUIRED trusted LB sources (off by default)
+    }
+    server {
+        maxconn 40960                # cap simultaneously-accepted inbound conns (0 = no limit)
+        read_timeout 30s             # inbound request read timeout (default 30s)
+        idle_timeout 120s            # keep-alive idle timeout (default 120s)
     }
 }
 
@@ -314,6 +328,40 @@ The equivalent run flags are `cadish run -proxy-protocol -proxy-protocol-trust
 10.0.0.0/8,192.0.2.7/32` (the flag form **overrides** the `proxy_protocol` block when
 set; the same non-empty-`trust` requirement applies).
 
+#### `server` — inbound connection limits & timeouts (opt-in)
+
+The `server` block tunes the **inbound (data-plane) listener** — the HAProxy
+`maxconn` / connection-timeout equivalents. Every field is **optional** and defaults
+to cadish's shipped value, so an absent block (or an omitted field) leaves behavior
+**byte-for-byte unchanged**.
+
+| Sub-directive | Meaning |
+|---|---|
+| `maxconn N` | Cap the number of **simultaneously-accepted** inbound connections (a `LimitListener`): the `N+1`-th connection waits until one is freed. `0` (the default) means **no limit** — the bare listener. Governs the public data plane only (the admin listener is separate). |
+| `read_timeout D` | Inbound request read timeout (headers + body), bounding a slow-request / slowloris client. Default `30s`. |
+| `idle_timeout D` | How long a keep-alive connection may sit idle between requests before cadish reclaims it. Default `120s`. |
+
+```
+{
+    server {
+        maxconn 40960                # sized for ~30k concurrent connections
+        read_timeout 30s
+        idle_timeout 120s
+    }
+}
+```
+
+Notes:
+
+- `ReadHeaderTimeout` (10s) and the streaming-safe **unset** `WriteTimeout` policy
+  are **not** exposed as knobs — a global write deadline would truncate legitimate
+  large/slow media downloads (a stalled origin is bounded by the idle-stall watchdog
+  instead). On the TLS path the `read_timeout` / `idle_timeout` knobs apply to both
+  the `:80` (ACME/redirect) and `:443` servers.
+- **Zero cost when off.** With no `server` block — or a `maxconn` of `0` — no
+  connection limiter is installed and the inbound timeouts keep their default
+  constants. This is a **server-only** concern (Cadish Edge runs on Cloudflare).
+
 ---
 
 ## Matchers
@@ -337,12 +385,14 @@ though inline regex/host matchers take a single arg; richer scopes need a name.
 | `upstream` | the request was routed to the named upstream | set by `route`; lets ORIGIN/DELIVER rules target a backend. |
 | `content_type` | the **response** `Content-Type` contains any arg | **response-phase**: case-insensitive substring (so `text/css` matches `text/css; charset=utf-8`); multiple args are OR'd. May scope the response/DELIVER directives (`cache_ttl`, `storage`, `header`, `strip_cookies`, `cors`) but not request-phase ones (a compile error). |
 | `set_cookie` | the **response** carries a `Set-Cookie` header — bare `set_cookie` = any cookie set; `set_cookie NAME…` = a cookie of that name was set (OR) | **response-phase**: cookie names are case-sensitive (RFC 6265). The session-safety primitive — drive `cache_ttl … hit_for_miss` off it so a per-user `Set-Cookie` response is never cached/shared. Same scoping rules as `content_type`. |
+| `resp_header` | a named **response** header's value matches: `resp_header X-Powered-By Express` (exact), `resp_header X-Powered-By Exp*` (`*`-glob), `resp_header X-Powered-By *` or `resp_header X-Powered-By` (presence) | **response-phase**: branch freshness on what the **origin returned**, e.g. SSR vs PHP by `X-Powered-By`. Header **name** match is case-insensitive; the **value** is exact or `*`-glob (same engine as `query_present`); a multi-valued header matches if any value matches. In a `cache_ttl`/`storage` selector it consumes exactly `NAME VALUE` and may be ANDed with a trailing `status`/`@scope` in the same rule (`cache_ttl resp_header X-Powered-By Express status 404 ttl 1m grace 24h`). Same scoping rules as `content_type` (response/DELIVER directives only; a request-phase use is a compile error). |
 | `classify` | a derived [`classify`](#classify) token equals (`{TOK}==v`) or differs from (`{TOK}!=v`) a value | turns a derived enum token into a reusable scope: `@gated classify {age}==gate`. Request-phase (usable anywhere `header` is). |
 | `geo` | the resolved geo class at a granularity is in the arg list: `geo country US ES`, `geo continent EU`, `geo region US-UT US-TX` | request-phase. The granularity (`country`/`continent`/`region`) selects which resolved class is tested (same source as `{geo}`/`{geo.continent}`/`{geo.region}`); the remaining args are an OR set, compared case-insensitively. Needs a [`geo`](#geo) source (and `region_header` for `region`). Feeds `classify` for geo→business mapping (below). |
 | `query_present` | **any** named query param is present: `query_present adult_content t a ff-* pub-*` | request-phase (usable anywhere `header` is). Presence-OR: matches as soon as one named param exists (even with an empty value, `?a=`). A trailing/embedded `*` is a glob over the param *name* (`ff-*` matches `ff-foo` but not `ff`); a bare `query_present *` matches any param. Tests the param *name*, never the value — pair it with [`classify`](#classify) to collapse "any of these present" to a 0/1 flag (the `publi` boolean, below). |
 | `query` | a **named** query param's **value** is in the arg list: `query channel beta canary` | request-phase. Tests ONE param name against an OR set of exact values (`query NAME VALUE…`); with no value (`query NAME`) it is a presence test of that one param. A repeated param (`?a=1&a=2`) matches if any value is accepted. Complements `query_present` (presence-OR over several *names*). Used by the Gateway controller for an HTTPRoute `queryParams` Exact match. |
 | `ip` | the **real client IP** is in any IP/CIDR arg: `ip 203.0.113.43/32 10.0.0.0/8 ::1 2001:db8::/32` | request-phase, IPv4 + IPv6, CIDR or bare IP (bare = a host route `/32`/`/128`); args are an OR set. Matches the **trusted-proxy-resolved real client IP** — the *same* resolution as `{geo}` (`geo { trust_proxy … }`), never the immediate peer — so behind a CDN/LB it ACLs the actual client, not the proxy. The IP/CIDR ACL primitive for the [security gate](#security-gate-allow--deny--block) (`allow`/`deny`). **Server-only:** an `ip` matcher is never projected to the edge. |
 | `all` | **every** referenced (optionally `!`-negated) sub-matcher matches (AND): `@m all @path @hdr !@internal` | request-phase composite. References other named matchers and ANDs them into ONE reusable matcher, so a single `route @m -> u` (and a correct terminal `respond !@m 404`) expresses a multi-criteria condition. Sub-refs must be plain matchers (no nesting); a response-phase sub-matcher is a compile error. The Gateway controller emits it for a multi-criteria HTTPRoute match (path AND headers AND method AND query). |
+| `upstream_healthy` | **any** named upstream **pool** has a live backend (`nbsrv()>0`): `upstream_healthy cache_pool` (or several: `upstream_healthy a b`) | request-phase liveness probe. True as soon as ONE listed pool has ≥1 backend that is health-FSM **up** and **not ejected** — an O(1) read of the maintained health state, **no dial, no probe**. Names pools EXPLICITLY (independent of routing), so it evaluates in RECV. Compose with scoped [`respond`](#respond) for an LB health endpoint (the AWS `/aws-health-check` 200/503 signal — see below). **Server-only:** live pool health has no edge analogue, so it is never projected to the edge (delegated). |
 
 ```
 @ajax      header X-Requested-With XMLHttpRequest
@@ -352,6 +402,7 @@ though inline regex/host matchers take a single arg; richer scopes need a name.
 @longcache content_type text/css image/svg+xml   # matches the RESPONSE Content-Type
 @authed    cookie sessionid                       # has a session cookie
 @session   set_cookie sessionid                   # the RESPONSE set a session cookie
+@ssr       resp_header X-Powered-By Express       # the RESPONSE came from the SSR origin
 @eu        geo continent EU                       # client is in Europe
 @regulated geo region US-UT US-TX                 # a regulated US state (needs region_header)
 @adparams  query_present adult_content t a p ff-* pub-*   # any ad/tracking param present
@@ -478,6 +529,72 @@ you confirm per-user keying is intended.)
 > edge cache for **every** credentialed request (no per-user keyed caching at the edge in
 > v1). The Go server behind it still does the per-user keyed caching described above.
 
+#### `cache_credentialed` — origin-authoritative caching of credentialed requests
+
+`cache_credentialed @scope` is the **scoped opt-out** of the credential bypass for sites whose
+origin serves **shared** content on credentialed requests and marks the genuinely per-user
+replies uncacheable — the classic Varnish custom-VCL `return(hash)`-on-cookie-traffic pattern.
+It is the faithful translation of:
+
+```
+# VCL: shared readmodel endpoints cache for everyone, keyed off the response signal
+if (beresp.http.X-Cache-Ttl) { unset beresp.http.Set-Cookie; unset beresp.http.Cache-Control; set beresp.ttl = ...; }
+```
+
+For a request whose scope matches, caching becomes **origin-authoritative**:
+
+1. the request-time **credential bypass is skipped** (a `Cookie` *or* `Authorization` request is
+   no longer bypassed — v1 covers both);
+2. the request's **original cookies are forwarded to the origin** (for the per-user routes to
+   authenticate) — this is for **origin auth only**, the credential never enters the cache key;
+3. the response is stored under the **shared, credential-free key** **only** on a **positive
+   in-scope `cache_ttl` signal** — the response **affirmatively** carries the operator's cache
+   directive (e.g. an in-scope `cache_ttl … from_header X-Cache-Ttl` with the header present, or
+   a positive `max-age`/`s-maxage` the rule honors). **That is the sole storage gate.**
+
+When the positive signal fires, it **force-overrides and strips** the per-user `Set-Cookie`
+**and** the weak `Cache-Control: no-store/private/no-cache`, `Pragma: no-cache`, and a past
+`Expires` from **both the stored entry and the delivered response** — exactly the VCL `unset
+set-cookie; unset Cache-Control; set ttl`. So a stored object **never** carries a `Set-Cookie`
+(the absolute confidentiality invariant holds), and a later HIT serves none.
+
+```
+@readmodel path_regex ^/v3/readmodel/cache/
+cache_credentialed @readmodel                       # forward cookies, cache shared on the signal
+cache_ttl @readmodel from_header X-Cache-Ttl        # the positive signal (the VCL X-Cache-Ttl)
+cache_ttl default     hit_for_miss 0s               # everything else: not stored
+```
+
+The shared endpoints (which emit `X-Cache-Ttl`) cache once and **HIT for everyone, logged-in
+included**; the per-user endpoints (`favorites`, `usernotifications`, …) emit **no**
+`X-Cache-Ttl`, so **no positive signal → never stored** — fetched fresh with each user's cookie.
+**No per-endpoint deny-list**, present or future.
+
+**Leak model — fail-closed, the same trust a custom VCL `return(hash)` assumes.** Safety rests
+on the **positive-signal gate**: a per-user route that emits no `X-Cache-Ttl` is never
+shared-cached *even if it forgot `Set-Cookie`*. Cross-user confidentiality then rests on the
+**origin** emitting the cache signal **only** on genuinely shareable bodies (a misbehaving origin
+that stamps `X-Cache-Ttl` on a per-user body would share it — but its `Set-Cookie` is still
+stripped, so no session token is ever stored). `cadish check` **warns** the origin-trust posture
+(like [`cache_unsafe`](#cache_unsafe)), and warns a scope with **no** positive-store `cache_ttl`
+rule (it can never store — a no-op).
+
+> **`Set-Cookie` note:** a positive in-scope signal **overrides and strips** `Set-Cookie` here
+> (matching the VCL) — it is **not** a refusal. Without the signal the response is simply not
+> stored. The codebase-wide invariant "a `Set-Cookie` value is never written into a cached
+> object" stays intact because the cookie is stripped *before* the object is cached.
+
+> **Guards.** `cache_unsafe` does **not** create an alternate store path in a
+> `cache_credentialed` scope — only the positive signal stores. And `strip_cookies` in the same
+> scope is a **compile error**: the directive already strips `Set-Cookie` on the store path, so a
+> redundant `strip_cookies` would only obscure where the safety comes from (the old
+> `strip_cookies @readmodel` is subsumed — drop it).
+
+> **Edge tier:** the opt-out + the precedence project to the Cadish Edge worker, so an edge
+> deployment behaves identically. A `cache_credentialed` scope that references a server-only or
+> untranslatable matcher **fails closed** at the edge (the worker passes the whole site to the
+> Cadish server behind, and `cadish edge build` fails loud).
+
 Session-aware bypass — the credential default already does this, but you can also make it
 explicit (or bypass on a cookie the default would not treat as a credential):
 
@@ -551,6 +668,19 @@ Applied at **RECV**, *after* the security gate (so `deny`/`allow` cookie rules s
 original cookies) but before the cache key, the credential bypass, and the origin fetch. The
 Cadish **Edge** worker enforces the same name-aware rule: a kept-but-unkeyed cookie bypasses
 the edge cache too (it never does blanket per-cookie exemption).
+
+- **A `pass`ed (uncached) request forwards the *original* Cookie to the origin.** Cookie
+  normalization is a **cache-key** concern, so it is **skipped when nothing is cached**: a
+  request whose decision is `pass` (an explicit [`pass`](#pass) rule, or a credential
+  **bypass** from a kept-but-unkeyed cookie / `Authorization`) reaches the origin carrying the
+  **full, pre-filter** Cookie header — *not* the `cookie_allow`/`derives_from`-stripped one.
+  This keeps auth/session intact on uncached per-user endpoints (`/me`, account, cart, APIs):
+  stripping a session that will never be cached has no caching benefit and only makes the
+  backend see an anonymous request. It is **safe** because a passed response is **never
+  stored**, so the per-user cookie cannot contaminate a shared cache entry (the same reason a
+  WebSocket-upgrade tunnel already forwards the original cookie). **Cacheable** requests are
+  unchanged: they still normalize the Cookie for the key + cross-user collapse. The Edge worker
+  applies the identical rule.
 
 #### `header_regex`
 
@@ -653,8 +783,8 @@ This is what closes the age-verification JSON state machine as *config* (see the
 row or an origin request header.
 
 > **Note (response-phase matchers):** every other matcher tests the *request*
-> (path/host/header/method) and works in any phase. `content_type` and
-> `set_cookie` test the **response**, which is only known once the origin has
+> (path/host/header/method) and works in any phase. `content_type`, `set_cookie`,
+> and `resp_header` test the **response**, which is only known once the origin has
 > answered — at `EvalResponse` (the ORIGIN phase, where `cache_ttl`/`storage`
 > decide) and at DELIVER. So they may scope the response/DELIVER directives
 > (`cache_ttl`, `storage`, `header`, `strip_cookies`, `cors`) but **not** the
@@ -662,7 +792,18 @@ row or an origin request header.
 > `pass`/`route`/`purge`/`cache_key`/a pre-cache_key `header` is a compile error.
 > Examples: `header @longcache Cache-Control "public, max-age=31536000"` sets a
 > long TTL on CSS/SVG *responses* (not by path); `cache_ttl @session hit_for_miss
-> 0s` refuses to cache a session-bearing response.
+> 0s` refuses to cache a session-bearing response;
+> `cache_ttl resp_header X-Powered-By Express ttl 1m grace 2w` gives an SSR origin
+> (it signals its kind in the response header) a different freshness tier than a
+> PHP origin behind the same path — including the residual 404 split that a `status`
+> selector alone can't tell apart:
+>
+> ```
+> cache_ttl resp_header X-Powered-By Express status 404 ttl 1m grace 24h   # SSR 404
+> cache_ttl resp_header X-Powered-By Express ttl 1m grace 2w               # SSR default
+> cache_ttl status 404 ttl 10s grace 1m                                    # PHP 404
+> cache_ttl default ttl 5s grace 1m                                        # PHP default
+> ```
 
 ---
 
@@ -682,6 +823,34 @@ tls off                             # plain HTTP (e.g. behind a TLS-terminating 
 Optional HSTS knob: `tls { acme …; hsts max_age 31536000 includeSubdomains preload }`.
 Certificates are issued **only** for configured hostnames (never an open issuer).
 
+**Keep a probe / data-plane path answering on plain `:80`** — `http_redirect_except`:
+
+```
+tls {
+    acme you@example.com
+    http_redirect_except /aws-health-check       # one or more paths; repeatable
+}
+respond @probe /aws-health-check 200             # answered on BOTH :80 and :443
+```
+
+With TLS configured, the standalone `:80` listener 301-redirects **every** request to
+HTTPS before any site rule runs — so a path meant to answer on plain HTTP (an L4/DNS
+health-check probe, a webhook, a monitor) gets a `301` instead of its real `200`/`503`.
+`http_redirect_except` lists request paths that the `:80` listener must **not** redirect:
+they fall through to the site pipeline and answer on plain HTTP (whatever your `respond`/
+`redirect`/`route` produces), while every other path still 301s to HTTPS. Notes:
+
+- Matching is **exact** on the request path (the query string is ignored);
+  `/aws-health-check` does not exempt `/aws-health-check/extra`. Repeat the option or pass
+  several paths to exempt more (`http_redirect_except /healthz /webhook`).
+- It is strictly an **opt-out for named paths** — the default (TLS ⇒ redirect-all on `:80`)
+  is unchanged, and it never *forces* a redirect. The `X-Forwarded-Proto: https` loop guard
+  is untouched (a request that already arrived over HTTPS is still served plain). No
+  redirect loops are introduced.
+- Scope is **`cadish run`** (standalone TLS). It composes with the ingress controller's
+  per-host redirect gating but is primarily a run-mode knob (ingress hosts gate the
+  redirect per host via `spec.tls`).
+
 #### `cache`
 The two-tier cache store for the site (details in [cache.md](cache.md)):
 
@@ -697,6 +866,16 @@ Omit `cache` and you get a default ~2 GiB RAM tier (with a scratch disk dir).
 `tier .ext -> ram|disk` sets a **per-extension default placement** (a `storage`
 rule overrides it per-request); both are honored by the cache.
 
+> **RAM-only caveat.** A `cache { ram … }` block with **no `disk` line** is a
+> RAM-only deployment (zero disk budget). It caches always-RAM extensions
+> (`.m3u8 .jpg …`) and other objects with a **known `Content-Length`** small enough
+> for RAM, but **unknown-length (chunked / streamed) and large objects route to the
+> disk tier — which doesn't exist — so they are cached nowhere and stream through
+> uncached.** A dynamic origin replying `Transfer-Encoding: chunked` gets **zero
+> caching** here. Watch the `DiskNoTierDiscards` cache stat (and a throttled log line)
+> to detect it; add a `disk` tier, or have the origin send a `Content-Length`, to fix
+> it. See [cache.md](cache.md#routing-ram-vs-disk).
+
 #### `upstream` / `cluster`
 A named backend pool. `upstream` is a normal origin; `cluster` is a peer pool
 (the cache-sharding case). Both accept the same block (details in
@@ -710,6 +889,7 @@ upstream web {
     host_header preserve | origin | VALUE    # Host sent upstream (default: preserve)
     sni         www.example.com              # TLS ClientHello server name (HTTPS backends)
     http_reuse  never                        # disable backend connection reuse
+    resolve     10s nameserver 10.0.0.10:53  # dns:// re-resolve interval + nameserver(s)
     policy      round_robin | least_conn | sticky | shard     # (or inferred)
     sticky      by cookie PHPSESSID else client_ip            # pin a user to a backend
     shard_by    url | key                                     # consistent-hash (clusters)
@@ -847,6 +1027,79 @@ emits a **warning** (`sni-without-https`) if you set them there. `bucket` (S3) a
 knobs allocate a dedicated transport only when set; the default path keeps the
 shared pooled client at zero cost.
 
+##### `tls_insecure` / `ca_file` / `alpn` — origin TLS verification
+
+Three per-`upstream`/`cluster` knobs that control how cadish verifies the **origin's
+TLS certificate** and which ALPN protocol it offers. The default is **secure**: full
+verification against the system roots, h2 auto-negotiated. They are **explicit-only**
+— an upstream that sets none is byte-for-byte unchanged.
+
+```
+upstream placercams_blog {
+    to          https://placercams-blog.production.svc.cluster.local:443
+    sni         www.placercams.com
+    host_header www.placercams.com
+    http_reuse  never
+    alpn        http/1.1        # pin the origin ALPN (disables the h2 auto-upgrade)
+    tls_insecure                # skip verification (= HAProxy `ssl verify none`)
+    # ca_file   /etc/cadish/internal-ca.pem   # the SECURE alternative — verify against a private CA
+}
+```
+
+| Directive | Effect |
+|---|---|
+| `tls_insecure` | Disables verification of the origin cert (`InsecureSkipVerify`) for this upstream only — the equivalent of HAProxy `ssl verify none`. A **bare flag** (no argument). Use only for a self-signed / internal origin you cannot otherwise trust. `cadish check` always emits a security **warning** (`insecure-origin-tls`). |
+| `ca_file <path>` | Verifies the origin against a **private CA** loaded from a PEM bundle (per-upstream `RootCAs`) — the secure alternative to `tls_insecure`. The PEM is loaded and validated at `cadish check` time, so a missing / unparseable / empty file fails the build loudly. |
+| `alpn <proto…>` | Pins the origin TLS **ALPN** list (`NextProtos`), e.g. `alpn http/1.1` or `alpn h2 http/1.1`. Pinning a list **disables Go's automatic HTTP/2 upgrade** (the supported way to force HTTP/1.1 to the origin). Unset ⇒ Go's default (h2 still attempted). |
+
+`tls_insecure` and `ca_file` are **mutually exclusive** — one skips verification, the
+other strengthens it — and setting both is a compile error. Verification is
+**per-upstream**: an insecure origin never relaxes verification for any other
+upstream (each gets its own `http.Transport` / `tls.Config`). The same settings are
+applied to **active health probes**, so a probe handshakes the HTTPS origin exactly
+as a live fetch does (HAProxy `http-check connect ssl` parity). `bucket` (S3) and
+`sign cloudfront` upstreams ignore these knobs (like `host_header`/`sni`).
+
+##### `resolve` — DNS re-resolution interval + custom nameserver
+
+`resolve [<interval>] [nameserver <ip:port>…]` controls how a **`dns://`** upstream
+re-resolves: how often, and which DNS server(s) to query (instead of the system
+`/etc/resolv.conf`). It is the HAProxy `resolvers … nameserver …` / `hold valid`
+equivalent for a non-Kubernetes DNS backend. **Explicit-only** — an upstream that
+omits it is byte-for-byte unchanged (system resolver, 30s re-resolution).
+
+```
+upstream legacy_dns {
+    to      dns://some-legacy-host.internal:80
+    resolve 10s nameserver 10.134.8.94:53 10.134.8.95:53
+}
+```
+
+| Form | Effect |
+|---|---|
+| `resolve <interval>` | Sets the dynamic re-resolution interval (e.g. `resolve 10s`). Unset ⇒ the 30s default. |
+| `resolve nameserver <ip:port>…` | Queries the listed DNS server(s) — each a literal `ip:port` (e.g. `10.134.8.94:53`) — instead of the system resolver. Multiple servers are tried in order. |
+| `resolve <interval> nameserver <ip:port>…` | Both at once. |
+
+A bare `resolve` (neither interval nor nameserver) is a compile error. The interval
+also applies to `k8s://` targets (which additionally re-resolve sub-second on pod
+churn). A custom nameserver only affects `dns://` targets — `http(s)://` static
+targets are resolved per-request by the Go HTTP client, and `k8s://` uses the
+EndpointSlice resolver, not DNS.
+
+> **Note (scope).** This is the *sound subset* of the RESOLVER spec. DNS-record-**TTL**
+> honoring (`ttl_respect`/`min_ttl`/`max_ttl`) is intentionally **not** implemented:
+> Go's stdlib resolver does not surface the record TTL, and a fixed interval is
+> already outcome-equivalent to HAProxy's `hold valid <dur>` (itself a fixed timer).
+> A backend that must follow DNS TTL precisely should use `k8s://` (event-driven) or a
+> short `resolve` interval.
+
+> **Security.** A custom nameserver is partly untrusted: cadish drops any
+> **link-local / cloud-metadata** address (`169.254.0.0/16`, `fe80::/10`) it returns,
+> so a hostile DNS answer cannot turn a backend into the instance metadata service.
+> (The default system resolver is assumed trusted and is not re-filtered, matching the
+> pre-existing behavior.)
+
 #### `origin chain`
 Composable origin fallback — try A, fall through to B on miss/4xx/5xx:
 
@@ -909,15 +1162,19 @@ single-flights, and per-peer health (passive ejection) comes from the reused lb 
 never reads through to *itself* (that would deadlock against coalescing) — a
 self-owned key is served locally.
 
-> **Security — strip `X-Cadish-Peer` at the edge.** The hop guard is a
-> loop-prevention hint, not a trust boundary. It **fails safe**: a request carrying
-> the header is served *locally* (never forwarded), so a spoofed value can only
-> *disable* peer routing — it can never cause a loop, a redirect, or an SSRF (peer
-> targets come solely from the `peers` config, never from the request). But a client
-> that sends `X-Cadish-Peer: <your-region>` opts itself out of owner-routing /
-> read-through, lowering the cluster's hit rate. If clients reach cadish directly,
-> **strip `X-Cadish-Peer` from inbound requests at the trust boundary** (the edge LB,
-> or a `header -X-Cadish-Peer` request-phase op) so only genuine peer hops carry it.
+> **Security — `X-Cadish-Peer` is trust-gated.** The hop guard is an inter-node
+> signal, never a client header. cadish honors an inbound `X-Cadish-Peer` **only when
+> the immediate socket peer is a trusted proxy/peer** — the same `trust_proxy` gate
+> used for `X-Forwarded-For` and header geo (the single trust-boundary policy). From
+> any untrusted/direct peer the header is **stripped** before routing, so a client
+> that forges `X-Cadish-Peer: <your-region>` can no longer suppress a peer fetch
+> (which would bypass the cluster cache and amplify origin load). **Declare your peer
+> network in `trust_proxy`** (e.g. `trust_proxy 10.0.0.0/8`) so genuine inter-node
+> hops are honored; with no `trust_proxy` the peer is never trusted, so the loop
+> guard is disabled (cadish still serves correctly via the self/owner checks, but the
+> defense-in-depth storm guard is inactive). The guard still **fails safe** either
+> way: a spoofed value can only *disable* peer routing, never cause a loop, redirect,
+> or SSRF (peer targets come solely from `peers`, never the request).
 
 > **Security — peer network must be isolated (hard deployment requirement).** Cadish
 > has **no mutual peer authentication** (no mTLS, no shared secret, no token). The
@@ -1166,6 +1423,41 @@ upstream. Like the exact-path form it runs in **RECV** (request-phase matchers o
 a response-phase matcher is a compile error) and is **not projected to the edge IR**
 (server-only).
 
+**Conditional health endpoint** — compose the scoped form with the
+[`upstream_healthy`](#matchers) matcher for an LB liveness probe that returns **200**
+when a pool has a live backend and **503** otherwise (the AWS / HAProxy
+`nbsrv() gt 0` health-check signal), with **no origin dial**:
+
+```
+@probe path /aws-health-check
+@live  upstream_healthy cache_pool      # ≥1 live backend in cache_pool?
+respond @probe @live 200 "OK"           # pool live  -> 200
+respond @probe 503                      # pool down  -> 503 (first-match: @live failed)
+```
+
+The matcher is evaluated against live load-balancer health, so an AWS/ELB (or any LB)
+target-group probe pulls the node out of the DNS pool the moment its cache origin is
+down, and adds it back when the origin recovers.
+
+`upstream_healthy` (the `AnyHealthy` signal) reflects **liveness only** — true as soon as
+**≥1** backend in a listed pool is passing health — **not spare capacity**: it does not
+report how many backends are up or whether they can absorb more load. This is
+intentional, mirroring Varnish's `nbsrv() > 0`; use it to answer "is this pool serving at
+all?", not "does it have headroom?".
+
+> Every `upstream_healthy NAME…` argument must name a **declared** `upstream`/`cluster`
+> pool. A typo (`upstream_healthy cache_poool`) is a `cadish check`/compile error — never
+> a silent always-down probe — because an unknown pool would fail closed at runtime and
+> answer **503 forever**, pulling the node out of rotation.
+>
+> A named pool only carries an active **health FSM** when it is a real load-balancer pool:
+> a `cluster NAME { … }`, a multi-backend `upstream`, or a single-backend `upstream` that
+> declares a `health { … }` block. A **trivial** single-backend `upstream NAME { to … }`
+> with no lb features (and an `s3`/`sign` upstream) is a plain origin with no FSM —
+> `upstream_healthy` resolves it **assumed healthy** (it exists and is served) and can
+> never report it down. `cadish check` warns (`upstream-healthy-non-pool`) so you add a
+> `health { … }` block when you want the backend actively probed.
+
 **Origin-error fallback** — `respond on_error [@scope] STATUS BODY [content_type T]`:
 
 ```
@@ -1177,7 +1469,9 @@ A configured synthetic body+status served when the origin **hard-fails** (a
 transport error / unreachable upstream, or a non-cacheable 5xx) and there is **no
 servable object** — neither a stale-in-grace copy, nor a within-`max_stale`
 last-good copy, nor a cacheable negative-cache entry. This serves a branded
-maintenance/error page instead of the bare `502 origin error`.
+maintenance/error page in place of the default error response (the upstream's own
+non-2xx body when it answered, or the bare `502`/`503` synthetic on a transport
+failure).
 
 - `STATUS` is the status sent to the client (e.g. `503`), independent of the
   upstream's failing code. `BODY` is the synthetic body. `content_type T`
@@ -1185,10 +1479,10 @@ maintenance/error page instead of the bare `502 origin error`.
 - `@scope` is an optional matcher OR-set so a path/host subset can carry its own
   page; a non-matching request falls through to the bare fallback. First match
   wins across multiple `respond on_error` rules.
-- **Request-phase scope only.** At origin-error time cadish has a status but **no
-  upstream response headers** (the origin contract drains non-2xx bodies), so a
-  `content_type` / `set_cookie` matcher cannot resolve and is a **compile error**
-  here — scope on `host` / `path` / `method` / request `header` only.
+- **Request-phase scope only.** `respond on_error` is a request-phase fallback, so a
+  response-phase `content_type` / `set_cookie` matcher cannot scope it and is a
+  **compile error** here — scope on `host` / `path` / `method` / request `header`
+  only.
 - **Precedence (load-bearing).** On origin failure the full order is:
   **fresh `HIT` > grace-stale `HIT-STALE` > `max_stale`-on-error `HIT-STALE-ERROR`
   > cacheable negative cache (`cache_ttl status …`) > `respond on_error` > the bare
@@ -1208,12 +1502,23 @@ maintenance/error page instead of the bare `502 origin error`.
 - **Not cached.** The synthetic is an availability stopgap, not an origin answer —
   caching it would mask recovery, so it is written straight to the client and a
   later request re-evaluates (a recovered origin serves a fresh `MISS`).
-- **The bare `502`/`503` fallback is a hard-failure path.** When no `respond
-  on_error` (or servable copy) applies, cadish writes a short synthetic status and
-  message. By design it does **not** carry the origin's own error body (the origin
-  contract drains non-2xx bodies) nor the `X-Cache`/cache-status header — use a
-  `respond on_error` page if you need a branded body, and rely on metrics/access logs
-  (not response headers) to observe these hard failures.
+- **Upstream non-2xx bodies are delivered.** An origin that *answers* with a
+  structured error — `401`/`403` auth, a `422` validation envelope, a `5xx`
+  maintenance JSON — has that response delivered to the client **verbatim**: its real
+  status, headers (`Content-Type`, `WWW-Authenticate`, `Retry-After`, …) and body,
+  exactly like an upstream `2xx`. On a `pass`/uncacheable request this is a straight
+  passthrough (never stored, so no cache-poisoning risk); on a `hit_for_miss`-matched
+  status the body reaches **this** client while the HFM marker is set and nothing is
+  stored. `404`/`410` keep their full-body negative-caching behavior. `respond
+  on_error` and `max_stale`-on-error still **outrank** passing the live error through
+  (see precedence) — they replace what the client sees, not the verbatim default.
+- **The bare `502`/`503` synthetic is a transport-failure path only.** When the
+  origin produced **no response** — a transport error / unreachable upstream
+  (`502 origin error`), or no eligible backend (`503`) — there is no upstream body to
+  deliver, so cadish writes a short synthetic status + message (and no
+  `X-Cache`/cache-status header). Use a `respond on_error` page if you want a branded
+  body for these, and rely on metrics/access logs (not response headers) to observe
+  them. (A not-found maps to `404 not found`.)
 - HEAD sends the status + headers with no body; a Range request gets the **full**
   synthetic (never a 206 slice of an error page).
 - **Edge-native** for the outage path (D76): the Cadish Edge worker serves this
@@ -1224,7 +1529,7 @@ maintenance/error page instead of the bare `502 origin error`.
 #### `redirect`
 Computed 3xx redirect — short-circuits cache and origin like `respond`, but emits
 a `Location` built from the request (host + path) instead of a body. Evaluated in
-RECV, first-match-wins (after `respond`). Three forms:
+RECV, first-match-wins (after `respond`). Four forms:
 
 **Regex form** — `redirect PATH_REGEX CODE TARGET`:
 
@@ -1258,6 +1563,31 @@ redirect @es 302 https://{host}/es{path}
 - A response-phase matcher (`content_type`/`set_cookie`) cannot scope a redirect
   (RECV runs before the origin response exists).
 
+**Scoped path-regex form** — `redirect @scope PATH_REGEX CODE TARGET` — combines a
+matcher scope **and** a path regex in one rule: the redirect fires only when the
+scope matches **and** the regex matches the path, and the regex capture groups feed
+`$1`…`$9` in the target. This expresses **"rewrite a path segment only when a signal
+holds"** — e.g. translate a URL slug only for a given language — in a single rule:
+
+```
+@es_target classify {langredir}==es                 # token-as-scope
+@en_target classify {langredir}==en
+redirect @es_target (?i)^(.*)/(couples|parejas)/?$ 301 https://{host}$1/parejas
+redirect @en_target (?i)^(.*)/(couples|parejas)/?$ 301 https://{host}$1/couples
+```
+
+- The leading `@scope` (one or more refs, OR'd) is evaluated first; the `PATH_REGEX`
+  follows and is matched against the request **path**. Both must hold for the rule to
+  fire — otherwise evaluation falls through to the next rule (first-match-wins).
+- The target may use the `$N` captures **and** the derived tokens (`{host}`,
+  `{classify.NAME}`, `{geo}`, …) together, so one rule can both rewrite a segment and
+  pick a subdomain. `{host}` remains the validated redirect host (open-redirect
+  defense, F12).
+- The form is disambiguated from the scope-only form by the argument count after the
+  leading refs: two trailing args (`CODE TARGET`) is scope-only, three
+  (`PATH_REGEX CODE TARGET`) is this combined form. `cadish check` counts the path
+  regex as one regex eval/request on top of the scope match.
+
 **Translation-map form** — `redirect CODE map { PFX -> NEWPFX … }` — sugar for the
 common "rewrite a leading path prefix, keep the rest" language/i18n case:
 
@@ -1278,20 +1608,52 @@ Each entry rewrites a leading path prefix and **preserves the remainder**, so
 | Placeholder | Expands to |
 |---|---|
 | `{host}` | request Host (lower-cased, port stripped) |
+| `{host.base}` | the **registrable base domain** of `{host}`, public-suffix aware (`es.nudity.tv` → `nudity.tv`, `www.amateur.tv` → `amateur.tv`, the multi-label `cam4you.tech555.io` → `cam4you.tech555.io`) |
+| `{host.sub}` | the leading **subdomain** label(s) below the registrable domain (`es`, `www`, `pt`); `""` for a bare base host |
 | `{path}` | request path |
 | `{query}` | canonical query string (no leading `?`); `""` if none |
 | `{uri}` | `{path}` plus `?{query}` when a query is present |
 | `{client_ip}` | resolved client IP (no port) |
 | `{http.NAME}` | request header `NAME` (absent → `""`) |
+| `{classify.NAME}` | the derived value of the `classify`'d `{NAME}` token (a bounded server enum) |
+| `{geo}` | resolved geo class (country code, e.g. `ES`, or `unknown`) |
+| `{geo.continent}` | resolved continent class (e.g. `EU`/`NA`, or `unknown`) |
+| `{geo.region}` | resolved region/subdivision class (e.g. `US-UT`; requires an upstream region header) |
+| `{proto}` / `{scheme}` | `https` when cadish terminated TLS for the request, else `http` (primarily for `X-Forwarded-Proto`; also resolved on the redirect path, so a `{proto}://…` Location reflects the inbound scheme — `https` on a TLS listener) |
 | `$0` | the whole regex match |
 | `$1`…`$9` | regex capture groups (out-of-range → empty) |
 | `$$` | a literal `$` |
 
 An unknown `{name}` is left verbatim. `cadish check` counts the path regex as one
 regex eval/request (RECV phase), the same cost class as a `path_regex` matcher.
-The `{client_ip}` / `{http.NAME}` request-scoped placeholders are most useful in
-dynamic `header` values (see below); in a `redirect` target they resolve too, but
-`{host}`/`{path}`/captures are the usual ones there.
+All of these request-scoped/derived placeholders resolve in a `redirect` target
+just as they do in dynamic `header` values — e.g. `{classify.langredir}` can pick
+the target subdomain, or `{geo}` branch a Location by country. `{host}`/`{path}`/
+captures remain the most common.
+
+**Open-redirect caveat.** A redirect `Location` drives a browser navigation, so be
+deliberate about what you reflect into it:
+
+- `{host}` is **always the validated redirect host** — the request Host is echoed
+  only when it is one of the site's configured addresses, otherwise the canonical
+  host is used (open-redirect defense, F12). An attacker-supplied Host cannot send a
+  visitor off-site. `{host.base}`/`{host.sub}` are **derived from that same validated
+  host**, so the open-redirect defense applies to the computed base/subdomain too —
+  an untrusted Host falls back to the canonical host's base, never the attacker's.
+- `{classify.NAME}` and `{geo}`/`{geo.continent}`/`{geo.region}` are **bounded,
+  server-derived enums** — safe to interpolate into a Location.
+- `{http.NAME}` and `{client_ip}` are **attacker-influenceable** (a client controls
+  its own headers/forwarded IP). Reflecting them into a Location is attacker-shaped
+  navigation; `net/http` already blocks CRLF header-splitting, but you own the
+  redirect-target semantics — prefer `{host}`/`{classify.*}`/`{geo*}` for routing
+  decisions and treat reflected `{http.*}`/`{client_ip}` as untrusted.
+- A raw `{http.*}` token in the **host position** of a redirect `TARGET` (e.g.
+  `redirect … 302 https://{http.x-forwarded-host}/login` or a protocol-relative
+  `//{http.host}/…`) is an **open redirect** — the header is attacker-supplied and,
+  unlike `{host}`, is not validated — so `cadish check`/load **rejects** it. Use the
+  validated `{host}`/`{host.base}`/`{host.sub}` for the authority instead; a `{http.*}`
+  in the **path or query** of the Location stays allowed (it can never become the
+  navigation origin).
 
 `{client_ip}` is the **trust-proxy-resolved** client: behind a `trust_proxy`-declared
 LB/CDN it is the real client walked out of `X-Forwarded-For` (the same resolution as
@@ -1325,6 +1687,30 @@ classify {lang} {                                    # derive a bounded {lang} e
 redirect @es 302 https://{host}/es{path}       # no $N captures — {path} carries the rest
 redirect @fr 302 https://{host}/fr{path}
 ```
+
+*Brand-agnostic subdomain rewrite* (`{host.base}`/`{host.sub}`) — rewrite the
+**subdomain** of any brand to `www.<same-base>` (or a per-language host) with **one**
+rule instead of N literal targets per brand. The base is public-suffix aware, so a
+whitelabel host family across many registrable domains collapses to a handful of
+generic rules:
+
+```
+# Trusts every brand host; one rule sends a bare/sub host to its own www host:
+es.nudity.tv, www.nudity.tv, nudity.tv, es.amateur.tv, www.amateur.tv, amateur.tv {
+    @needs_www host nudity.tv es.nudity.tv amateur.tv es.amateur.tv
+    redirect @needs_www ^/(.*)$ 302 https://www.{host.base}/$1   # -> www.<brand>/…
+    # …or branch the target subdomain by language, still brand-agnostic:
+    @spanish classify {lang}==es
+    redirect @spanish ^/(.*)$ 302 https://es.{host.base}/$1      # -> es.<brand>/…
+}
+```
+
+`{host.base}` strips the leading subdomain down to the registrable domain
+(`es.nudity.tv` → `nudity.tv`), and `{host.sub}` is what was stripped (`es`); both
+derive from the **validated** redirect host. A multi-label public suffix is handled
+correctly (`cam4you.tech555.io` → base `cam4you.tech555.io`, not `tech555.io`). Scope
+the rule (here `@needs_www host …`) to the hosts that should move so a request already
+on the target host does not redirect to itself.
 
 #### `purge`
 Token-guarded cache invalidation:
@@ -1422,6 +1808,39 @@ pass method POST        # by inline matcher
 pass path /admin/*      # inline path
 ```
 
+#### `upgrade`
+Enable a **WebSocket / `Connection: Upgrade` passthrough tunnel** for the matching
+scope. Mirrors `pass` exactly (RECV-phase, OR-set scope, first-match-wins) and
+**implies `pass`** — a tunnel is entirely off the caching path. Pair it with a
+`route @scope -> upstream` to choose which upstream the tunnel dials.
+
+```
+upstream chat { to k8s://chatserver.production:80 }
+@sock path /socket.io/* /chatserver/socket.io/*
+route   @sock -> chat
+upgrade @sock
+```
+
+- A request matching the scope is tunnelled **only when it is a genuine upgrade** —
+  it carries a `Connection` header with an `upgrade` token **and** an `Upgrade`
+  header. A non-upgrade request on the same scope is served as a normal `pass`
+  (plain proxy), so a `socket.io` long-poll that has not yet upgraded still works.
+- On a genuine upgrade cadish forwards the `Upgrade`/`Connection`/`Sec-WebSocket-*`
+  handshake headers to the routed upstream, returns its `101 Switching Protocols`,
+  then byte-copies both directions until either side closes. The tunnel honors the
+  upstream's load-balancer pick (health/sticky) and per-upstream transport knobs
+  (`sni`, `http_reuse`, `tls_insecure`/`ca_file`/`alpn`, connect/TLS timeouts).
+- The tunnel **never caches, coalesces, ranges, transforms, or encodes** — it is a
+  new server path that bypasses LOOKUP/ORIGIN. For every NON-tunnel request the
+  global hop-by-hop strip is unchanged, so `Upgrade`/`Connection` are still removed
+  on the normal path (no header smuggling).
+- An idle tunnel is torn down by the global `server { idle_timeout … }` (0 = the
+  default, unbounded-until-close). The active tunnel count is exported as the
+  `cadish_upgrades_active` gauge.
+- **Server-only.** A live tunnel cannot run on the stateless Cloudflare Workers edge
+  tier, so `cadish edge build` **delegates** any `upgrade` route to the Cadish server
+  behind (it is reported, never silently dropped; `-strict` flags it).
+
 #### `rewrite`
 Rewrite the **path and/or query sent to the ORIGIN**, *without* changing the
 client-facing URL. This is the HAProxy `replace-path` / SSR query-reconstruction
@@ -1463,7 +1882,9 @@ rewrite @legacy path ^/v1/(.*)$ /v2/$1   # conditional: only when @legacy matche
 >
 > **Edge note:** `rewrite` is **server-only** in v1 (the Cadish Edge worker does
 > not yet apply it; an edge request is served/delegated without the rewrite). The
-> `cache_ttl from_header` TTL **is** surfaced in the edge IR.
+> `cache_ttl from_header` TTL — and the `grace_from_header` / `max_stale_from_header`
+> windows — **are** surfaced in the edge IR (the worker resolves them identically, per
+> the cross-runtime conformance suite).
 
 ### KEY
 
@@ -1475,7 +1896,8 @@ cache_key url host
 ```
 
 Tokens: `method`, `host`, `path`, `url` (path+query), `query`, `query_allow NAME…`
-(only the listed params — globs ok), `header:NAME` (vary on a header), `cookie:NAME`
+(only the listed params — globs ok), `query_strip NAME…` (the full query *minus* the
+listed params — globs ok), `header:NAME` (vary on a header), `cookie:NAME`
 (vary on a single cookie's value — the way to cache per-user content; it lifts the
 [credentialed-request bypass](#credentialed-requests-are-never-shared-cached-by-default)
 only when it captures **every** cookie the request sends — see there),
@@ -1548,10 +1970,34 @@ keyword `default` (the catch-all). Rules:
   cache_key host path query_allow genre age camLang {publi}
   ```
 
-  (There is no separate denylist / `utm_*`-strip token: an allowlist already drops
-  everything unlisted, which is the strip. To forward a *cleaned* URL to the origin
-  — not just key on it — a request-URL rewrite is the separate, not-yet-shipped
-  piece.)
+- `query_strip NAME…` is the **dual** of `query_allow`: it keys on the **full**
+  canonical query **minus** the listed params (a *denylist*), so every meaningful
+  param still keys but known tracking junk (`utm_*`, `a_mute`, `gclid`, `fbclid`, …)
+  is dropped and cannot fragment the cache. Use it when the origin takes an
+  open-ended set of meaningful params you don't want to enumerate (so an allowlist
+  can't express it) and you only want to *remove* the junk:
+
+  ```
+  cache_key host path query_strip utm_* a_mute gclid fbclid   # key on everything BUT the tracking params
+  ```
+
+  Names follow the same rules as `query_allow` — exact names or a `*` glob over the
+  param name (`utm_*` drops `utm_source`, `utm_medium`); a bare `*` strips every param
+  (= an empty query). The surviving params are canonicalized + **sorted** identically
+  to the whole-`query` token, so the key is byte-stable regardless of incoming order.
+  It greedily consumes the param names that follow it up to the next token keyword, so
+  it can sit before other tokens: `cache_key host path query_strip utm_* {publi}`.
+  `query_allow` and `query_strip` are **mutually exclusive** in one recipe (allowlist
+  *xor* denylist) — using both is a `cadish check`/compile error. Like `query_allow`,
+  it is **key-only**: it changes the cache key, not the origin request. To forward a
+  *cleaned* URL upstream — not just key on it — use the separate `rewrite strip_query`
+  (the two are independent: key vs fetch).
+  Note: `query_strip` does **not** bound key cardinality the way `query_allow` does — an
+  origin that varies on many distinct *non-stripped* params still fragments the key into
+  one entry per combination (bounded by LRU eviction, not a memory leak, but it dilutes
+  the hit rate). Prefer `query_allow` whenever you can enumerate the params that actually
+  matter; reach for `query_strip` only when the meaningful set is open-ended and you can
+  enumerate just the junk to drop.
 - `{sticky}` is **live**: it folds the sticky cookie (or client IP) into the key,
   so a per-user route varies on the small sticky enum, not the raw cookie.
 - `{device}` is **live (v2a)**: the server classifies the `User-Agent` into a
@@ -1759,10 +2205,22 @@ example.com {
 ```
 
 `trust_proxy` is the **single source of truth** for trusted-proxy resolution: it
-feeds *both* [`{geo}`](#geo) and the security gate's [`ip`](#matchers) ACL. XFF is
-honored only when the socket peer is a trusted proxy (otherwise it is client-
-spoofable and ignored); the rightmost non-trusted XFF hop is the client. It is a
-SETUP directive (parsed once at load).
+feeds [`{geo}`](#geo), the security gate's [`ip`](#matchers) ACL, the cluster
+[`X-Cadish-Peer`](#cluster----region-local-peer-cache-clustering) hop guard, the
+`:80` [HTTP→HTTPS redirect loop guard](#tls), **and the X-Forwarded-* headers cadish
+sends to the origin** (one trust boundary). XFF is honored only when the socket peer
+is a trusted proxy (otherwise it is client-spoofable and ignored); the rightmost
+non-trusted XFF hop is the client. It is a SETUP directive (parsed once at load).
+
+**Forwarded headers to the origin.** cadish always sends the origin a *trustworthy*
+client identity rather than relaying the client's spoofable values: from a **direct/
+untrusted** peer it OVERWRITES `X-Forwarded-For` and `X-Real-IP` with the verified
+socket-peer IP, sets `X-Forwarded-Proto`/`X-Forwarded-Host` from the inbound request,
+and drops any client `Forwarded`. Behind a **trusted** proxy (`trust_proxy`) it KEEPS
+the vetted `X-Forwarded-For` chain and APPENDS the socket peer (standard reverse-proxy
+semantics), and sets `X-Real-IP` to the resolved real client. So an XFF-trusting
+origin can rely on the value — a client can no longer spoof its source IP through
+cadish. (An explicit `header_up X-Forwarded-For …` still wins.)
 
 **Why it matters (security):** the `ip` ACL resolves the real client only through a
 trusted proxy. **Without `trust_proxy`, behind an LB/CDN the `ip` matcher matches
@@ -1851,6 +2309,16 @@ Grammar:
   whose conjunction holds wins. An optional `and` reads as a connector
   (`when @a and @b` ≡ `when @a @b`).
 - `default -> VALUE` — the value when no `when` row matches (required).
+- `derives_from cookie NAME… [forward|keep]` *(optional)* — names the request
+  **cookies this axis consumes**, so cadish can do the Varnish *cardinality collapse*:
+  read the per-user cookies → derive the low-cardinality token → **strip the raw
+  cookies** → cache keyed by the normalized token. Without it, a kept per-user cookie
+  forces a credential **bypass** (you can read the cookie *or* cache, not both); with it
+  the request caches under the bounded axis (e.g. `1.2M` cookie combinations collapse to
+  `~64` entries). A trailing **`forward`** (alias `keep`) modifier on the line keeps the
+  named cookies in the request — they are **forwarded to the origin** unchanged instead
+  of stripped, while still keyed + covered by `{TOKEN}` (the loud opt-in for backends
+  that personalize from the raw cookie). See the worked example below.
 
 The token is consumed exactly like the other key normalizers:
 
@@ -1885,6 +2353,83 @@ so the token is a safe, low-cardinality key.
 > (wildcards/filters/recursion) or a **computed output** (string building,
 > arithmetic): the moment a requirement needs that, it is a Go module (the escape
 > hatch) — not a richer Cadishfile.
+
+> **`derives_from` — normalized cookie vary (derive → strip → key).** Browser traffic
+> always carries per-user cookies, so a `classify` that *reads* a cookie would still
+> **bypass** the shared cache (a kept, unkeyed cookie is a credential — see
+> [`cookie_allow`](#cookie_allow) and the bypass rule). `derives_from cookie NAME…`
+> closes that gap by declaring the cookies an axis consumes:
+>
+> ```
+> @verified   cookie verified-prod 1
+> @registered cookie userType registered
+> classify {ageverify} {
+>     derives_from cookie verified-prod userType   # the axis inputs
+>     when @verified   -> 0
+>     when @registered -> 1
+>     default          -> 2
+> }
+> cookie_allow                                     # strip everything else
+> cache_key default host url {ageverify}           # {ageverify} in the key ⇒ active
+> ```
+>
+> When `{ageverify}` is in the **selected** `cache_key` recipe, cadish (1) lets the
+> declared cookies **survive** `cookie_allow` so the classifier reads the original
+> value and the key is built from it, then (2) **strips** them from the request *after*
+> the key is captured and *before* the credential check + the origin fetch (Varnish's
+> `unset req.http.Cookie`). The origin therefore gets an **anonymous** request and its
+> reply is safely stored under the collapsed key.
+>
+> **Fail-closed, by design.** Auto-strip is the *only* mechanism — a `derives_from`
+> token never "covers" a cookie that is still forwarded. An axis must list **all** its
+> inputs: a per-user cookie that is *not* declared and *not* keyed still bypasses (no
+> silent cross-user store), and `Set-Cookie` is still never cached. The strip is
+> **gated** on the token being in the selected recipe — a `derives_from` whose token is
+> in no recipe is read but never stripped (it would leak to origin), which `cadish
+> check` flags (`derives-from-not-stripped`); and a covered cookie no longer raises
+> `cookie-allow-unkeyed`. Edge parity: the worker replicates the exact derive→strip
+> ordering, so the edge and server collapse cardinality identically.
+>
+> **`forward` mode — derive + key + cover, but FORWARD the cookie.** Sometimes the
+> origin still personalizes server-side from the *raw* cookie (some code paths read it
+> directly). A trailing **`forward`** (alias `keep`) keeps the named cookies in the
+> request instead of stripping them:
+>
+> ```
+> classify {adult_php} {
+>     derives_from cookie AdultContent forward   # read + key + cover + FORWARD (don't strip)
+>     when @adultcookie -> 1
+>     default           -> 0
+> }
+> cookie_allow
+> cache_key default host url {adult_php}
+> ```
+>
+> A forward cookie is **read pre-key, contributes to `{TOKEN}`, forwarded to origin
+> unchanged, and treated as covered** by `{TOKEN}` for the credential bypass — so the
+> request still caches under the collapsed key. The coverage is gated **exactly like the
+> strip**: the token must be in the *selected* recipe, so a forward cookie is **always
+> keyed** (no shared-key leak along the axis). A forward cookie whose token is *not* in
+> the selected recipe is **not** covered and falls through to the normal path (bypass /
+> `cookie_allow`) like any kept cookie. Per-cookie granularity is by **separate lines**
+> (one strip, one `forward`) for *different* cookies — declaring the **same** cookie both
+> strip (bare) and `forward` within one `classify` block is a **compile error** (a cookie
+> cannot be both stripped and forwarded; the safe-default strip is never silently
+> downgraded). Because the collapsed key now hides the raw cookie, `cadish
+> check` emits a loud advisory **`cookie-forward-uncollapsed`**: you are asserting the
+> cookie's only cache-relevant effect is `{TOKEN}` — if the origin personalizes on it
+> along a dimension the key does not capture, that per-user body would be served under the
+> shared key. `Set-Cookie` is still never cached. Use bare `derives_from` (strip — the
+> safe default) unless the backend genuinely reads the raw cookie.
+>
+> **Duplicate forward cookies.** A browser may legitimately send one cookie name more
+> than once (e.g. a domain-scoped and a host-scoped copy under RFC 6265). A
+> forward-covered cookie sent **more than once with identical values still caches** —
+> it is keyed by the derived `{TOKEN}` (occurrence-independent) and the origin sees N
+> identical values, so no cross-user divergence is possible. If the occurrences carry
+> **differing** values (genuinely ambiguous), or the cookie is keyed by a raw
+> `cookie:NAME` token (the raw value enters the key, which captures only the first
+> occurrence), a duplicate still forces a **bypass** — fail-closed.
 
 #### `tenant` / `group`
 Serve many brands/hosts from one config (whitelabel multi-tenancy) without
@@ -1961,11 +2506,15 @@ cache_ttl @images          ttl 24h grace 365d          # selector: a matcher
 cache_ttl default          from_header X-Cache-Ttl grace 1h  # TTL from an origin header
 cache_ttl default          ttl 2s  grace 24h           # catch-all fallback
 cache_ttl @pages           ttl 60s grace 5m max_stale 24h    # serve-stale-on-outage
+cache_ttl @v3 from_header X-Cache-Ttl grace_from_header X-Cache-Grace grace 5m  # grace from an origin header
 ```
 
 - Selectors: `status CODE…`, `status not CODE…`, `@matcher`, `default`.
-- Actions: `ttl DUR [grace DUR] [max_stale DUR]`,
-  `from_header HEADER [grace DUR] [max_stale DUR]`, or `hit_for_miss DUR`.
+- Actions: `ttl DUR [grace DUR|grace_from_header NAME] [max_stale DUR|max_stale_from_header NAME]`,
+  `from_header HEADER [grace DUR|grace_from_header NAME] [max_stale DUR|max_stale_from_header NAME]`,
+  or `hit_for_miss DUR`. Each window may be a literal **or** sourced from an origin
+  response header; `grace_from_header`/`max_stale_from_header` are rejected on
+  `hit_for_miss`.
 - **A broad selector (`default`, `@scope`, `status not …`) stores only `200`, `404`
   and `410`** — a success body, or the canonical negative-cache entries. It will **not**
   cache a transient `4xx`/`5xx`: caching a `5xx` under a generic `cache_ttl default`
@@ -1978,7 +2527,23 @@ cache_ttl @pages           ttl 60s grace 5m max_stale 24h    # serve-stale-on-ou
   *don't-store* decision and is honored for any failing status.
 - `grace` is the stale-while-revalidate window: a stale-but-in-grace object is
   served immediately while cadish revalidates in the background — **regardless of
-  origin health** (it trades freshness for latency on every request).
+  origin health** (it trades freshness for latency on every request). A stale-in-grace
+  serve is a deliberate, operator-authoritative relaxation: it is served **even when the
+  origin response carried `Cache-Control: must-revalidate`** (which RFC 9111 §5.2.2.1
+  would otherwise forbid). With **no** `grace` configured (the default, `grace 0`) cadish
+  never serves stale, so `must-revalidate` is honored by default — only an explicit
+  `grace` opt-in serves stale, and that operator decision is authoritative over the
+  origin's directive (see ADR D97).
+- **Downstream freshness on a HIT/MISS.** A response cadish **stores** is served — on
+  both the MISS that stored it and every later HIT — with cadish's **own** authoritative
+  `Cache-Control: public, max-age=<the cache_ttl you set>` (and the absolute `Expires` is
+  dropped), plus an `Age` header. cadish is authoritative over the origin's freshness (your
+  `cache_ttl` already overrides the origin's `max-age`), so a downstream shared cache (or
+  the Cadish Edge tier in front) sees the **same** remaining lifetime cadish itself uses —
+  never the origin's overridden value and never RFC 9111 heuristic freshness from a bare
+  `Last-Modified`. An explicit `header Cache-Control "…"` directive **overrides** this. A
+  `pass` / hit-for-miss / uncacheable response keeps the origin's `Cache-Control` verbatim
+  (see ADR D96).
 - **`max_stale DUR`** is the **third freshness tier** (the serve-stale-on-origin-
   *failure* window). A past-grace object stays in reserve for this additional span
   and is served **only when the origin fetch fails** — never to a healthy request.
@@ -2010,6 +2575,24 @@ cache_ttl @pages           ttl 60s grace 5m max_stale 24h    # serve-stale-on-ou
   static `cache_ttl default ttl …` after it to supply a fallback. An optional
   `grace DUR` adds a static stale-while-revalidate window on top of the dynamic
   TTL.
+- **`grace_from_header NAME`** and **`max_stale_from_header NAME`** source the
+  **grace** / **max_stale** window from an origin response header the same way
+  (bare integer = seconds; otherwise a cadish duration; one-year cap). They are valid
+  on the `ttl` and `from_header` actions (rejected on `hit_for_miss`). Unlike the
+  header **TTL**, an absent/unparseable value does **not** make the rule fall through —
+  it falls back to the in-rule **literal** `grace` / `max_stale` (so
+  `grace_from_header X-Cache-Grace grace 5m` means "grace from the header, or 5m if it
+  is missing", matching the Varnish `std.duration(beresp.http.X-Cache-Grace, 5m)`
+  idiom). The `max_stale ≥ grace` rule is enforced against the **resolved** values: an
+  origin `max_stale` below the effective grace is **ignored** (no error-fallback
+  window) rather than erroring at request time.
+- **Consumed control headers are stripped from the delivered response.** When a rule
+  reads any `from_header`-family header (the TTL, grace, or max_stale header name,
+  whichever are configured) and applies, cadish **removes those headers** from the
+  response before storing and delivering it — they are an internal origin↔cache
+  control contract, not for the client (mirroring Varnish's `unset beresp.http.X-Cache-
+  Ttl`). Non-control origin headers are untouched, and a site with no `from_header`-
+  family rule strips nothing.
 
 > **Wiring note:** `hit_for_miss` **is** applied on a transient upstream
 > 4xx/5xx. **Negative caching is wired** — a `cache_ttl status 404 410 ttl 60s`
@@ -2058,6 +2641,52 @@ load.
 > credential (`cache_key … cookie:session` / `header:Authorization`), so you cannot
 > accidentally cache credentialed traffic under a shared key.
 
+#### `client_cache_control`
+Site-level **opt-out of honoring a request's client-forced revalidation**. Takes one
+value, `ignore`:
+
+```
+client_cache_control ignore
+```
+
+By default (directive absent) cadish honors the RFC 9111 §5.2.1.4 rule that a request
+`Cache-Control: no-cache` / `max-age=0` (or the HTTP/1.0 `Pragma: no-cache`) forbids
+serving a stored response without first revalidating with origin. A standard **browser
+hard-refresh sends `Cache-Control: max-age=0`**, so every reload becomes a `MISS` that
+goes to origin — engaged users who refresh never benefit from the shared cache, and the
+origin absorbs the full load. That is a **cache-bust / DoS** vector.
+
+`client_cache_control ignore` makes cadish **not honor** that client directive for the
+whole site: a fresh or in-grace entry is served as a normal `HIT`/`HIT-STALE` and the
+client cannot force a `MISS`. It is the Cadish equivalent of Varnish's
+`unset req.http.Cache-Control` / `unset req.http.Pragma`.
+
+The opt-out **only** suppresses the *client*-forced revalidation. Everything else is
+unchanged:
+
+- normal **TTL / grace** revalidation still applies — an entry past its grace window is
+  **never** served stale; it revalidates with origin regardless of this flag;
+- **`Set-Cookie` / credential / `no-store`-response** safety, the unsafe-method serve
+  guard, and the credentialed-request bypass are all untouched.
+
+It carries **no per-request cost** — read once at config load; when set, the server skips
+the client-revalidation header scan entirely on the hot path. `ignore` is the only
+accepted value (any other value, or none, is a config error).
+
+> Scope: this is a **per-site** flag. Unlike `cache_unsafe` (which governs the *response*
+> shareability refusal), `client_cache_control` governs only whether a *request* directive
+> can force a revalidation.
+
+> **Edge tier:** the Cloudflare Workers edge tier **always serves operator-TTL-fresh
+> content and never honors client-forced revalidation** — it does not scan the request
+> `Cache-Control` / `Pragma`, so a client `no-cache` / `max-age=0` can never punch a stored
+> edge entry through to origin. In other words the edge behaves as if `client_cache_control
+> ignore` were permanently set, **regardless of this directive** (the EdgeIR carries no
+> client-revalidation flag). This is deliberate: a CDN-style additive cache must not let a
+> client bust the shared edge cache (the cache-bust / DoS vector), and Cloudflare's own cache
+> layer in front of the worker applies whatever request-`Cache-Control` handling the zone is
+> configured for. On the origin (Go) tier the directive behaves exactly as described above.
+
 #### `storage`
 Which tier stores the object:
 
@@ -2102,6 +2731,7 @@ as `redirect` targets. The two request-scoped placeholders are:
 | `{http.NAME}` | the request header `NAME` (canonicalized); an **absent** header → empty string |
 | `{classify.NAME}` | the derived [`classify`](#classify) token `NAME`'s value |
 | `{geo}` / `{geo.continent}` / `{geo.region}` | the resolved geo classes (when a `geo` source is configured) |
+| `{proto}` / `{scheme}` | `https` when cadish **terminated TLS** for the inbound connection, else `http` (the `X-Forwarded-Proto` value) |
 
 The value is expanded **per request** (the cache stores nothing about it). A plain
 literal value with no `{`/`$` does zero per-request work — only templated values are
@@ -2113,10 +2743,24 @@ to empty).
 # Echo the client IP to the origin (request-side: before cache_key).
 header X-Real-IP {client_ip}
 
+# Forwarded-header set the origin expects (the `option forwardfor` +
+# `X-Forwarded-Proto https if { ssl_fc }` equivalent):
+header +X-Forwarded-For   {client_ip}     # APPEND our hop; the client's existing
+                                          # X-Forwarded-For chain is forwarded verbatim,
+                                          # so the origin sees `client, …, cadish`.
+header X-Forwarded-Proto  {proto}         # https when cadish terminated TLS, else http
+
 # Reflect the request Origin back as the allowed CORS origin (response-side).
 header Access-Control-Allow-Origin {http.Origin}
 header +Vary Origin
 ```
+
+> **`X-Forwarded-For` (the `option forwardfor` equivalent).** Use the **append**
+> form `header +X-Forwarded-For {client_ip}` (the leading `+`): it *adds* cadish's
+> resolved client-IP hop to the request's existing `X-Forwarded-For` chain rather
+> than replacing it, so a multi-proxy chain stays intact (`client, proxy1, cadish`).
+> A plain `header X-Forwarded-For {client_ip}` would **overwrite** the chain with a
+> single hop. There is no separate `append` keyword — the `+` op is the append.
 
 > ⚠️ **Security — reflected `Origin` is a footgun.** `header
 > Access-Control-Allow-Origin {http.Origin}` echoes *whatever* `Origin` the caller
@@ -2253,11 +2897,17 @@ example.com {
 }
 ```
 
-A fragment is a bare list of matchers/directives (no site wrapper). Missing/
-cyclic imports are positioned errors (`cadish check` reports them) — including a
-file that imports **itself**. A *top-level* `import` (outside any site, in a file
-that already has site blocks) is a no-op — both `cadish run` and `cadish check`
-ignore it — so put `import` inside the site that uses the fragment.
+A fragment is a bare list of matchers/directives (no site wrapper) parsed with the
+**full site-body grammar** — including brace-bodied directives. A fragment may
+contain `classify {…}`, `upstream {…}`, `tls {…}`, `cache {…}`, `geo {…}`,
+`device_detect {…}`, etc.; each splices in as exactly the block it would be inline
+at the `import` point, so splitting a config into fragments is byte-for-behavior
+identical to the single file. An unclosed/malformed block in a fragment is a
+positioned error, never a silent flatten. Missing/cyclic imports are positioned
+errors (`cadish check` reports them) — including a file that imports **itself**. A
+*top-level* `import` (outside any site, in a file that already has site blocks) is
+a no-op — both `cadish run` and `cadish check` ignore it — so put `import` inside
+the site that uses the fragment.
 
 The path may be a **glob** (`*`, `?`, `[…]`): `import conf.d/*.cadish` splices every
 match in sorted order (nested imports inside a fragment resolve recursively). A glob

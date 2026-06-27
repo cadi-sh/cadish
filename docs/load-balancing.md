@@ -50,6 +50,9 @@ directives; validation produces **positioned** `*cadishfile.ParseError`s
 | `host_header preserve\|origin\|VALUE` | Host sent upstream (default `preserve`). See [cadishfile-reference](cadishfile-reference.md#host_header--which-host-the-origin-sees). |
 | `sni <server-name>` | TLS ClientHello server name for HTTPS backends (explicit-only). See [cadishfile-reference](cadishfile-reference.md#sni--http_reuse--tls-server-name--connection-reuse). |
 | `http_reuse never` | Disable backend connection reuse (`DisableKeepAlives`); only `never` is supported. |
+| `tls_insecure` | Skip origin TLS verification for this upstream (= HAProxy `ssl verify none`); bare flag, `cadish check` warns. Mutually exclusive with `ca_file`. See [cadishfile-reference](cadishfile-reference.md#tls_insecure--ca_file--alpn--origin-tls-verification). |
+| `ca_file <path>` | Verify the origin against a private CA PEM bundle (per-upstream `RootCAs`); the secure alternative to `tls_insecure`. Loaded+validated at `cadish check` time. |
+| `alpn <proto…>` | Pin the origin TLS ALPN list (e.g. `alpn http/1.1`); pinning disables the h2 auto-upgrade. |
 | `replicas N` | Consistent-hash virtual-node count (advanced/tests). |
 
 Policy is inferred when not explicit: a `sticky` line ⇒ `sticky`, a `shard_by`
@@ -108,7 +111,7 @@ A backend `to` target is one of:
 | Syntax | Behaviour |
 |--------|-----------|
 | `http://host:port` / `https://host:port` | **Static**: one endpoint; DNS resolved by the HTTP client per request. |
-| `dns://host:port` | **Dynamic**: `host` is re-resolved (A/AAAA) every `resolve` interval (default 30s); each address becomes an endpoint. |
+| `dns://host:port` | **Dynamic**: `host` is re-resolved (A/AAAA) on a periodic interval (default 30s, set per-upstream with `resolve <interval>`); each address becomes an endpoint. |
 | `k8s://service[.namespace]:port` | **Dynamic, Kubernetes-native**: resolved through an injected `EndpointResolver` (an informer + warm cache, `internal/k8s`) to the service's current **ready pod endpoints** (named ports → numbers), re-resolved on the periodic timer **and** poked sub-second on pod churn via `Watch`. Absent a wired resolver the pool simply has no endpoints. |
 
 Re-resolution updates the backend set **with no reload**: endpoints that persist
@@ -119,6 +122,26 @@ transient DNS blip never blackholes a working pool). The DNS resolver is injecta
 (`Resolver` interface, `WithResolver`); the Kubernetes endpoint resolver is injected
 with `WithEndpointResolver` (the server wires a shared one when any `k8s://` target
 is present).
+
+A `dns://` upstream can override the re-resolution interval and the DNS server(s) it
+queries with the inline **`resolve [<interval>] [nameserver <ip:port>…]`** directive
+(the HAProxy `resolvers … nameserver … / hold valid` equivalent):
+
+```
+upstream legacy_dns {
+    to      dns://some-legacy-host.internal:80
+    resolve 10s nameserver 10.134.8.94:53
+}
+```
+
+When `nameserver` is set, cadish builds a per-pool Go resolver that dials those
+servers (instead of `/etc/resolv.conf`) and **drops any link-local/metadata address**
+they return (SSRF guard). Omitting `resolve` keeps the byte-for-byte default: the
+system resolver on the 30s timer. DNS-record-TTL honoring is intentionally out of
+scope (Go's resolver does not expose the TTL; a fixed interval is outcome-equivalent
+to HAProxy `hold valid`). See the
+[Cadishfile reference](cadishfile-reference.md#resolve--dns-re-resolution-interval--custom-nameserver)
+for the full surface.
 
 ## Timeouts & connection accounting
 

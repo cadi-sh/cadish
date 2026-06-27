@@ -1,11 +1,60 @@
 package vcladapt
 
 import (
+	"regexp"
 	"strconv"
 	"strings"
 )
 
 // --- condition extraction ---
+
+// condHasUntranslatableLogic reports whether a return(pass)/route/synth condition uses
+// boolean logic the mechanical extractors can't faithfully decompose:
+//
+//   - `&&` (AND): the extractors emit each recognized atom as an INDEPENDENT, OR-combined
+//     rule (cadish `pass`/route matchers are OR-scoped). Decomposing an intersection as a
+//     union silently WIDENS the rule — `if (req.url ~ "/admin" && req.method == "POST")
+//     return(pass)` would pass every /admin request AND every POST, far more than VCL meant.
+//   - `!` / `!~` / `!=` (negation): the positive extractors would emit the INVERTED rule —
+//     `if (!req.http.X) return(pass)` becomes `pass header X`, passing exactly the requests
+//     the VCL meant to keep cacheable.
+//
+// Either case is a silent semantic change, so the caller must flag it TODO(adapt) instead
+// of guessing. A pure `||` chain of positive atoms stays mechanically mappable (union==union).
+func condHasUntranslatableLogic(cond []token) bool {
+	for _, t := range cond {
+		if t.kind == tPunct {
+			switch t.text {
+			case "&&", "!", "!~", "!=":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// re2Reject reports whether pattern fails to compile under RE2 (Go's regexp, which is
+// exactly the engine cadish's path_regex/host_regex use). VCL regexes are PCRE; PCRE-only
+// constructs (backreferences `\1`, lookaround `(?=…)`/`(?<=…)`, possessive quantifiers)
+// are not valid RE2. Emitting such a pattern verbatim as a cadish regex produces output
+// `cadish check` rejects (or, worse, a silently different meaning), so the caller TODOs it
+// instead. ok=true means RE2 rejects it; reason carries the compile error for the operator.
+func re2Reject(pattern string) (reason string, ok bool) {
+	if _, err := regexp.Compile(pattern); err != nil {
+		return err.Error(), true
+	}
+	return "", false
+}
+
+// containsStr reports whether sl contains x.
+func containsStr(sl []string, x string) bool {
+	for _, v := range sl {
+		if v == x {
+			return true
+		}
+	}
+	return false
+}
 
 // extractMatches returns the string operands of `target (~|==) "S"` in cond.
 func extractMatches(cond []token, target string) []string {

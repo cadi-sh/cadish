@@ -104,8 +104,15 @@ func Format(src []byte) ([]byte, error) {
 		if t.BlankBefore > 0 && atLineStart && !suppressBlank {
 			pendingBlank = true
 		}
-		// suppressBlank only guards the first line-start token after a brace.
-		if t.Kind != TokenNewline {
+		// suppressBlank guards the very top of a block body so it never starts
+		// with a blank line. It should stay set until a token that actually
+		// emits content at line-start arrives. A newline emits nothing, and a
+		// ";"/empty statement at line-start also emits nothing (it just ends an
+		// already-empty line), so neither ends the suppression — otherwise a
+		// leading ";" inside a block would clear the guard and let the blank
+		// line it precedes survive one Format pass but not the next (i.e. Format
+		// would not be idempotent on input like "{;\n\n0}").
+		if t.Kind != TokenNewline && !(t.Kind == TokenSemicolon && atLineStart) {
 			suppressBlank = false
 		}
 
@@ -235,6 +242,27 @@ func needsQuoting(text string) bool {
 		}
 	}
 	return false
+}
+
+// QuoteArg renders an arbitrary string as a SINGLE Cadishfile word token, double-
+// quoting and escaping it whenever a bare rendering would not survive a re-lex as one
+// word. It is the canonical quoter for any externally-influenced value concatenated
+// into GENERATED Cadishfile text (k8s Ingress / Gateway match names, header/query
+// values, methods, paths): a hostile value must never be able to break out of its
+// directive or its enclosing block.
+//
+// Beyond the round-trip cases needsQuoting already covers (empty, leading '#',
+// trailing '\', whitespace, '"', ';'), QuoteArg ALSO force-quotes the block-structural
+// braces '{' and '}'. The lexer never emits a brace as part of a bare word — a '}' (or a
+// stray, non-placeholder '{') terminates the current word and is re-read as a structural
+// token — so an unquoted value containing a brace would silently close/open a block.
+// needsQuoting deliberately ignores braces (real source never needs them quoted for a
+// round trip); generated text built from untrusted input does, so QuoteArg adds them.
+func QuoteArg(text string) string {
+	if needsQuoting(text) || strings.IndexByte(text, '{') >= 0 || strings.IndexByte(text, '}') >= 0 {
+		return quote(text)
+	}
+	return text
 }
 
 // quote wraps text in double quotes, escaping embedded backslashes and quotes.

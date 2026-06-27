@@ -16,6 +16,7 @@ package tlsacme
 
 import (
 	"fmt"
+	"net/netip"
 	"strings"
 
 	"github.com/cadi-sh/cadish/internal/cadishfile"
@@ -80,6 +81,14 @@ type SiteTLS struct {
 	CertFile string // ModeStatic
 	KeyFile  string // ModeStatic
 	HSTS     HSTS
+	// RedirectExcept lists request paths (exact, e.g. "/aws-health-check") that the
+	// :80 listener must NOT 301 to HTTPS — they are answered on plain :80 by the site
+	// pipeline instead (an L4/DNS health-check probe, webhook, or monitoring endpoint
+	// that direct-to-origin clients hit over HTTP while TLS is terminated in cadish).
+	// It is strictly an opt-OUT for named paths; the default (TLS ⇒ redirect-all) is
+	// unchanged, and a normal path still 301s. Parsed from `tls { http_redirect_except
+	// /path … }`. See ADR D89.
+	RedirectExcept []string
 }
 
 // SiteConfig binds a site's hostnames to its TLS configuration. The hostnames are
@@ -87,6 +96,14 @@ type SiteTLS struct {
 type SiteConfig struct {
 	Hosts []string
 	TLS   SiteTLS
+	// TrustedProxies are the site's `trust_proxy` CIDRs (union of geo + standalone).
+	// The :80 HTTP→HTTPS redirect loop guard honors a client `X-Forwarded-Proto: https`
+	// ONLY when the immediate socket peer is in this set (the single WS-B trust
+	// boundary, ADR D95); from an untrusted/direct peer the header is ignored and the
+	// request is always redirected. The Manager unions every site's set (the :80
+	// listener is whole-server). Empty ⇒ no trusted proxy ⇒ XFP never suppresses a
+	// redirect.
+	TrustedProxies []netip.Prefix
 }
 
 // ParseSiteTLS interprets a site's `tls` directive into a SiteTLS. The cadishfile
@@ -99,6 +116,7 @@ type SiteConfig struct {
 //	tls { cert FILE key FILE }    → ModeStatic
 //	tls { cert FILE; key FILE }   → ModeStatic
 //	tls { acme EMAIL; hsts max_age 31536000 includeSubdomains }
+//	tls { acme EMAIL; http_redirect_except /aws-health-check }
 //
 // A nil directive (no `tls` at all) yields ModeOff. Unrecognized inner directives
 // produce a (soft) error in the returned slice but do not abort parsing; callers
@@ -224,13 +242,29 @@ func applyTLSStatement(cfg *SiteTLS, keyword string, args []cadishfile.Arg, pos 
 		}
 	case "hsts":
 		cfg.HSTS = parseHSTS(args)
+	case "http_redirect_except":
+		// `http_redirect_except /path …` exempts the listed request paths from the
+		// :80→443 redirect, so they answer on plain :80 via the site pipeline. It does
+		// NOT set a TLS mode (so it composes with acme/cert/off) and never forces a
+		// redirect — it only ever SKIPS one for an explicitly named path. A path that
+		// does not start with "/" can never match a request path, so flag it.
+		if len(args) == 0 {
+			addErr(pos, "`http_redirect_except` needs at least one path (e.g. `http_redirect_except /aws-health-check`)")
+		}
+		for _, a := range args {
+			p := a.Raw
+			if !strings.HasPrefix(p, "/") {
+				addErr(pos, "`http_redirect_except %s`: a request path must start with `/` — it will never match", p)
+			}
+			cfg.RedirectExcept = append(cfg.RedirectExcept, p)
+		}
 	case "tls":
 		// Inline `tls <keyword> ...` where keyword is the first arg.
 		if len(args) >= 1 {
 			applyTLSStatement(cfg, args[0].Raw, args[1:], pos, addErr)
 		}
 	default:
-		addErr(pos, "unknown tls option %q (want acme/cert/key/off/hsts)", keyword)
+		addErr(pos, "unknown tls option %q (want acme/cert/key/off/hsts/http_redirect_except)", keyword)
 	}
 }
 

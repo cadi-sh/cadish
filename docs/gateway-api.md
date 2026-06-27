@@ -263,12 +263,25 @@ Lease (`cadish-gateway-leader`) gates **only** the status writer — exactly lik
 controller. Serving is never gated by leadership. Run >= 2 replicas. Disable with
 `-leader-elect=false` for a single replica.
 
+## Warm-readiness probe (`/.cadish/readyz`)
+
+cadish serves a reserved `/.cadish/readyz` endpoint that reports **`503 Service
+Unavailable` until the controller's first reconcile builds the routing table** from synced
+listers, then **`200 OK`**. The controller's `startupProbe` and `readinessProbe` use it
+(`httpGet: /.cadish/readyz`), so Kubernetes does **not** route traffic to a pod whose
+routing table is not yet built — closing the rollout window where a freshly-started pod
+would otherwise return transient **404s** (a TCP probe passes the instant the listener
+binds, *before* `WaitForCacheSync` + the first reconcile). The endpoint is Host-agnostic,
+answers any method, is never cached or logged as traffic, and never reaches an origin. The
+`livenessProbe` deliberately stays **TCP** — liveness must check process-alive, not warm,
+or it would kill a pod that is merely between configs.
+
 ## CLI
 
 ```
 cadish gateway [-config base.cadish] [flags]
 
-  -config string             base Cadishfile (globals only)              (default cadishfile)
+  -config string             base Cadishfile (globals only)              (default Cadishfile)
   -namespace string          comma-separated namespaces to watch (empty = all)
   -addr string               HTTP listen address                         (default ":80")
   -https-addr string         HTTPS listen address (BYO-cert termination) (default ":443")

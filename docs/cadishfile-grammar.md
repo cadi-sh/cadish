@@ -46,7 +46,10 @@ whitespace.
   follow a colon: `{$VAR:fallback}` expands to `$VAR` when it is set (even to an empty
   string) and to `fallback` otherwise; the default itself may contain colons (e.g.
   `to http://localhost:{$PORT:8080}`). `{$VAR:}` is an explicit empty default; a bare
-  `{$VAR}` for an unset variable still expands to empty.
+  `{$VAR}` for an unset variable still expands to empty. An `{$VAR}` span is substituted
+  **whether or not the token is quoted** — `auth_token "{$ADMIN_TOKEN}"` resolves the
+  same as the unquoted form (a quoted env span must never load as its literal text). A
+  literal `{$…}` is still expressible by escaping the brace (`\{$VAR}`).
 - **Generic placeholder** `{device}`, `{geo}`, `{http.X-Foo}` — a runtime value
   resolved by the pipeline; left untouched by env substitution.
 
@@ -134,6 +137,7 @@ Matchers are defined with `@name type arg...` and referenced elsewhere as
 | `method` | HTTP method set | `@writes method POST PUT` |
 | `upstream` | request bound to a named upstream | `@images upstream images` |
 | `content_type` | response Content-Type (substring; resolves in the response phases — ORIGIN/DELIVER) | `@longcache content_type text/css image/svg+xml` |
+| `resp_header` | response-phase test of a named origin response header (exact or `*`-glob); response-phase only | `@express resp_header X-Powered-By Express` |
 | `cookie_json` | a bounded dotted-field test inside a JSON **cookie** value | `@beta cookie_json prefs flags.beta true` |
 | `header_json` | a bounded dotted-field test inside a JSON **header** value | `@beta header_json X-Ctx user.tier premium` |
 | `set_cookie` | response `Set-Cookie` present, or a named cookie set | `@sets set_cookie sessionid` |
@@ -143,10 +147,11 @@ Matchers are defined with `@name type arg...` and referenced elsewhere as
 | `query` | a named query param's value is in an OR set (no value = presence of that one param) | `@prod query env prod staging` |
 | `ip` | client IP / CIDR ACL (resolved real client IP) | `@office ip 10.0.0.0/8` |
 | `all` | AND-composite: every referenced (optionally `!`-negated) sub-matcher matches | `@m all @path @method !@bot` |
+| `upstream_healthy` | liveness probe: matches when ANY named upstream pool has a live backend (server-only) | `@live upstream_healthy web api` |
 
 These names are available programmatically as `cadishfile.DefaultMatcherTypes`.
-(`content_type` / `set_cookie` are **response-phase** matchers; the rest are
-request-phase.)
+(`content_type` / `resp_header` / `set_cookie` are **response-phase** matchers;
+the rest are request-phase.)
 
 ## 4. Directive catalog (v1)
 
@@ -164,13 +169,17 @@ milestones can warn on unknown directives:
 | `cluster` | sharded peer cache (`shard_by`, `health`) | yes |
 | `origin` | composed origin chains (`origin chain a -> b`) | no |
 | `pass` | bypass cache for matched requests | no |
+| `upgrade` | WebSocket / `Connection: Upgrade` passthrough tunnel for matched requests (implies `pass`; server-only) | no |
 | `cache_key` | cache key composition | no |
 | `cache_ttl` | TTL / grace policy by status or matcher | no |
-| `cache_unsafe` | opt out of safe-by-default caching (cache Set-Cookie/private/uncovered-Vary) | no |
+| `cache_unsafe` | opt out of PART of safe-by-default caching (cache private/no-store/no-cache/uncovered-Vary; never Set-Cookie or Vary:*) | no |
+| `cache_credentialed` | origin-authoritative shared-key caching of credentialed requests, scoped (`cache_credentialed @scope`) | no |
+| `client_cache_control` | opt out of honoring a request's client-forced revalidation (`client_cache_control ignore`) | no |
 | `storage` | storage tier routing (`-> ram` / `-> disk`) | no |
 | `lb` / `sticky` | load-balancing / stickiness | no |
 | `header` | response header manipulation | no |
 | `strip_cookies` | cookie hygiene by path / matcher | no |
+| `cookie_allow` | request-cookie allowlist (keep only the named cookies, strip the rest before the cache key + origin fetch) | no |
 | `route` | route matched requests to an upstream | no |
 | `respond` | synthetic responses | no |
 | `purge` | purge / ban (token-protected) | no |
@@ -179,6 +188,10 @@ milestones can warn on unknown directives:
 | `host_header` | which Host the origin sees | no |
 | `sni` | per-upstream TLS ClientHello server name | no |
 | `http_reuse` | per-upstream connection-reuse knob (`http_reuse never`) | no |
+| `tls_insecure` | per-upstream origin-TLS verification opt-out (skip-verify) | no |
+| `ca_file` | per-upstream private-CA bundle for origin-TLS verification | no |
+| `alpn` | per-upstream pinned origin-TLS ALPN protocols | no |
+| `resolve` | per-upstream DNS resolver knob (re-resolution interval + nameservers) | no |
 | `rewrite` | edit the origin-bound path/query in RECV | no |
 | `redirect` | computed 3xx redirect (status + target / `map`) | no |
 | `geo` | geo source + trusted-proxy block for `{geo}` tokens / `geo` matcher | yes |
@@ -190,9 +203,11 @@ milestones can warn on unknown directives:
 | `classify` | define a `{TOKEN}` request classifier (ordered `when` rules) | yes |
 | `edge` | Cadish Edge (Cloudflare Workers) deploy + cache-tier policy | yes |
 | `access_log` | global access-log toggle (`access_log off`) | no |
+| `strict_host` | global option: reject an undeclared Host with 421 instead of the lenient single-site fallback | no |
 | `admin` | global dashboard/metrics listener | yes |
 | `proxy_protocol` | global opt-in PROXY-protocol listener (`trust …`) | yes |
 | `security` | global security observability (`audit_log …`) | yes |
+| `server` | global inbound data-plane connection knobs (`maxconn`, `read_timeout`, `idle_timeout`) | yes |
 | `allow` / `deny` / `block` | security gate (native primitives, server-only) | no |
 | `monitor` | global toggle: run the security gate in monitor (non-enforcing) mode | no |
 | `rate_limit` | stateful rate limiter (token bucket, server-only) | no |
@@ -208,7 +223,7 @@ example.com, *.example.com {
     }
 
     upstream web {
-        to        k8s://web-ingress:8080
+        to        k8s://web-ingress.default:8080
         sticky    by cookie PHPSESSID else client_ip
         health    GET / expect 301 interval 5s window 6 threshold 3
     }

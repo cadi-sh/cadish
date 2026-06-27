@@ -100,6 +100,9 @@ func validateStructure(name, src, baseDir string, resolve func(string) ([]cadish
 	if _, err := proxyProtocolFromFile(file); err != nil {
 		return err
 	}
+	if _, err := serverConfigFromFile(file); err != nil {
+		return err
+	}
 
 	// Expand `group { … }` site-groups exactly as loadFromSource does, so a
 	// per-tenant site is validated the way it will actually serve.
@@ -133,6 +136,22 @@ func validateSiteStructure(site *cadishfile.Site, baseDir string, resolve func(s
 	}
 	if err := validateOriginStructure(spliced); err != nil {
 		return err
+	}
+
+	// Reproduce run's cluster MEMBERSHIP build so a malformed `cluster { … }` block fails
+	// `check` the way it fails `run` (R08). validateOriginStructure SKIPS the nameless
+	// membership block (it is not an lb pool), but config.buildCluster builds it at
+	// config-load via cluster.Parse — which produces every positioned membership error
+	// (region/peers/self/mode/fallback/health/replicas), the exact failures `check` exists
+	// to pre-empt. cluster.Parse is PURE (no filesystem, no network), so it runs on both
+	// the CLI and admin-sandbox paths. cluster.New is deliberately NOT called here: it runs
+	// lb's initial DNS resolution (a `dns://` peer would be looked up), and every STRUCTURAL
+	// membership error already lives in Parse — so Parse alone keeps check network-free and
+	// faithful.
+	if d := findMembershipBlock(spliced); d != nil {
+		if _, err := cluster.Parse(d); err != nil {
+			return err
+		}
 	}
 
 	// The remaining per-site constructors run does at config-build time, reused here
@@ -245,7 +264,11 @@ func validateOriginStructure(site *cadishfile.Site) error {
 			if _, perr := parseHostHeader(d); perr != nil {
 				return perr
 			}
-			if _, _, perr := parseTransportPolicy(d); perr != nil {
+			// openFiles=false: validate the transport STRUCTURE only — never read the
+			// `ca_file` PEM from disk on the validate/sandbox path (no host-file read
+			// oracle, and `cadish check` stays portable; a missing CA is a deploy-time
+			// WARNING via fileExistenceWarnings, mirroring geo/cert/key/sign-PEM).
+			if _, perr := parseTransportPolicy(d, false); perr != nil {
 				return perr
 			}
 		case "origin":

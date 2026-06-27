@@ -27,6 +27,25 @@ type BackendHealth struct {
 	ConsecFail int `json:"consec_fail"`
 }
 
+// AnyHealthy reports whether the pool currently has at least one ELIGIBLE backend —
+// one whose health FSM is up AND which is not passively ejected — i.e. Varnish's
+// nbsrv()>0. It is the O(1)-ish, no-dial liveness signal behind the
+// `upstream_healthy NAME…` matcher (the AWS /aws-health-check probe): it reads only
+// the maintained health/ejection state, never opening a connection or running a
+// probe. It takes the same cheap read snapshot the picker uses, then short-circuits
+// on the first live backend under that backend's own mutex (the same lock the fetch
+// path already takes), so it is race-clean and never blocks the datapath.
+func (u *Upstream) AnyHealthy() bool {
+	backends, _, _ := u.snapshot()
+	now := u.now()
+	for _, b := range backends {
+		if b.eligible(now) {
+			return true
+		}
+	}
+	return false
+}
+
 // HealthSnapshot returns a copied, immutable view of the pool's current backends
 // and their health. It takes the same read snapshot the picker uses, then copies
 // each backend's state under its own mutex, so it is race-clean and never blocks

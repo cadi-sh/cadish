@@ -29,9 +29,11 @@ rules:
 # The publish Service: the leader status writer reads its LoadBalancer address to
 # populate Ingress status.loadBalancer (resolvePublishAddress). Without this read the
 # GET is forbidden, the address resolves to "", and status is never written.
+# Least privilege: the controller does a direct GET of the single publish Service
+# (no Service informer/lister), so `get` alone suffices — no list/watch.
 - apiGroups: [""]
   resources: ["services"]
-  verbs: ["get", "list", "watch"]
+  verbs: ["get"]
 # Write Ingress status.loadBalancer (leader-only writer).
 - apiGroups: ["networking.k8s.io"]
   resources: ["ingresses/status"]

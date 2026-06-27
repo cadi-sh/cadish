@@ -1,0 +1,72 @@
+{
+  "irVersion": 6,
+  "site": {
+    "hosts": [
+      "example.com"
+    ],
+    "redirectHosts": [
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "ungreedy": {
+      "kind": "path_regex",
+      "regexUntranslatable": true
+    }
+  },
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s"
+      }
+    ]
+  },
+  "deliver": {},
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  },
+  "delegate": [
+    {
+      "directive": "path_regex",
+      "reason": "matcher @ungreedy uses a RE2 regex construct with no faithful JavaScript RegExp equivalent (e.g. ungreedy `(?U)`, a scoped `(?i:…)` group, or a mid-pattern inline flag); it is failed-closed at the edge, so any directive matching on it must run on the Cadish server behind"
+    },
+    {
+      "directive": "redirect",
+      "reason": "redirect scope references a matcher the edge cannot evaluate (a server-only Gateway/lb matcher or an untranslatable RE2 regex such as `(?U)`/`(?i:…)`); it fails CLOSED at the edge, so a later redirect would wrongly become the first match — the redirect chain from here is delegated to the Cadish server behind to preserve first-match-wins"
+    },
+    {
+      "directive": "redirect",
+      "reason": "a preceding redirect rule is delegated to the Cadish server behind; to preserve `redirect` first-match-wins semantics this later rule is also delegated, so the edge never terminally answers a request whose true first match runs on the server (additive-tier limitation)"
+    }
+  ]
+}

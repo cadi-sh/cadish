@@ -1,6 +1,7 @@
 package lb
 
 import (
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/url"
@@ -244,6 +245,40 @@ type Config struct {
 	// unchanged). The config layer fills it from `http_reuse never`; the default
 	// origin factory passes it to httporigin.WithDisableKeepAlives.
 	DisableReuse bool
+	// Insecure disables origin TLS verification for every backend (TLSVERIFY,
+	// `tls_insecure` = HAProxy `ssl verify none`). False ⇒ full verification (the
+	// secure default, datapath unchanged). Mutually exclusive with CAFile (enforced
+	// by the config layer). Applied to BOTH the origin factory and the health probe.
+	Insecure bool
+	// CAFile is the `ca_file <path>` source for RootCAs, kept for the pool
+	// fingerprint (a *x509.CertPool is not stably hashable). "" ⇒ system roots. The
+	// config layer loads + validates the PEM at `cadish check` time into RootCAs.
+	CAFile string
+	// RootCAs is the per-upstream verification pool loaded from CAFile (TLSVERIFY,
+	// `ca_file`). nil ⇒ system roots (the default). Applied to BOTH the origin
+	// factory and the health probe transport. The config layer fills it.
+	RootCAs *x509.CertPool
+	// CAPEMHash is a stable content hash (hex sha256) of the loaded ca_file PEM bytes,
+	// folded into the pool fingerprint so a CA rotation IN PLACE (same path, new bytes)
+	// forces a fresh pool across a hot reload instead of transplanting the old RootCAs.
+	// "" ⇒ no ca_file (system roots), the byte-for-byte default. The config layer fills
+	// it from the bytes it already reads in loadCAFilePEM; *x509.CertPool itself is not
+	// stably hashable, so this hash stands in for it.
+	CAPEMHash string
+	// ALPN pins the origin TLS ALPN protocol list for every backend (TLSVERIFY,
+	// `alpn http/1.1`). Empty ⇒ Go's default (h2 auto-upgrade preserved). The config
+	// layer fills it; the origin factory passes it to httporigin.WithALPN.
+	ALPN []string
+	// ResolveInterval overrides how often dns:// / k8s:// targets are re-resolved
+	// (the inline `resolve <interval>` knob). 0 ⇒ defaultResolveInterval (30s), the
+	// byte-for-byte default. The config layer fills it from the `resolve` directive;
+	// lb.New promotes it onto the pool's re-resolution ticker.
+	ResolveInterval time.Duration
+	// Nameservers are the DNS servers (ip:port) to query for dns:// targets (the
+	// inline `resolve nameserver <ip:port>…` knob). Empty ⇒ the system resolver
+	// (net.DefaultResolver), the byte-for-byte default. When set, lb.New builds a
+	// per-pool PreferGo *net.Resolver that dials these servers in order.
+	Nameservers []string
 	// MaxConns caps concurrent in-flight requests per backend (0 = unlimited).
 	MaxConns int
 	// Replicas is the consistent-hash virtual-node count per backend (0 ⇒
@@ -303,10 +338,11 @@ func parseTarget(tok string, pos cadishfile.Pos) (Target, error) {
 	}
 	t := Target{Raw: tok, Host: host, Port: port, Path: path, Pos: pos}
 	// SSRF defense-in-depth (general): reject a link-local / cloud-metadata host
-	// LITERAL (169.254.0.0/16 — incl. the 169.254.169.254 cloud IMDS — and IPv6
-	// fe80::/10). A `to` target must never be able to reach the instance metadata
-	// service. RFC1918 / private ranges are deliberately NOT blocked: k8s pod IPs and
-	// private origins are legitimate backends.
+	// LITERAL (169.254.0.0/16 — incl. the 169.254.169.254 cloud IMDS — IPv6 fe80::/10,
+	// and the AWS IPv6 IMDS endpoint fd00:ec2::254). A `to` target must never be able to
+	// reach the instance metadata service. RFC1918 / private ranges (and ordinary IPv6
+	// ULA backends) are deliberately NOT blocked: k8s pod IPs and private origins are
+	// legitimate backends.
 	if isLinkLocalLiteral(host) {
 		return Target{}, posErrf(pos, "backend target %q resolves to a link-local/cloud-metadata address (blocked)", tok)
 	}
@@ -374,17 +410,26 @@ func parseTargetURL(raw string) (scheme, host, port, path string, err error) {
 	return scheme, host, port, path, nil
 }
 
-// isLinkLocalLiteral reports whether host is an IP LITERAL in the IPv4 link-local
-// range 169.254.0.0/16 (which includes the 169.254.169.254 cloud metadata endpoint) or
-// the IPv6 link-local range fe80::/10. Only literals are matched — a hostname that
-// merely resolves to such an address is out of scope here (DNS resolution is not done at
-// parse time). This is an SSRF guard, not a private-range block: RFC1918 is allowed.
+// ec2IPv6MetadataIP is the AWS IPv6 Instance Metadata Service (IMDS) endpoint,
+// fd00:ec2::254. It lives in the Unique-Local (ULA, fc00::/7) range, so it is NOT
+// caught by IsLinkLocalUnicast — yet it serves the same credential-bearing metadata as
+// the v4 169.254.169.254 endpoint. We block this single address specifically; we do NOT
+// block fc00::/7 broadly, since legitimate ULA backends are common.
+var ec2IPv6MetadataIP = net.ParseIP("fd00:ec2::254")
+
+// isLinkLocalLiteral reports whether host is an IP LITERAL that must not become a
+// backend: the IPv4 link-local range 169.254.0.0/16 (which includes the 169.254.169.254
+// cloud metadata endpoint), the IPv6 link-local range fe80::/10, or the AWS IPv6 cloud-
+// metadata endpoint fd00:ec2::254 (a ULA, hence its explicit case). Only literals are
+// matched — a hostname that merely resolves to such an address is out of scope here (DNS
+// resolution is not done at parse time). This is an SSRF guard, not a private-range
+// block: RFC1918 and ordinary ULA backends are allowed.
 func isLinkLocalLiteral(host string) bool {
 	ip := net.ParseIP(strings.Trim(host, "[]"))
 	if ip == nil {
 		return false
 	}
-	return ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+	return ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.Equal(ec2IPv6MetadataIP)
 }
 
 // splitServiceNamespace splits a k8s:// host of the form "service.namespace" into

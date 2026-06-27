@@ -9,19 +9,24 @@ import (
 )
 
 // redirectRule is one compiled `redirect` directive. It selects matching requests
-// in one of two ways and emits a status + target template that builds the Location:
+// via a path regex and/or a matcher scope, and emits a status + target template
+// that builds the Location:
 //
 //   - path-regex form: re matches the request path; submatches feed $1..$9.
 //   - scoped form: sc is a matcher scope (OR of @matchers / one inline matcher,
 //     incl. a classify token matcher); re is nil and there are no $N captures.
+//   - scoped path-regex (combined) form: BOTH sc and re are set — the rule fires
+//     only when the scope matches AND the regex matches the path; the submatches
+//     feed $1..$9 in the Location (Part B). This expresses "rewrite this path
+//     segment only when language=X" in a single rule.
 //
 // Evaluated in RECV, first-match-wins; a match short-circuits the lifecycle with
 // a synthetic 3xx (no cache, no origin) — the redirect sibling of `respond`.
 type redirectRule struct {
-	re     *regexp.Regexp // path-regex form: matched against the request path; nil in the scoped form
-	sc     *scope         // scoped form: the matcher scope that fires this redirect; nil in the path-regex form
+	re     *regexp.Regexp // path-regex selector: matched against the request path; nil when absent
+	sc     *scope         // scope selector: the matcher scope that fires this redirect; nil when absent
 	status int            // 301/302/303/307/308
-	target string         // template: {host}/{path}/{query}/{uri} (+ $0..$9 captures, path-regex form only)
+	target string         // template: {host}/{path}/{query}/{uri} (+ $0..$9 captures when re is set)
 }
 
 // eval returns a *Redirect if the rule fires for the request, or nil. For the
@@ -35,10 +40,37 @@ type redirectRule struct {
 // the Location (open-redirect defense, F12). See Pipeline.redirectHost.
 func (r *redirectRule) eval(c *matchContext, p *Pipeline) *Redirect {
 	req := c.req
+	// Populate the request-scoped sources for the derived tokens — {http.NAME},
+	// {client_ip}, {geo}/{geo.continent}/{geo.region} — so they resolve in a redirect
+	// Location, the same way header/cache_key values do. We borrow ONLY these field
+	// values, NOT fillHeaderTemplateEnv, because that helper sets Host = req.normHost()
+	// and would defeat the F12 open-redirect defense: {host} must stay the VALIDATED
+	// redirect host (p.redirectHost), never the raw attacker-supplied Host.
+	// Scheme is set inline from req.TLS (Finding 3): a redirect on a TLS-terminated
+	// listener must emit {proto}/{scheme} = "https", not the bare "http" default — else a
+	// `{proto}://…` Location downgrades the scheme (and a force-https rule loops). Unlike
+	// {host}, Scheme carries no open-redirect concern, so setting it here does not weaken
+	// the F12 defense (we still must NOT route Host through fillHeaderTemplateEnv).
+	scheme := "http"
+	if req.TLS {
+		scheme = "https"
+	}
 	env := &TemplateEnv{
-		Host:  p.redirectHost(req),
-		Path:  req.Path,
-		Query: canonicalQuery(req),
+		Host:         p.redirectHost(req),
+		Path:         req.Path,
+		Query:        canonicalQuery(req),
+		Header:       req.Header,
+		ClientIP:     req.ClientIP,
+		Geo:          req.Geo,
+		GeoContinent: req.GeoContinent,
+		GeoRegion:    req.GeoRegion,
+		Scheme:       scheme,
+	}
+	// Scope and regex are ANDed: in the combined form (both set) the rule fires only
+	// when the scope matches AND the regex matches the path. The scope-only and
+	// regex-only forms degenerate (one selector nil) to a single condition.
+	if r.sc != nil && !c.scopeMatches(r.sc) {
+		return nil
 	}
 	if r.re != nil {
 		m := r.re.FindStringSubmatch(req.Path)
@@ -46,10 +78,65 @@ func (r *redirectRule) eval(c *matchContext, p *Pipeline) *Redirect {
 			return nil
 		}
 		env.Capture = m
-	} else if !c.scopeMatches(r.sc) {
-		return nil
 	}
-	return &Redirect{Status: r.status, Location: expandTemplate(r.target, env, classifyResolver{})}
+	// Pass the LIVE resolver (the one header/cache_key use) so {classify.NAME} resolves
+	// to its computed value instead of expanding empty. It is built inline and passed
+	// by value — the per-request matchContext is never stored on env.
+	return &Redirect{Status: r.status, Location: expandTemplate(r.target, env, classifyResolver{ctx: c, classifiers: p.classifiers})}
+}
+
+// redirectSchemePrefix matches a leading URL scheme followed by its ':' separator
+// (RFC 3986 scheme grammar). It anchors the R26 authority extraction: a SPECIAL scheme
+// (http/https) introduces an authority after the ':' regardless of how many — or which
+// direction of — slashes follow (browsers fold '\' to '/'), so the colon, not "://", is
+// the real boundary.
+var redirectSchemePrefix = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*:`)
+
+// redirectTargetHasUnsafeHostToken reports whether a redirect TARGET template places a
+// raw {http.NAME} token in the AUTHORITY (host[:port]) position of an absolute or
+// protocol-relative Location. Such a token resolves a request header verbatim (e.g.
+// {http.x-forwarded-host}) with NO host validation, so a redirect like
+// `https://{http.x-forwarded-host}/login` reflects an attacker-supplied Host into the
+// Location — an open redirect (R26 of the 2026-06-26 review battery).
+//
+// Browsers treat a SPECIAL scheme (http/https) as introducing the authority immediately
+// after the ':', independent of the slash count or direction, so the classic filter-
+// bypass variants — `https:/{http.x-forwarded-host}/login`, `https:{http.host}/login`,
+// `https:\{http.host}`, `https:/\{http.host}` — all reflect the header into the
+// navigation origin exactly like the naive `https://{http.host}`. We therefore detect a
+// leading `scheme:`, fold backslashes to forward slashes, and strip ALL leading slashes
+// after the scheme before extracting the authority span (up to the first '/','?','#').
+//
+// Only the unvalidated {http.*} family in the authority is rejected. The validated host
+// tokens ({host}/{host.base}/{host.sub} — all derived from the site's allowlist via
+// Pipeline.redirectHost, the F12 defense) stay allowed (so `https://{host.base}{uri}`
+// compiles: the host is still the validated token; {uri} expands to the path/query at
+// runtime), and a {http.*} in the PATH or QUERY of the Location is harmless (it can never
+// become the navigation origin), so it is still allowed. A relative target (no scheme, no
+// leading "//"/"\\") has no authority — a leading {http.host} there renders as a path
+// segment, not a host — so it is allowed.
+func redirectTargetHasUnsafeHostToken(target string) bool {
+	rest := target
+	if m := redirectSchemePrefix.FindString(rest); m != "" {
+		// Authority follows the scheme ':'. Fold '\'→'/' and drop every leading slash so
+		// `https:`, `https:/`, `https://`, `https:\\`, `https:/\` all reduce alike.
+		rest = strings.ReplaceAll(rest[len(m):], "\\", "/")
+		rest = strings.TrimLeft(rest, "/")
+	} else {
+		// No scheme. A protocol-relative authority starts with two slash-likes ("//",
+		// "\\", "/\", "\/" — browsers fold '\' to '/'); a single leading slash is a
+		// path-absolute relative URL with no authority.
+		norm := strings.ReplaceAll(rest, "\\", "/")
+		if !strings.HasPrefix(norm, "//") {
+			return false
+		}
+		rest = strings.TrimLeft(norm, "/")
+	}
+	// The authority ends at the first '/', '?', or '#'.
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	return strings.Contains(rest, "{http.")
 }
 
 // validRedirectCode reports whether code is a redirect status cadish emits.
@@ -62,16 +149,20 @@ func validRedirectCode(code int) bool {
 	}
 }
 
-// compileRedirect parses a `redirect` directive in one of three forms:
+// compileRedirect parses a `redirect` directive in one of four forms:
 //
-//	redirect PATH_REGEX CODE TARGET      # regex form (capture groups -> $1..$9)
-//	redirect @scope CODE TARGET          # scoped form (fires when @scope matches)
-//	redirect CODE map { PFX -> NEWPFX }  # translation-map form (prefix preserved)
+//	redirect PATH_REGEX CODE TARGET            # regex form (capture groups -> $1..$9)
+//	redirect @scope CODE TARGET                # scoped form (fires when @scope matches)
+//	redirect @scope PATH_REGEX CODE TARGET     # scoped path-regex form (scope AND regex; $1..$9)
+//	redirect CODE map { PFX -> NEWPFX }        # translation-map form (prefix preserved)
 //
-// Disambiguation: a leading `@name` arg means the SCOPED form (the @scope is a
+// Disambiguation: a leading `@name` arg means a SCOPED form (the @scope is a
 // matcher ref — incl. a classify token matcher `@x classify {tok}==val`); a
-// non-`@` first arg is the PATH_REGEX form. This removes the old footgun where
-// `redirect @x …` silently parsed `@x` as a path regex (never matching).
+// non-`@` first arg is the PATH_REGEX form. Within the scoped forms the arg count
+// after the leading run of refs tells them apart: exactly two trailing args
+// (`CODE TARGET`) is scope-only, three (`PATH_REGEX CODE TARGET`) is the combined
+// scope+regex form. This removes the old footgun where `redirect @x …` silently
+// parsed `@x` as a path regex (never matching).
 //
 // The regex form matches PATH_REGEX against the request path; TARGET is a template
 // interpolating {host}/{path}/{query}/{uri} and the regex submatches $0..$9. The
@@ -103,13 +194,23 @@ func compileRedirect(d *cadishfile.Directive, matchers map[string]*matcher) ([]r
 	if target == "" {
 		return nil, &CompileError{Pos: d.Args[2].Pos, Msg: "redirect: TARGET must be non-empty"}
 	}
+	if redirectTargetHasUnsafeHostToken(target) {
+		return nil, &CompileError{Pos: d.Args[2].Pos, Msg: "redirect: a raw {http.*} request-header token in the Location host is an open redirect — use the validated {host}/{host.base}/{host.sub} instead: " + quote(target)}
+	}
+	// A stray token after TARGET is almost always a typo (e.g. a second target or an
+	// unquoted space); surface it at check time rather than silently dropping it.
+	if len(d.Args) > 3 {
+		return nil, &CompileError{Pos: d.Args[3].Pos, Msg: "redirect: unexpected extra argument(s) after TARGET: " + quote(d.Args[3].Raw)}
+	}
 	return []redirectRule{{re: re, status: code, target: target}}, nil
 }
 
-// compileRedirectScoped parses the `redirect @scope… CODE TARGET` form: one or more
-// leading @matcher refs (OR'd into a scope) followed by the status and target. The
-// scope is the only selector — no path regex — so the TARGET interpolates the
-// request scalars ({host}/{path}/{query}/{uri}) but never $N captures.
+// compileRedirectScoped parses the two `@scope`-led redirect forms: one or more
+// leading @matcher refs (OR'd into a scope) followed EITHER by `CODE TARGET`
+// (scope-only — the scope is the sole selector, no $N captures) OR by
+// `PATH_REGEX CODE TARGET` (the combined form — the rule fires only when the scope
+// matches AND the path regex matches, and the submatches feed $1..$9 in TARGET).
+// The two are told apart by the count of args remaining after the leading refs.
 func compileRedirectScoped(d *cadishfile.Directive, matchers map[string]*matcher) ([]redirectRule, error) {
 	// Consume the leading run of @matcher refs as the scope.
 	sc, rest, err := leadingRefScope(d.Args, matchers)
@@ -123,7 +224,17 @@ func compileRedirectScoped(d *cadishfile.Directive, matchers map[string]*matcher
 		return nil, err
 	}
 	if len(rest) < 2 {
-		return nil, &CompileError{Pos: d.Pos, Msg: "redirect scoped form needs `@scope CODE TARGET`"}
+		return nil, &CompileError{Pos: d.Pos, Msg: "redirect scoped form needs `@scope CODE TARGET` (or `@scope PATH_REGEX CODE TARGET`)"}
+	}
+	// Combined form: a path regex precedes the CODE TARGET (≥3 trailing args). The
+	// scope-only form has exactly the `CODE TARGET` pair.
+	var re *regexp.Regexp
+	if len(rest) >= 3 {
+		re, err = regexp.Compile(rest[0].Raw)
+		if err != nil {
+			return nil, &CompileError{Pos: rest[0].Pos, Msg: "redirect: invalid path regex " + quote(rest[0].Raw) + ": " + err.Error()}
+		}
+		rest = rest[1:]
 	}
 	code, err := strconv.Atoi(rest[0].Raw)
 	if err != nil {
@@ -136,7 +247,15 @@ func compileRedirectScoped(d *cadishfile.Directive, matchers map[string]*matcher
 	if target == "" {
 		return nil, &CompileError{Pos: rest[1].Pos, Msg: "redirect: TARGET must be non-empty"}
 	}
-	return []redirectRule{{sc: sc, status: code, target: target}}, nil
+	if redirectTargetHasUnsafeHostToken(target) {
+		return nil, &CompileError{Pos: rest[1].Pos, Msg: "redirect: a raw {http.*} request-header token in the Location host is an open redirect — use the validated {host}/{host.base}/{host.sub} instead: " + quote(target)}
+	}
+	// A stray token after TARGET (in either the scope-only or the combined form) is
+	// almost always a typo; surface it instead of silently dropping it.
+	if len(rest) > 2 {
+		return nil, &CompileError{Pos: rest[2].Pos, Msg: "redirect: unexpected extra argument(s) after TARGET: " + quote(rest[2].Raw)}
+	}
+	return []redirectRule{{re: re, sc: sc, status: code, target: target}}, nil
 }
 
 // compileRedirectMap parses the `redirect CODE map { PFX -> NEWPFX … }` form.
@@ -243,6 +362,6 @@ func canonicalQuery(req *Request) string {
 		return ""
 	}
 	var b strings.Builder
-	writeCanonicalQuery(&b, req, false, nil)
+	writeCanonicalQuery(&b, req, false, nil, nil)
 	return b.String()
 }

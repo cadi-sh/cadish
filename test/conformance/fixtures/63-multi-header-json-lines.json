@@ -1,0 +1,32 @@
+{
+  "name": "63-multi-header-json-lines",
+  "cadishfile": "example.com {\n    @admin header_json X-Auth role admin\n    pass @admin\n\n    cache_ttl default ttl 60s\n\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": {
+        "method": "GET",
+        "host": "example.com",
+        "path": "/p",
+        "header": { "X-Auth": ["{}", "{\"role\":\"admin\"}"] }
+      },
+      "origin": {
+        "status": 200,
+        "header": { "Content-Type": ["text/html"] }
+      },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": {
+        "method": "GET",
+        "host": "example.com",
+        "path": "/p",
+        "header": { "X-Auth": ["{\"role\":\"admin\"}"] }
+      },
+      "origin": {
+        "status": 200,
+        "header": { "Content-Type": ["text/html"] }
+      },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

@@ -219,8 +219,9 @@ and `cadish check` reports `cache-key-no-default`.
 ## Directive → phase mapping
 
 `respond` `redirect` `purge` `route` `pass` `rewrite` are always RECV, as are the
-server-only security-gate directives `allow` `deny` `block` `rate_limit` `monitor`
-(evaluated first, in `EvalSecurity`; never projected to the edge). `cache_key` is KEY.
+server-only security-gate directives `allow` `deny` `block` `rate_limit`
+(evaluated first, in `EvalSecurity`; never projected to the edge). `monitor` is
+the parse-once toggle that flips that gate to log-only, so it is Setup, not RECV. `cache_key` is KEY.
 `cache_ttl` `storage` are ORIGIN. `strip_cookies` `cors` `replace` `encode` are
 DELIVER. A `header` directive is **request-phase if it appears before the KEY boundary**
 (the first of `cache_key`, `cache_ttl`, `storage`, `strip_cookies`, `cors`, `replace`,

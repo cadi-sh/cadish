@@ -5,8 +5,13 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cadi-sh/cadish/internal/config"
+	"github.com/cadi-sh/cadish/internal/metrics"
 )
 
 // postValidate POSTs src to /api/validate with the given token and decodes the
@@ -44,6 +49,54 @@ func TestSourceEndpoint(t *testing.T) {
 	}
 	if sr.Error != "" {
 		t.Errorf("unexpected error: %q", sr.Error)
+	}
+}
+
+// TestSourceEndpointNeverLeaksAbsolutePath proves /api/source returns only the base
+// filename in Path and routes a read error through stripPathFromError, so a token
+// holder cannot learn the host directory layout (#16 hardening, restored for the
+// sibling endpoint — R37). Mirrors handleConfig's stripping policy.
+func TestSourceEndpointNeverLeaksAbsolutePath(t *testing.T) {
+	dir := t.TempDir() // an absolute path with a recognizable directory prefix
+	// Success case: a readable config — Path must be the bare filename, not the abs path.
+	cfgPath := filepath.Join(dir, "Cadishfile")
+	if err := os.WriteFile(cfgPath, []byte("example.com {\n  cache_key url\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ac := &config.AdminConfig{Listen: "127.0.0.1:0", AuthToken: "secret", Metrics: true}
+	srv := New(ac, metrics.New(), fakeLive{}, nil, nil, cfgPath)
+	rec := do(t, srv, "GET", "/api/source", "secret")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	var sr sourceResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &sr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if sr.Path != "Cadishfile" {
+		t.Errorf("Path = %q, want bare filename %q", sr.Path, "Cadishfile")
+	}
+	if strings.Contains(sr.Path, dir) || strings.ContainsAny(sr.Path, `/\`) {
+		t.Errorf("Path leaks a directory: %q (dir %q)", sr.Path, dir)
+	}
+
+	// Error case: a non-existent config file — the os.ReadFile error embeds the abs
+	// path; it must be stripped to the base filename before reaching the caller.
+	missing := filepath.Join(dir, "nope", "Cadishfile")
+	srv2 := New(ac, metrics.New(), fakeLive{}, nil, nil, missing)
+	rec2 := do(t, srv2, "GET", "/api/source", "secret")
+	var sr2 sourceResponse
+	if err := json.Unmarshal(rec2.Body.Bytes(), &sr2); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if sr2.Error == "" {
+		t.Fatal("expected a read error for a missing config file")
+	}
+	if strings.Contains(sr2.Error, dir) {
+		t.Errorf("error string leaks the absolute directory: %q (dir %q)", sr2.Error, dir)
+	}
+	if strings.Contains(sr2.Path, dir) {
+		t.Errorf("Path leaks the absolute directory: %q (dir %q)", sr2.Path, dir)
 	}
 }
 

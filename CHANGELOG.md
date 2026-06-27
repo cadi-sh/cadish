@@ -4,6 +4,113 @@ All notable changes to cadish are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and cadish follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-06-27
+
+A batch of capabilities surfaced by consolidating a real multi-tier caching, TLS, and
+load-balancing stack into a single cadish process. Every one is **fail-closed and costs
+nothing when unused** — the request/response fast path is byte-for-byte unchanged unless you
+reach for the feature. All are mirrored in the
+Cloudflare-Workers edge tier where they apply (server-only ones are explicitly delegated),
+with Go↔JS conformance kept in lockstep.
+
+### Added
+- **Normalized cookie vary** — `classify {TOKEN} { derives_from cookie NAME… }` derives a
+  low-cardinality cache axis from per-user cookies, then **strips those cookies** and keys by
+  the normalized axis (the classic cardinality collapse, e.g. 1.2M → ~64 variations). The strip is the single
+  load-bearing safety mechanism: the origin sees an anonymous request and a per-user body can
+  never land under the shared key. Any cookie you don't declare-and-key still bypasses. An
+  explicit `derives_from cookie NAME… forward` (alias `keep`) keys by the axis but **forwards
+  the cookie to the origin unchanged** (for backends that personalize from the raw cookie) —
+  covered only when its token is in the selected key recipe; a loud `cookie-forward-uncollapsed`
+  warning flags the opt-in.
+- **WebSocket / `Upgrade` passthrough** — `upgrade @scope` opts a route into end-to-end
+  `Connection: Upgrade` tunnelling (socket.io, live, SSE-over-WS). Off the cache path;
+  reuses the routed upstream's health/sticky pick and transport; idle-timeout teardown; an
+  active-tunnel gauge (`cadish_upgrades_active`).
+- **Per-upstream origin-TLS control** — `tls_insecure` (skip origin certificate verification),
+  `ca_file <pem>` (verify against a private CA), and `alpn` (pin origin
+  ALPN). Default stays fully verifying; `tls_insecure` warns at `cadish check`; each upstream
+  is isolated (one insecure origin never relaxes verification for another).
+- **Origin-header-driven grace** — `cache_ttl … grace_from_header NAME` /
+  `max_stale_from_header NAME` (the literal stays as the fallback).
+- **Upstream-liveness probe** — the `upstream_healthy NAME…` matcher (true when a named pool
+  has a live backend); compose with `respond` for an L4/DNS health endpoint that returns
+  200/503 by pool liveness.
+- **Configurable DNS resolution** — per-upstream `resolve [<interval>] [nameserver <ip:port>…]`
+  for `dns://` upstreams (custom nameserver + re-resolve interval). Custom and system resolver
+  answers are both filtered against link-local/cloud-metadata addresses.
+- **Derived tokens in redirect targets** — `{classify.*}`, `{geo}`/`{geo.continent}`/
+  `{geo.region}`, `{client_ip}`, `{http.NAME}`, and `{proto}`/`{scheme}` now resolve inside a
+  `redirect` `Location` (the target host stays the validated host — the open-redirect defense
+  is preserved). A `redirect @scope PATH_REGEX CODE TARGET` form combines a matcher scope
+  **and** `$N` path-regex captures in one rule (e.g. language-conditioned bidirectional slug
+  translation, `couples↔parejas`).
+- **`{proto}` / `{scheme}` template token** — `https` when cadish terminated TLS, else `http`
+  (e.g. `header X-Forwarded-Proto {proto}`).
+- **Global inbound limits** — a top-level `server { maxconn N; read_timeout D; idle_timeout D }`
+  block (caps the inbound accept set; overrides the inbound timeouts).
+- **Cache-key query denylist** — `cache_key … query_strip NAME…`: key on the whole query
+  **minus** a name/glob denylist (`utm_* gclid …`) so tracking params stop fragmenting the
+  cache. The dual of `query_allow` (mutually exclusive with it).
+- **Response-header-scoped TTL** — `cache_ttl resp_header NAME VALUE …` branches freshness on
+  what the origin returned (e.g. `X-Powered-By: Express`), evaluated in the response phase.
+- **Opt out of client-forced revalidation** — `client_cache_control ignore` makes a site **not**
+  honor a request `Cache-Control: no-cache`/`max-age=0` (or `Pragma: no-cache`), so a browser
+  hard-refresh can't bust the shared cache and hammer the origin. Default (absent) still
+  honors it per RFC 9111 §5.2.1.4.
+- **Origin-authoritative caching of credentialed requests** — `cache_credentialed @scope`
+  opts a scope out of the safe-default credential bypass. Normally a request carrying a
+  `Cookie`/`Authorization` the key doesn't cover is never shared-cached; in this scope caching
+  becomes origin-authoritative. Storage is gated **solely by a per-response origin cache
+  signal** (an in-scope `cache_ttl … from_header NAME` firing, or an origin `max-age`/
+  `s-maxage`) — a static blanket TTL never authorizes it. When the signal fires, the response
+  is stored under the **shared** key with `Set-Cookie` and the weak control headers
+  (`no-store`/`private`/`no-cache`, `Pragma`, a past `Expires`) stripped from **both** the
+  stored entry and the delivered response; **no signal ⇒ never stored** (fail-closed), so a
+  per-user route that omits the marker is never shared-cached. The original cookies are
+  forwarded to the origin for authentication but never enter the cache key. A `strip_cookies`
+  rule over the same scope is a compile error, `cache_unsafe` cannot open an alternate store
+  path, and a `cache-credentialed-origin-trust` check warning flags the origin-trust
+  requirement. Mirrored at the edge (fail-closed when the scope cannot be projected).
+- **Reserved `/.cadish/readyz` warm-readiness probe** — a built-in readiness endpoint that
+  reports ready only after the ingress/gateway controller completes its first successful
+  reconcile, so a pod is not declared ready while still cold. It is served as 200/503 on plain
+  `:80` even in TLS-redirect mode (exempt from the HTTP→HTTPS redirect), so a Kubernetes
+  `httpGet` readiness probe is never masked by a 301. Controller readiness probes use it,
+  fixing rollout 502/404 when a pod became routable before it was warm.
+
+### Changed
+- A global-only block (`server`, `admin`, `proxy_protocol`, `strict_host`, `security`,
+  `access_log`) placed inside a **site body** is now a positioned error in both `cadish check`
+  and `cadish run` (previously silently ignored).
+
+### Fixed
+- A legitimately duplicated forward-covered cookie (same value sent more than once — e.g. a
+  domain-scoped and a host-scoped copy of one cookie) no longer forces a cache bypass: it is
+  keyed by its derived axis, so identical occurrences cache normally. A differing-value
+  duplicate, or a duplicate of a raw-value-keyed cookie, still bypasses (the same fix applies
+  at the edge).
+- A passed/uncached request now forwards the client's **original** cookies to the origin
+  (previously `cookie_allow`/`derives_from` stripped them before the pass/cache decision,
+  breaking auth/session on every `pass`ed per-user endpoint — a logged-in user read as GUEST).
+  Cacheable requests still normalize the cookie for the key; the same fix applies at the edge.
+- The origin control headers a `from_header` TTL/grace rule consumes (`X-Cache-Ttl`,
+  `X-Cache-Grace`, `X-Cache-Max-Stale`) are now stripped from the delivered response (and at
+  the edge) instead of leaking to the client.
+- A lone `to dns://host` upstream now loads (previously failed with a base-URL error).
+- **Multi-line site address lists no longer silently drop all-but-the-last line** — the parser
+  now reads the full list of comma-wrapped addresses, so a static TLS cert covers every
+  declared host (a comma-less wrap or a stray comma is a positioned parse error rather than a
+  silent truncation that broke SNI). `cadish check` also warns (`tls-cert-uncovered-address`)
+  when a static cert does not cover every declared address.
+
+### Security
+- The sandboxed `/api/validate` admin path never reads files from disk: `ca_file` is
+  structure-validated there and the PEM is loaded only at run time, preserving the
+  no-filesystem trust boundary (and a missing CA is a deploy-time warning, not a hard error).
+- The custom-nameserver and default DNS resolution paths both drop link-local and
+  cloud-metadata answers (incl. the AWS IPv6 IMDS endpoint).
+
 ## [0.2.0] — 2026-06-25
 
 **The first public release (beta).** cadish is a single static binary that consolidates
@@ -171,4 +278,5 @@ sweep hardened the surface:
 - Future module tracks (not in this release): an own-engine **WAF**, signed-URL inbound
   verification + HLS, and an eBPF/XDP L4 module.
 
+[0.2.1]: https://github.com/cadi-sh/cadish/releases/tag/v0.2.1
 [0.2.0]: https://github.com/cadi-sh/cadish/releases/tag/v0.2.0

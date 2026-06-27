@@ -1,0 +1,22 @@
+{
+  "name": "41-proto-token",
+  "cadishfile": "edge.example.com {\n    cache_key url\n    cache_ttl default ttl 10s\n\n    header X-Forwarded-Proto {proto}\n    header X-Scheme         {scheme}\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": {
+        "method": "GET", "host": "edge.example.com", "path": "/secure",
+        "tls": true
+      },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": {
+        "method": "GET", "host": "edge.example.com", "path": "/plain",
+        "tls": false
+      },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

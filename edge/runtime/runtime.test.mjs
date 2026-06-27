@@ -12,8 +12,9 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import assert from "node:assert";
-import { handle } from "./entry.js";
-import { EdgeCache } from "./cache-tiers.js";
+import { handle, buildIReq } from "./entry.js";
+import { IR_VERSION, evalRequest, canonicalHeaderKey } from "./interpreter.js";
+import { EdgeCache, isCacheableResponse } from "./cache-tiers.js";
 import { fetchOrigin, EDGE_TRUST_HEADERS } from "./origin.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -33,6 +34,64 @@ const COOKIE_ALLOW_HDR_IR = JSON.parse(readFileSync(join(genDir, "33-cookie-allo
 // 35 allow-lists `session` but does NOT key it (default key) — used to pin that the edge
 // BYPASSES an allow-listed-but-unkeyed cookie (a kept cookie must be keyed to cache).
 const COOKIE_ALLOW_UNKEYED_IR = JSON.parse(readFileSync(join(genDir, "35-cookie-allow-unkeyed.ir.json"), "utf8"));
+// 11 is the COOKIE-NORM fixture: `classify {ageverify} { derives_from cookie verified-prod
+// userType … }` + `cookie_allow` (strip-all) + `cache_key default host url {ageverify}`.
+// Used to pin that the edge derives the normalized axis from the ORIGINAL cookies, keys by
+// it, strips the axis cookies before the origin/credential check, and caches (no bypass).
+const COOKIE_NORM_IR = JSON.parse(readFileSync(join(genDir, "11-cookie-norm.ir.json"), "utf8"));
+// 44 is the Finding 1 (round-3) fixture: `@premium cookie premium 1` selects recipe A
+// (`cache_key @premium host url {tier}`) where {tier} `derives_from cookie premium`, plus a
+// `cache_key default host url cookie:uid`. The premium cookie is stripped post-key, so a
+// NAIVE re-selection of the recipe (on the stripped request) would land on the default
+// recipe and wrongly judge the unkeyed `uid` cookie covered → a cross-user store. Used to
+// pin that the edge judges credential coverage against the recipe that BUILT the key.
+const RECIPE_RESELECT_IR = JSON.parse(readFileSync(join(genDir, "44-recipe-reselect.ir.json"), "utf8"));
+// 45 is the COOKIE-NORM forward fixture: classify {axis} has a STRIP line
+// (`derives_from cookie StripMe`) AND a FORWARD line (`derives_from cookie KeepMe forward`),
+// `cookie_allow` (strip-all), `cache_key default host url {axis}`. Used to pin that the edge
+// STRIPS StripMe but FORWARDS KeepMe to origin (covered by {axis}), and still CACHES.
+const COOKIE_FORWARD_IR = JSON.parse(readFileSync(join(genDir, "45-cookie-forward.ir.json"), "utf8"));
+// 47 is the Finding 1 (SAFETY) scoped-forward leak fixture: @premium selects recipe A
+// (`cache_key @premium host url {tier}`) where {tier} derives_from cookie premium (strip),
+// while the FALLBACK default recipe B (`cache_key default host url {loyal}`) has a
+// `derives_from cookie loyalty forward` axis. The premium cookie is stripped post-key, so a
+// NAIVE re-selection of the FORWARD set on the stripped request lands on recipe B and marks
+// the allow-listed `loyalty` cookie "covered" — though recipe A (which built the key) has no
+// forward axis and does not key loyalty. Used to pin that the edge judges forward coverage
+// against the recipe that BUILT the key (must BYPASS), matching Go (pipeline.go:458).
+//
+// The leak gate itself is guarded in THREE places, defense in depth: (1) the "Finding 1
+// (forward variant)" handle() test below drives the real worker and asserts a cross-user MISS
+// (the load-bearing behavioral guard); (2) internal/pipeline/recipe_reselect_test.go pins the
+// Go BypassForCredentials path; and (3) the conformance fixture's derivedStripPostStrip /
+// derivedForwardPostStrip probes (decide() recomputes the strip/forward partition on the
+// post-strip request) — these FLIP if the gate ever regresses to a fresh selectKeyTokens, so
+// the fixture now distinguishes the bug from the fix instead of being byte-identical for both.
+const SCOPED_FORWARD_LEAK_IR = JSON.parse(readFileSync(join(genDir, "47-scoped-forward-leak.ir.json"), "utf8"));
+// 40 is the from_header-family fixture (`cache_ttl @api from_header X-Cache-Ttl
+// grace_from_header X-Cache-Grace max_stale_from_header X-Cache-Max-Stale`). Used to pin
+// (Finding 6) that the edge STRIPS those consumed control headers before deliver + store,
+// so the internal origin↔cache contract never leaks to the client — mirroring the server.
+const GRACE_FROM_HEADER_IR = JSON.parse(readFileSync(join(genDir, "40-grace-from-header.ir.json"), "utf8"));
+// 43 is the Finding 1 fixture: `redirect ^/go/(.*)$ 302 {proto}://{host}/landing/$1`.
+// Driven through the REAL worker entry (buildIReq) — NOT decide() directly — to pin that
+// an https:// inbound request resolves {proto} to "https" (the conformance fixture feeds
+// `tls:` straight to decide(), bypassing buildIReq, so it can't catch the adapter omission).
+const REDIRECT_PROTO_IR = JSON.parse(readFileSync(join(genDir, "43-redirect-proto-tls.ir.json"), "utf8"));
+// 60 is cache_credentialed (D101) + cookie_allow where the cache_ttl SIGNAL selector is
+// PATH-scoped (does NOT read a cookie): the common, parity-safe case. The stripped cookie
+// (`tracking`) is read by no response-phase matcher, so the edge (normalized cookie) and the
+// server (original cookie restored before EvalResponse) reach the SAME store decision.
+const CRED_COOKIE_NORM_IR = JSON.parse(readFileSync(join(genDir, "60-cache-credentialed-cookie-norm.ir.json"), "utf8"));
+// 61 is the (now-closed) cookie-norm signal case (D101 review): the cache_ttl signal selector
+// `@premium cookie tier premium` reads a cookie that `cookie_allow session` STRIPS. BOTH tiers
+// evaluate the signal against the NORMALIZED cookie (tier stripped), so the positive signal NEVER
+// fires and NEITHER stores — the edge worker always did this, and the Go server now forwards the
+// original cookie to ORIGIN ONLY (an origin-bound reqHeaderOp), keeping EvalResponse on the
+// normalized request, so it no longer over-caches a per-user body under the shared key. Parity is
+// pinned both ways — see the companion
+// internal/server/cache_credentialed_cookienorm_test.go (TestCredentialedCookieNormSignalParity).
+const CRED_COOKIE_NORM_SIGNAL_IR = JSON.parse(readFileSync(join(genDir, "61-cache-credentialed-cookie-norm-signal.ir.json"), "utf8"));
 
 // --- mocks ------------------------------------------------------------------
 
@@ -48,6 +107,9 @@ class MockCache {
     const e = this.map.get(req.url);
     if (!e) return undefined;
     return new Response(e.body, { status: e.status, headers: e.headers });
+  }
+  async delete(req) {
+    return this.map.delete(req.url);
   }
 }
 
@@ -77,6 +139,9 @@ class MockKV {
       return { value: null, metadata: null };
     }
     return { value: e.v, metadata: e.metadata };
+  }
+  async delete(k) {
+    return this.m.delete(k);
   }
 }
 
@@ -161,6 +226,104 @@ await test("MISS then HIT (store in L1, second read is fresh)", async () => {
   assert.equal(fetchImpl.calls, 1, "a fresh HIT must not hit the origin again");
 });
 
+// aeAwareOrigin models a content-negotiating origin: it returns a gzip-ENCODED body to a
+// client that accepts gzip and an IDENTITY body otherwise, always advertising
+// `Vary: Accept-Encoding`. This is what any compressing origin behind the edge does.
+function aeAwareOrigin() {
+  const impl = async (_url, init) => {
+    impl.calls++;
+    const ae = (init && init.headers && init.headers.get("Accept-Encoding")) || "";
+    if (/gzip/i.test(ae)) {
+      return new Response("GZIPBODY", {
+        status: 200,
+        headers: { "Content-Type": "text/html", "Content-Encoding": "gzip", Vary: "Accept-Encoding" },
+      });
+    }
+    return new Response("PLAINBODY", {
+      status: 200,
+      headers: { "Content-Type": "text/html", Vary: "Accept-Encoding" },
+    });
+  };
+  impl.calls = 0;
+  return impl;
+}
+
+await test("EDGE ENCODING GUARD: a stored Content-Encoding variant is never served to a client that doesn't accept it (Go serveFromCache parity)", async () => {
+  // The edge keys its cache on the Accept-Encoding-AGNOSTIC logical key (Vary: Accept-Encoding
+  // is treated as "covered" by the encode layer). So a gzip-encoded body cached for a gzip
+  // client must NOT be handed to an identity-only client — that delivers an undecodable body.
+  // The Go server guards exactly this in serveFromCache (handler.go ~690): a stored copy whose
+  // Content-Encoding the client does not accept falls through to a fresh origin negotiation.
+  clock.t = 1_000_000;
+  const cache = freshCache();
+  const fetchImpl = aeAwareOrigin();
+  const deps = { ir: IR, cache, fetchImpl, originBase: "http://o" };
+
+  // Client A accepts gzip → origin returns a gzip body → edge stores it under the logical key.
+  const ctxA = mockCtx();
+  const a = await handle(req("/catalog/a", { headers: { "Accept-Encoding": "gzip" } }), {}, ctxA, deps);
+  await ctxA.drain();
+  assert.equal(a.headers.get("X-Cache"), "MISS");
+  assert.equal(a.headers.get("Content-Encoding"), "gzip", "client A is served the gzip variant");
+  assert.equal(fetchImpl.calls, 1);
+
+  // Client B accepts NO compression (identity only). The stored copy is gzip-encoded; serving it
+  // would be undecodable, so the edge must re-fetch origin (a fresh negotiation), never HIT.
+  const b = await handle(req("/catalog/a", { headers: { "Accept-Encoding": "identity" } }), {}, mockCtx(), deps);
+  assert.equal(fetchImpl.calls, 2, "an identity-only client must NOT be served the stored gzip variant — re-fetch origin");
+  assert.notEqual(b.headers.get("Content-Encoding"), "gzip", "must never deliver a gzip body to an identity-only client");
+});
+
+await test("UNSAFE METHOD (POST) is never stored/served at the edge — Go parity (handler.go isSafeMethod)", async () => {
+  // Finding 3: an anonymous POST under `cache_ttl default` (EDGE_IR caches `/` and does NOT
+  // `pass` POST) must NOT be stored at the edge — a 2nd identical anonymous POST still reaches
+  // origin (it can never be a cache HIT), exactly like the Go server (doStore + serveFromCache
+  // are both gated on isSafeMethod). Without the guard the first POST would store under the
+  // cacheable entry and the second would HIT without the side-effect reaching origin.
+  clock.t = 1_000_000;
+  const cache = freshCache();
+  const fetchImpl = originStub(200, { "Content-Type": "text/html" });
+  const deps = { ir: EDGE_IR, cache, fetchImpl, originBase: "http://o" };
+
+  const ctx1 = mockCtx();
+  const p1 = await handle(req("/", { method: "POST" }), {}, ctx1, deps);
+  await ctx1.drain();
+  assert.equal(p1.headers.get("X-Cache"), "MISS", "a POST is never served from cache");
+  assert.equal(fetchImpl.calls, 1);
+
+  const ctx2 = mockCtx();
+  const p2 = await handle(req("/", { method: "POST" }), {}, ctx2, deps);
+  await ctx2.drain();
+  assert.equal(p2.headers.get("X-Cache"), "MISS", "a 2nd POST is still a MISS (nothing stored)");
+  assert.equal(fetchImpl.calls, 2, "a 2nd identical POST must reach origin — unsafe methods never HIT the edge");
+});
+
+await test("a successful POST invalidates the sibling GET entry (RFC 9111 §4.4)", async () => {
+  // After a 2xx/3xx write the next GET to the same URI must re-fetch the post-write body
+  // rather than serve the stale pre-write copy — mirroring the Go server's §4.4 forget.
+  clock.t = 1_000_000;
+  const cache = freshCache();
+  const fetchImpl = originStub(200, { "Content-Type": "text/html" });
+  const deps = { ir: EDGE_IR, cache, fetchImpl, originBase: "http://o" };
+
+  // Prime a cacheable GET (now FRESH in L1).
+  const ctxG = mockCtx();
+  const g1 = await handle(req("/"), {}, ctxG, deps);
+  await ctxG.drain();
+  assert.equal(g1.headers.get("X-Cache"), "MISS");
+  const g2 = await handle(req("/"), {}, mockCtx(), deps);
+  assert.equal(g2.headers.get("X-Cache"), "HIT", "the GET is cached before the write");
+
+  // A successful POST to the same URI forgets the sibling GET entry.
+  const ctxP = mockCtx();
+  await handle(req("/", { method: "POST" }), {}, ctxP, deps);
+  await ctxP.drain();
+
+  // The next GET re-fetches (MISS, not the stale HIT).
+  const g3 = await handle(req("/"), {}, mockCtx(), deps);
+  assert.equal(g3.headers.get("X-Cache"), "MISS", "the sibling GET entry was invalidated by the successful POST");
+});
+
 await test("cookie_allow: edge strips non-allowed cookies (origin never sees the session) and caches per allowed cookie", async () => {
   clock.t = 1_000_000;
   const cache = freshCache();
@@ -222,6 +385,160 @@ await test("cookie_allow + header:Cookie: the edge key reads the FILTERED cookie
   assert.equal(rb.headers.get("X-Cache"), "HIT", "a differing STRIPPED cookie must not change the key");
 });
 
+await test("derives_from: the edge derives→strips the axis cookies, keys the normalized token, and caches an anonymous origin request", async () => {
+  clock.t = 1_000_000;
+  const cache = freshCache();
+  const seen = [];
+  const fetchImpl = Object.assign(
+    async (_url, init) => {
+      seen.push((init && init.headers && init.headers.get("Cookie")) || "");
+      return new Response("body", { status: 200, headers: { "Content-Type": "text/html" } });
+    },
+    { calls: 0 },
+  );
+  const deps = { ir: COOKIE_NORM_IR, cache, fetchImpl, originBase: "http://o" };
+
+  // A registered user: {ageverify} derives to 1 from userType, then verified-prod/userType
+  // are stripped before the origin (anonymous upstream) and the response CACHES.
+  const ctxA = mockCtx();
+  const ra = await handle(req("/p", { headers: { Cookie: "userType=registered; _ga=X" } }), {}, ctxA, deps);
+  await ctxA.drain();
+  assert.equal(ra.headers.get("X-Cache"), "MISS", "first derives_from request is a cacheable MISS (not a bypass)");
+  const last = seen[seen.length - 1];
+  assert.ok(!/userType/.test(last) && !/verified-prod/.test(last), `origin saw an un-stripped axis cookie: ${last}`);
+
+  // A second registered user (different tracking cookie) shares the normalized entry → HIT.
+  const rb = await handle(req("/p", { headers: { Cookie: "userType=registered; _ga=Y" } }), {}, mockCtx(), deps);
+  assert.equal(rb.headers.get("X-Cache"), "HIT", "same normalized axis shares the entry across users");
+
+  // A DIFFERENT axis (verified-prod=1 → ageverify 0) lands on a DIFFERENT entry → MISS.
+  const rc = await handle(req("/p", { headers: { Cookie: "verified-prod=1" } }), {}, mockCtx(), deps);
+  assert.equal(rc.headers.get("X-Cache"), "MISS", "a different normalized axis is a distinct cache entry");
+});
+
+await test("forward mode: the edge FORWARDS the forward cookie to origin (not stripped), strips the strip cookie, keys the axis, and CACHES", async () => {
+  clock.t = 1_000_000;
+  const cache = freshCache();
+  const seen = [];
+  const fetchImpl = Object.assign(
+    async (_url, init) => {
+      seen.push((init && init.headers && init.headers.get("Cookie")) || "");
+      return new Response("body", { status: 200, headers: { "Content-Type": "text/html" } });
+    },
+    { calls: 0 },
+  );
+  const counted = Object.assign(async (...a) => (counted.calls++, fetchImpl(...a)), { calls: 0 });
+  const deps = { ir: COOKIE_FORWARD_IR, cache, fetchImpl: counted, originBase: "http://o" };
+
+  // StripMe (strip) is removed; KeepMe (forward) is FORWARDED to origin; _ga (not allow-
+  // listed) is stripped. {axis}=1 (StripMe row). The forward cookie is covered → CACHES.
+  const ctxA = mockCtx();
+  const ra = await handle(req("/p", { headers: { Cookie: "StripMe=yes; KeepMe=yes; _ga=X" } }), {}, ctxA, deps);
+  await ctxA.drain();
+  assert.equal(ra.headers.get("X-Cache"), "MISS", "first forward request is a cacheable MISS (covered, not a bypass)");
+  const last = seen[seen.length - 1];
+  assert.match(last, /KeepMe=yes/, `the forward cookie must be FORWARDED to origin: ${last}`);
+  assert.ok(!/StripMe/.test(last), `the strip cookie must NOT reach origin: ${last}`);
+  assert.ok(!/_ga/.test(last), `a non-allow-listed cookie must be stripped: ${last}`);
+
+  // A second request with the SAME axis HITs the shared entry (it cached).
+  const rb = await handle(req("/p", { headers: { Cookie: "StripMe=yes; KeepMe=yes; _ga=Y" } }), {}, mockCtx(), deps);
+  assert.equal(rb.headers.get("X-Cache"), "HIT", "the forward response cached → same axis HITs");
+
+  // A different axis (KeepMe row → {axis}=2) is a DISTINCT entry → MISS, KeepMe still forwarded.
+  const rc = await handle(req("/p", { headers: { Cookie: "KeepMe=yes" } }), {}, mockCtx(), deps);
+  assert.equal(rc.headers.get("X-Cache"), "MISS", "a different axis is a distinct cache entry");
+  assert.match(seen[seen.length - 1], /KeepMe=yes/, "the forward cookie is forwarded on the distinct-axis request too");
+});
+
+await test("SPEC-DUP-COOKIE (edge): a forward-covered cookie sent twice with IDENTICAL values CACHES; with DIFFERING values BYPASSES (Go==JS)", async () => {
+  clock.t = 1_000_000;
+  // Same-value duplicate: KeepMe=yes; KeepMe=yes → forward-covered axis is occurrence-
+  // independent and the origin sees two identical values → covered → caches (MISS then HIT).
+  {
+    const cache = freshCache();
+    const fetchImpl = originStub(200, { "Content-Type": "text/html" });
+    const deps = { ir: COOKIE_FORWARD_IR, cache, fetchImpl, originBase: "http://o" };
+    const ctxA = mockCtx();
+    const ra = await handle(req("/p", { headers: { Cookie: "KeepMe=yes; KeepMe=yes" } }), {}, ctxA, deps);
+    await ctxA.drain();
+    assert.equal(ra.headers.get("X-Cache"), "MISS", "same-value forward-covered duplicate is a cacheable MISS (not a bypass)");
+    const rb = await handle(req("/p", { headers: { Cookie: "KeepMe=yes; KeepMe=yes" } }), {}, mockCtx(), deps);
+    assert.equal(rb.headers.get("X-Cache"), "HIT", "the same-value duplicate cached → second request HITs");
+    assert.equal(fetchImpl.calls, 1, "only the first request reached origin (it cached)");
+  }
+  // Differing-value duplicate: KeepMe=yes; KeepMe=no → ambiguous axis → BYPASS (nothing
+  // cached; a repeat of the identical request still MISSes and re-fetches origin).
+  {
+    const cache = freshCache();
+    const fetchImpl = originStub(200, { "Content-Type": "text/html" });
+    const deps = { ir: COOKIE_FORWARD_IR, cache, fetchImpl, originBase: "http://o" };
+    const ctxA = mockCtx();
+    const ra = await handle(req("/p", { headers: { Cookie: "KeepMe=yes; KeepMe=no" } }), {}, ctxA, deps);
+    await ctxA.drain();
+    assert.equal(ra.headers.get("X-Cache"), "MISS", "differing-value duplicate bypasses (uncached MISS)");
+    const rb = await handle(req("/p", { headers: { Cookie: "KeepMe=yes; KeepMe=no" } }), {}, mockCtx(), deps);
+    assert.equal(rb.headers.get("X-Cache"), "MISS", "a bypass stores nothing → the repeat still MISSes");
+    assert.equal(fetchImpl.calls, 2, "both differing-value requests bypass to origin (nothing cached)");
+  }
+});
+
+await test("Finding 1: a recipe selector that reads a derives_from cookie does not leak — coverage is judged against the recipe that BUILT the key", async () => {
+  // @premium selects recipe A (host url {tier}); {tier} derives_from premium, so premium is
+  // stripped post-key. uid stays (allow-listed, unkeyed under recipe A). A naive re-selection
+  // on the stripped request lands on the default recipe (host url cookie:uid) and would judge
+  // uid covered → store alice's body under recipe A's uid-agnostic key → bob would HIT it.
+  clock.t = 1_000_000;
+  const cache = freshCache();
+  const seen = [];
+  const fetchImpl = Object.assign(
+    async (_url, init) => {
+      const c = (init && init.headers && init.headers.get("Cookie")) || "";
+      seen.push(c);
+      return new Response("body-for:" + c, { status: 200, headers: { "Content-Type": "text/html" } });
+    },
+    { calls: 0 },
+  );
+  const counted = Object.assign(async (...a) => (counted.calls++, fetchImpl(...a)), { calls: 0 });
+  const deps = { ir: RECIPE_RESELECT_IR, cache, fetchImpl: counted, originBase: "http://o" };
+
+  const ctxA = mockCtx();
+  const a = await handle(req("/p", { headers: { Cookie: "premium=1; uid=alice" } }), {}, ctxA, deps);
+  await ctxA.drain();
+  assert.equal(a.headers.get("X-Cache"), "MISS", "alice (unkeyed uid under recipe A) must bypass, not cache");
+  assert.match(seen[seen.length - 1], /uid=alice/, "origin sees alice's uid (forwarded, premium stripped)");
+
+  // Bob: same {tier}=p bucket, DIFFERENT uid. If the post-strip recipe had been used he would
+  // HIT alice's stored body. He must MISS and fetch his own.
+  const b = await handle(req("/p", { headers: { Cookie: "premium=1; uid=bob" } }), {}, mockCtx(), deps);
+  assert.equal(b.headers.get("X-Cache"), "MISS", "CROSS-USER LEAK: bob must not HIT alice's entry (coverage judged against recipe A, no uid)");
+  assert.equal(counted.calls, 2, "both premium users bypass to origin; nothing cached cross-user");
+});
+
+await test("Finding 1 (forward variant): a fallback recipe's forward axis does not leak — forward coverage is judged against the recipe that BUILT the key", async () => {
+  // @premium selects recipe A (host url {tier}); {tier} derives_from premium, so premium is
+  // stripped post-key. loyalty stays (allow-listed). The DEFAULT recipe B (host url {loyal})
+  // FORWARDS+covers loyalty via {loyal}. A naive re-selection of the FORWARD set on the
+  // stripped request lands on recipe B and judges loyalty covered → store user A's body under
+  // recipe A's loyalty-agnostic key → user B (same premium, different loyalty) would HIT it.
+  // The edge must judge forward coverage against recipe A (no forward axis) → BYPASS.
+  clock.t = 1_000_000;
+  const cache = freshCache();
+  const fetchImpl = originStub(200, { "Content-Type": "text/html" });
+  const deps = { ir: SCOPED_FORWARD_LEAK_IR, cache, fetchImpl, originBase: "http://o" };
+
+  const ctxA = mockCtx();
+  const a = await handle(req("/p", { headers: { Cookie: "premium=1; loyalty=gold" } }), {}, ctxA, deps);
+  await ctxA.drain();
+  assert.equal(a.headers.get("X-Cache"), "MISS", "user A (unkeyed loyalty under recipe A) must bypass, not cache");
+
+  // User B: same {tier}=p bucket, DIFFERENT loyalty. If recipe B's forward coverage had been
+  // (wrongly) used, A's body would be stored under recipe A's key and B would HIT it. B must MISS.
+  const b = await handle(req("/p", { headers: { Cookie: "premium=1; loyalty=silver" } }), {}, mockCtx(), deps);
+  assert.equal(b.headers.get("X-Cache"), "MISS", "CROSS-USER LEAK: B must not HIT A's entry (forward coverage judged against recipe A, no loyalty)");
+  assert.equal(fetchImpl.calls, 2, "both users bypass to origin; nothing cached cross-user");
+});
+
 await test("cookie_allow: an allow-listed but UNKEYED cookie bypasses the edge cache (no cross-user store)", async () => {
   // The kept `session` cookie is forwarded to origin but the key does NOT capture it, so the
   // edge must bypass — never store user A's session body under a session-agnostic key.
@@ -237,6 +554,29 @@ await test("cookie_allow: an allow-listed but UNKEYED cookie bypasses the edge c
   const b = await handle(req("/page", { headers: { Cookie: "session=BBB" } }), {}, mockCtx(), deps);
   assert.equal(b.headers.get("X-Cache"), "MISS", "an unkeyed allow-listed cookie must bypass, not HIT a stored entry");
   assert.equal(fetchImpl.calls, 2, "both unkeyed-cookie requests bypass to origin (nothing cached cross-user)");
+});
+
+await test("SPEC-PASS-FORWARDS-COOKIES: a credential-bypassed (uncached) edge request forwards the ORIGINAL cookies to origin", async () => {
+  // The kept `session` is unkeyed → the request bypasses the edge cache (credentialed). Because
+  // NOTHING is cached, the cookie_allow strip — a pure cache-key normalization — must NOT reach
+  // the origin: the origin sees the FULL original Cookie (the kept `session` AND the stripped
+  // `_ga`), so a `pass`ed per-user endpoint can authenticate instead of reading the user as
+  // GUEST. Go==JS parity with TestCredentialBypassForwardsOriginalCookie (the Go pass branch).
+  clock.t = 1_000_000;
+  const cache = freshCache();
+  const seen = [];
+  const fetchImpl = Object.assign(
+    async (_url, init) => {
+      seen.push((init && init.headers && init.headers.get("Cookie")) || "");
+      return new Response("body", { status: 200, headers: { "Content-Type": "text/html" } });
+    },
+    { calls: 0 },
+  );
+  const deps = { ir: COOKIE_ALLOW_UNKEYED_IR, cache, fetchImpl, originBase: "http://o" };
+
+  const r = await handle(req("/page", { headers: { Cookie: "session=AAA; _ga=X" } }), {}, mockCtx(), deps);
+  assert.equal(r.headers.get("X-Cache"), "MISS", "an unkeyed allow-listed cookie bypasses (never cached)");
+  assert.equal(seen[seen.length - 1], "session=AAA; _ga=X", "the bypass path must forward the ORIGINAL cookies, not the cookie_allow-filtered (session=AAA) value");
 });
 
 await test("cookie_allow: SWR revalidation re-stores the entry (post-grace requests stay cached)", async () => {
@@ -536,7 +876,7 @@ await test("stale-on-error within max_stale salvages a past-grace copy (D70)", a
   // A small synthetic IR: ttl 1s, grace 1s, max_stale 24h — so a copy past grace but
   // within max_stale is salvageable, while one past max_stale is not.
   const msIR = {
-    irVersion: 4,
+    irVersion: IR_VERSION,
     site: { hosts: ["example.com"] },
     upstream: {},
     matchers: {},
@@ -577,7 +917,7 @@ await test("origin failure with no cached copy returns 502", async () => {
 // no-match (bare 502), and precedence (salvage wins).
 function onErrorIR() {
   return {
-    irVersion: 4,
+    irVersion: IR_VERSION,
     site: { hosts: ["example.com"] },
     upstream: {},
     matchers: { api: { kind: "path", patterns: ["/api/*"] } },
@@ -631,7 +971,7 @@ await test("D76: a salvageable stale copy WINS over respond on_error (precedence
 
 function replaceIR() {
   return {
-    irVersion: 4,
+    irVersion: IR_VERSION,
     site: { hosts: ["example.com"] },
     upstream: {},
     matchers: { html: { kind: "content_type", contentTypes: ["text/html"], responsePhase: true } },
@@ -763,7 +1103,7 @@ await test("cacheKeyHash matches the canonical sha256 prefix (Go/shell parity)",
 // a pass. Uses a small inline IR so the header marker is present.
 await test("worker emits X-Cache-Key (hash) on MISS+HIT, omits on pass", async () => {
   const ir = {
-    irVersion: 4,
+    irVersion: IR_VERSION,
     site: { hosts: ["ck.local"] },
     upstream: { to: "backend" },
     matchers: { dyn: { kind: "path", patterns: ["/api/*"] } },
@@ -795,6 +1135,74 @@ await test("worker emits X-Cache-Key (hash) on MISS+HIT, omits on pass", async (
   // pass path → no key → header omitted.
   const r3 = await handle(mkReq("/api/x"), {}, mockCtx(), { ir, cache, fetchImpl, originBase: "http://o" });
   assert.equal(r3.headers.get("X-Cache-Key"), null, "pass omits the cache-key header");
+});
+
+// cache_credentialed (D101): the worker makes caching ORIGIN-AUTHORITATIVE for a matching
+// credentialed request — it does NOT credential-bypass it, forwards the ORIGINAL cookies to
+// origin, and stores under the SHARED key on a positive X-Cache-Ttl signal (Set-Cookie
+// hard-refused). Loads the generated fixture-59 IR so the worker path matches Go==JS exactly.
+await test("worker cache_credentialed: forwards cookie, shares HIT, refuses Set-Cookie", async () => {
+  const ir = JSON.parse(readFileSync(join(here, "..", "..", "test", "conformance", "generated", "59-cache-credentialed.ir.json"), "utf8"));
+
+  // (a) Positive signal: a logged-in request caches under the shared key; the origin saw the
+  // ORIGINAL session cookie; a different cookie HITs the same entry (origin hit only once).
+  let seenCookie = null;
+  const okFetch = async (_url, init) => {
+    seenCookie = new Headers(init.headers).get("Cookie");
+    okFetch.calls++;
+    return new Response("BODY", { status: 200, headers: { "X-Cache-Ttl": "60", "Pragma": "no-cache", "Cache-Control": "no-store, private" } });
+  };
+  okFetch.calls = 0;
+  const cache = freshCache();
+  const mk = (cookie) => new Request("https://example.com/v3/readmodel/cache/home", { method: "GET", headers: { Cookie: cookie } });
+
+  const ctx1 = mockCtx();
+  const r1 = await handle(mk("session=alice"), {}, ctx1, { ir, cache, fetchImpl: okFetch, originBase: "http://o" });
+  await ctx1.drain();
+  assert.equal(r1.headers.get("X-Cache"), "MISS", "first is a MISS");
+  assert.equal(seenCookie, "session=alice", "origin must receive the ORIGINAL cookie (origin auth)");
+  assert.equal(r1.headers.get("Pragma"), null, "Pragma stripped on the positive-signal store");
+  assert.notEqual(r1.headers.get("Cache-Control"), "no-store, private", "weak Cache-Control force-overridden");
+
+  const r2 = await handle(mk("session=bob"), {}, mockCtx(), { ir, cache, fetchImpl: okFetch, originBase: "http://o" });
+  assert.equal(r2.headers.get("X-Cache"), "HIT", "a different user's cookie HITs the shared entry");
+  assert.equal(okFetch.calls, 1, "origin fetched once — the 2nd request is a shared HIT");
+
+  // (b) SAFETY CRUX — Set-Cookie + X-Cache-Ttl: the positive signal STORES it under the shared
+  // key with the Set-Cookie STRIPPED; the MISS delivery carries no Set-Cookie, and a 2nd
+  // request (different cookie) HITs the shared object and serves ZERO Set-Cookie (never stored).
+  const scFetch = async () => {
+    scFetch.calls++;
+    return new Response("BODY", { status: 200, headers: { "X-Cache-Ttl": "60", "Set-Cookie": "track=for-alice; Path=/", "Cache-Control": "no-store" } });
+  };
+  scFetch.calls = 0;
+  const cache2 = freshCache();
+  const mkSC = (c) => new Request("https://example.com/v3/readmodel/cache/onlineusersnumber", { method: "GET", headers: { Cookie: c } });
+  const ctxA = mockCtx();
+  const rA = await handle(mkSC("session=alice"), {}, ctxA, { ir, cache: cache2, fetchImpl: scFetch, originBase: "http://o" });
+  await ctxA.drain();
+  assert.equal(rA.headers.get("X-Cache"), "MISS", "Set-Cookie + X-Cache-Ttl is STORED (MISS)");
+  assert.equal(rA.headers.get("Set-Cookie"), null, "Set-Cookie stripped from the delivered MISS");
+  const rB = await handle(mkSC("session=bob"), {}, mockCtx(), { ir, cache: cache2, fetchImpl: scFetch, originBase: "http://o" });
+  assert.equal(rB.headers.get("X-Cache"), "HIT", "a different user HITs the shared object");
+  assert.equal(rB.headers.get("Set-Cookie"), null, "the cached object carries ZERO Set-Cookie (no cross-user cookie leak)");
+  assert.equal(scFetch.calls, 1, "stored once — the 2nd is a shared HIT");
+
+  // (c) Set-Cookie WITHOUT a signal (the per-user favorites case) → not stored, refetched.
+  const noSig = async () => {
+    noSig.calls++;
+    return new Response("BODY", { status: 200, headers: { "Set-Cookie": "session=fresh; Path=/" } });
+  };
+  noSig.calls = 0;
+  const cache3 = freshCache();
+  const mkFav = () => new Request("https://example.com/v3/readmodel/cache/favorites", { method: "GET", headers: { Cookie: "session=alice" } });
+  for (let i = 0; i < 2; i++) {
+    const ctx = mockCtx();
+    const r = await handle(mkFav(), {}, ctx, { ir, cache: cache3, fetchImpl: noSig, originBase: "http://o" });
+    await ctx.drain();
+    assert.notEqual(r.headers.get("X-Cache"), "HIT", "a no-signal Set-Cookie response must never be shared-cached");
+  }
+  assert.equal(noSig.calls, 2, "no-signal response refetched per request (never stored)");
 });
 
 // --- KV guardrail tests (W2: kv_ttl, kv_max_bytes, cross-POP, TTL-only) ------
@@ -962,7 +1370,7 @@ await test("security fix A: client X-Cadish-Device is not used in the cache key"
   // Build a minimal IR that uses {device} as a cache key token so any
   // device leakage would produce distinct keys and a cache miss.
   const deviceIR = {
-    irVersion: 4,
+    irVersion: IR_VERSION,
     site: { hosts: ["dev.local"] },
     upstream: { to: "backend" },
     matchers: {},
@@ -1135,7 +1543,7 @@ await test("security fix C: EDGE_TRUST_HEADERS includes CF-IPCountry", () => {
 await test("BUG-1: lifted (?i) regex compiles + matches case-insensitively, no throw", async () => {
   const { decide } = await import("./interpreter.js");
   const ir = {
-    irVersion: 4,
+    irVersion: IR_VERSION,
     site: { hosts: ["example.com"] },
     upstream: { to: "backend" },
     matchers: { bypass: { kind: "path_regex", regex: "^/(atvpanel|admin)", regexFlags: "i" } },
@@ -1168,7 +1576,7 @@ await test("BUG-1: lifted (?i) regex compiles + matches case-insensitively, no t
 await test("BUG-1: untranslatable regex matcher fails closed (no throw, no match)", async () => {
   const { decide } = await import("./interpreter.js");
   const ir = {
-    irVersion: 4,
+    irVersion: IR_VERSION,
     site: { hosts: ["x"] },
     upstream: { to: "backend" },
     matchers: { bad: { kind: "path_regex", regexUntranslatable: true } },
@@ -1188,7 +1596,7 @@ await test("BUG-1: untranslatable regex matcher fails closed (no throw, no match
 await test("Fix #1: serverOnly matcher fails closed (never matches)", async () => {
   const { decide } = await import("./interpreter.js");
   const ir = {
-    irVersion: 4,
+    irVersion: IR_VERSION,
     site: { hosts: ["x"] },
     upstream: { to: "backend" },
     // A serverOnly matcher whose underlying shape WOULD match if it were evaluated
@@ -1203,6 +1611,226 @@ await test("Fix #1: serverOnly matcher fails closed (never matches)", async () =
   };
   const d = decide(ir, { method: "GET", host: "x", path: "/anything", origin: { status: 0 }, cacheStatus: "MISS" });
   assert.equal(d.request.pass, false, "serverOnly matcher must fail closed (not match)");
+});
+
+await test("from_header: edge strips consumed X-Cache-Ttl/Grace/Max-Stale on deliver AND store (no leak)", async () => {
+  clock.t = 1_000_000;
+  const cache = freshCache();
+  const fetchImpl = originStub(200, {
+    "Content-Type": "text/html",
+    "X-Cache-Ttl": "300",
+    "X-Cache-Grace": "5m",
+    "X-Cache-Max-Stale": "30m",
+  });
+  const deps = { ir: GRACE_FROM_HEADER_IR, cache, fetchImpl, originBase: "http://o" };
+
+  // MISS: the delivered response must NOT carry the consumed control headers.
+  const ctx = mockCtx();
+  const r1 = await handle(req("/api/all"), {}, ctx, deps);
+  await ctx.drain();
+  assert.equal(r1.headers.get("X-Cache"), "MISS");
+  for (const h of ["X-Cache-Ttl", "X-Cache-Grace", "X-Cache-Max-Stale"]) {
+    assert.equal(r1.headers.get(h), null, `MISS leaked ${h} to the client`);
+  }
+
+  // HIT: the STORED copy was stripped too, so a cache hit also carries none.
+  const r2 = await handle(req("/api/all"), {}, mockCtx(), deps);
+  assert.equal(r2.headers.get("X-Cache"), "HIT");
+  for (const h of ["X-Cache-Ttl", "X-Cache-Grace", "X-Cache-Max-Stale"]) {
+    assert.equal(r2.headers.get(h), null, `HIT replayed ${h} from the stored copy`);
+  }
+});
+
+await test("buildIReq: an https inbound request resolves {proto} to https (real worker adapter)", async () => {
+  // Drive the REAL worker entry with an https:// URL (req() builds https://example.com/…).
+  // The redirect rule emits {proto}://{host}/landing/$1, so the Location's scheme is the
+  // resolved {proto}. Before the buildIReq fix this came back http:// (an HTTPS→HTTP
+  // downgrade) because the adapter built newRequest WITHOUT a tls/scheme field.
+  const r = await handle(req("/go/home"), {}, mockCtx(), { ir: REDIRECT_PROTO_IR });
+  assert.equal(r.status, 302, "redirect rule must fire");
+  const loc = r.headers.get("Location");
+  assert.ok(loc && loc.startsWith("https://"), `{proto} must resolve to https on a TLS request, got Location=${loc}`);
+
+  // And the http:// counterpart still resolves {proto} to http (no over-correction).
+  const rPlain = await handle(new Request("http://example.com/go/home"), {}, mockCtx(), { ir: REDIRECT_PROTO_IR });
+  assert.equal(rPlain.status, 302);
+  const locPlain = rPlain.headers.get("Location");
+  assert.ok(locPlain && locPlain.startsWith("http://") && !locPlain.startsWith("https://"), `{proto} must stay http on a plaintext request, got Location=${locPlain}`);
+});
+
+await test("R20: cache_unsafe lets the store guard cache a private/no-store response; Set-Cookie still never caches", async () => {
+  const priv = () => new Response("B", { status: 200, headers: { "Cache-Control": "private, max-age=60" } });
+  const noStore = () => new Response("B", { status: 200, headers: { "Cache-Control": "no-store" } });
+  const setCookie = () => new Response("B", { status: 200, headers: { "Cache-Control": "private", "Set-Cookie": "s=1" } });
+
+  // Default (cache_unsafe=false): private/no-store refused, mirroring the old guard.
+  assert.equal(isCacheableResponse(priv(), false), false, "private must be refused without cache_unsafe");
+  assert.equal(isCacheableResponse(noStore(), false), false, "no-store must be refused without cache_unsafe");
+  // cache_unsafe=true: private/no-store now cacheable (parity with the server).
+  assert.equal(isCacheableResponse(priv(), true), true, "private must cache under cache_unsafe");
+  assert.equal(isCacheableResponse(noStore(), true), true, "no-store must cache under cache_unsafe");
+  // Set-Cookie is ironclad — refused EVEN under cache_unsafe.
+  assert.equal(isCacheableResponse(setCookie(), true), false, "Set-Cookie must never cache, even under cache_unsafe");
+  // Token-aware: an unrelated token that merely CONTAINS the substring does not refuse.
+  assert.equal(isCacheableResponse(new Response("B", { status: 200, headers: { "Cache-Control": "max-age=600, private-data" } }), false), true, "private-data is not the `private` directive");
+
+  // End-to-end through EdgeCache.store: a cacheUnsafe cache stores a private response; a
+  // default cache does not.
+  clock.t = 2_000_000;
+  const unsafe = new EdgeCache({ cache: new MockCache(), now: () => clock.t, cacheUnsafe: true });
+  await unsafe.store("k1", priv(), { ttlMs: 60000, graceMs: 0, tier: "local" });
+  assert.ok((await unsafe.lookup("k1")).response, "cache_unsafe must store a private response");
+
+  const safe = new EdgeCache({ cache: new MockCache(), now: () => clock.t });
+  await safe.store("k1", priv(), { ttlMs: 60000, graceMs: 0, tier: "local" });
+  assert.equal((await safe.lookup("k1")).response, null, "default must NOT store a private response");
+
+  // Even under cache_unsafe, a Set-Cookie response is not stored.
+  await unsafe.store("k2", setCookie(), { ttlMs: 60000, graceMs: 0, tier: "local" });
+  assert.equal((await unsafe.lookup("k2")).response, null, "Set-Cookie must never be stored");
+});
+
+await test("R09: a response with >1KB of headers round-trips through KV (L2); metadata stays tiny", async () => {
+  clock.t = 3_000_000;
+  const kv = new MockKV();
+  // L2-only cache (no L1) so lookup must read the KV envelope back.
+  const cache = new EdgeCache({ cache: null, kv, distribute: true, now: () => clock.t });
+  const bigVal = "x".repeat(2048); // a single header value well over KV's 1024-byte metadata cap
+  const resp = new Response("PAYLOAD", { status: 200, headers: { "Content-Type": "text/html", "X-Big": bigVal } });
+  await cache.store("kbig", resp, { ttlMs: 60000, graceMs: 0, tier: "distribute" });
+
+  // The KV metadata must NOT carry the headers (it would overflow the 1024-byte cap on real
+  // KV and the put would be silently rejected — the R09 bug). It holds only tiny numbers.
+  const stored = kv.m.get("kbig");
+  assert.ok(stored, "the header-heavy response must be written to KV (not dropped)");
+  assert.equal(stored.metadata.headers, undefined, "headers must NOT live in KV metadata");
+  assert.ok(JSON.stringify(stored.metadata).length < 1024, "KV metadata must stay under the 1024-byte cap");
+
+  // And it round-trips: the big header survives the envelope.
+  const got = await cache.lookup("kbig");
+  assert.equal(got.state, "fresh", "the KV-stored object must be a fresh L2 hit");
+  assert.equal(got.response.headers.get("X-Big"), bigVal, "the >1KB header must round-trip through KV");
+  assert.equal(await got.response.text(), "PAYLOAD", "the body must round-trip through KV");
+});
+
+await test("cache_credentialed + cookie_allow (path-scoped signal): edge stores shared, forwards the ORIGINAL cookie (parity-safe common case)", async () => {
+  // Companion to internal/server/cache_credentialed_cookienorm_test.go
+  // TestCredentialedCookieAllowCommonCaseParity: the cache_ttl signal is PATH-scoped, so the
+  // cookie value is irrelevant to the store decision and edge == server.
+  clock.t = 1_000_000;
+  const cache = freshCache();
+  const seen = [];
+  const fetchImpl = Object.assign(
+    async (_url, init) => {
+      seen.push((init && init.headers && init.headers.get("Cookie")) || "");
+      return new Response("body", { status: 200, headers: { "Content-Type": "application/json", "X-Cache-Ttl": "60" } });
+    },
+    { calls: 0 },
+  );
+  const deps = { ir: CRED_COOKIE_NORM_IR, cache, fetchImpl, originBase: "http://o" };
+
+  const ctxA = mockCtx();
+  const ra = await handle(req("/v3/readmodel/cache/home", { headers: { Cookie: "session=alice; tracking=abc" } }), {}, ctxA, deps);
+  await ctxA.drain();
+  assert.equal(ra.headers.get("X-Cache"), "MISS", "req1 is a cacheable MISS (positive signal, stored shared)");
+  // cache_credentialed forwards the ORIGINAL (full) cookie to origin, overriding cookie_allow.
+  assert.equal(seen[seen.length - 1], "session=alice; tracking=abc", "origin must see the ORIGINAL cookie (cred overrides cookie_allow)");
+
+  const rb = await handle(req("/v3/readmodel/cache/home", { headers: { Cookie: "session=bob" } }), {}, mockCtx(), deps);
+  assert.equal(rb.headers.get("X-Cache"), "HIT", "req2 (different user) HITs the shared entry");
+});
+
+await test("cache_credentialed + cookie_allow (cookie-dependent signal): edge does NOT store — server now matches (D101 parity)", async () => {
+  // The COOKIE-NORM parity case (D101 review). The cache_ttl signal selector `@premium cookie
+  // tier premium` reads `tier`, which `cookie_allow session` STRIPS. The edge evaluates
+  // evalResponse against the NORMALIZED request (no tier), so @premium never fires and NOTHING
+  // is stored — every request is a MISS that re-hits origin. The Go server now does the same
+  // (companion test TestCredentialedCookieNormSignalParity): it forwards the original cookie to
+  // origin via an origin-bound reqHeaderOp and evaluates EvalResponse against the normalized
+  // request, so a non-premium user no longer HITs a premium response. The edge side was always
+  // the fail-safe one (caches LESS); the server fix brought it into parity here.
+  clock.t = 1_000_000;
+  const cache = freshCache();
+  let originHits = 0;
+  const seen = [];
+  const fetchImpl = Object.assign(
+    async (_url, init) => {
+      originHits++;
+      seen.push((init && init.headers && init.headers.get("Cookie")) || "");
+      return new Response("body", { status: 200, headers: { "Content-Type": "application/json", "X-Cache-Ttl": "60" } });
+    },
+    { calls: 0 },
+  );
+  const deps = { ir: CRED_COOKIE_NORM_SIGNAL_IR, cache, fetchImpl, originBase: "http://o" };
+
+  const ctxA = mockCtx();
+  const ra = await handle(req("/v3/readmodel/cache/home", { headers: { Cookie: "session=alice; tier=premium" } }), {}, ctxA, deps);
+  await ctxA.drain();
+  assert.equal(ra.headers.get("X-Cache"), "MISS", "req1 is a MISS");
+  // The original cookie (incl. the stripped `tier`) is still FORWARDED to origin (parity with
+  // the server) — only the cache-DECISION view of the cookie differs.
+  assert.equal(seen[seen.length - 1], "session=alice; tier=premium", "origin must see the ORIGINAL cookie incl. tier");
+
+  const rb = await handle(req("/v3/readmodel/cache/home", { headers: { Cookie: "session=bob" } }), {}, mockCtx(), deps);
+  assert.equal(rb.headers.get("X-Cache"), "MISS", "req2 is a MISS — the edge NEVER stored (normalized cookie has no tier)");
+  assert.equal(originHits, 2, "every request re-hits origin (neither edge nor server stores: both judge the signal on the normalized cookie — parity)");
+});
+
+// rawReq is a minimal Workers-Request double whose headers.entries() yields the EXACT
+// pre-combined values the test wants — used to reproduce what the real Fetch runtime hands
+// buildIReq after it has collapsed multiple inbound `Cookie:` lines into one entries() value.
+// (A real undici/Workers `Headers` recombines multiple Cookie lines with "; " of its own, so a
+// genuine multi-line Request can't reproduce the ", "-joined shape some runtimes produce; this
+// double feeds the value directly, the unit-level path the gap note in entry.js calls out.)
+function rawReq(url, entries, getMap = {}) {
+  const lower = {};
+  for (const [k, v] of entries) lower[k.toLowerCase()] = v;
+  return {
+    method: "GET",
+    url,
+    headers: {
+      entries: () => entries[Symbol.iterator](),
+      get: (name) => {
+        const n = name.toLowerCase();
+        if (n in getMap) return getMap[n];
+        return n in lower ? lower[n] : null;
+      },
+    },
+  };
+}
+
+const NOGEO = { geo: "", geoContinent: "", geoRegion: "" };
+
+await test("multi-Cookie-line runtime ingestion: buildIReq normalizes the \", \"-combined Cookie to \"; \" (Go lenientCookies parity)", async () => {
+  // The runtime gap: at the Workers runtime the Fetch Headers API has ALREADY collapsed multiple
+  // inbound `Cookie:` lines into ONE entries() value, joined with the GENERIC ", " separator —
+  // NOT the "; " interpreter.js parseCookies (and the Go server's lenientCookies) splits on. So a
+  // 2nd/Nth-line cookie was silently invisible to the cookie token / matchers / credential gate.
+  const ireq = buildIReq(rawReq("https://example.com/p", [["cookie", "sess=x, uid=42"]]), NOGEO);
+  // buildIReq must have normalized the combine separator back to "; " so the whole cookie set
+  // survives — byte-identical to a single-line "sess=x; uid=42".
+  assert.deepEqual(ireq.header.get(canonicalHeaderKey("Cookie")), ["sess=x; uid=42"], "Cookie normalized to '; '-joined");
+
+  // Behavioral parity through the REAL interpreter: fixture 44's default recipe keys
+  // `cookie:uid` (the SECOND, post-comma cookie). Two requests differing ONLY in uid must
+  // produce DIFFERENT cache keys — without the fix uid is invisible (the lone parsed cookie is
+  // `sess`), the cookie:uid token renders "" for BOTH, and the keys would COLLIDE (cross-user
+  // serving). `sess` is not the `premium` cookie, so the always/default recipe is selected.
+  const keyA = evalRequest(RECIPE_RESELECT_IR, buildIReq(rawReq("https://example.com/p", [["cookie", "sess=x, uid=42"]]), NOGEO)).cacheKey;
+  const keyB = evalRequest(RECIPE_RESELECT_IR, buildIReq(rawReq("https://example.com/p", [["cookie", "sess=x, uid=99"]]), NOGEO)).cacheKey;
+  assert.notEqual(keyA, keyB, "cookie:uid (2nd Cookie) must influence the key — no collision");
+
+  // And the ", "-combined form must key IDENTICALLY to a proper single-line "; " request
+  // (full parity, whichever separator the host runtime chose to combine with).
+  const keySingle = evalRequest(RECIPE_RESELECT_IR, buildIReq(rawReq("https://example.com/p", [["cookie", "sess=x; uid=42"]]), NOGEO)).cacheKey;
+  assert.equal(keyA, keySingle, "', '-combined and '; '-combined Cookie produce the same key");
+
+  // A runtime that already recombines Cookie with "; " (undici/workerd) must be a no-op.
+  const ireqSemi = buildIReq(rawReq("https://example.com/p", [["cookie", "a=1; b=2"]]), NOGEO);
+  assert.deepEqual(ireqSemi.header.get(canonicalHeaderKey("Cookie")), ["a=1; b=2"], "already-'; ' Cookie left untouched");
+  // A single cookie (the common case) is byte-identical.
+  const ireqOne = buildIReq(rawReq("https://example.com/p", [["cookie", "only=1"]]), NOGEO);
+  assert.deepEqual(ireqOne.header.get(canonicalHeaderKey("Cookie")), ["only=1"], "single cookie byte-identical");
 });
 
 // --- report -----------------------------------------------------------------

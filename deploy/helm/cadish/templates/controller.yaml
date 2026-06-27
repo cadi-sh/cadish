@@ -79,9 +79,11 @@ rules:
 {{- end }}
 # The publish Service: the leader status writer reads its LoadBalancer address to
 # populate Ingress status.loadBalancer. Cluster-wide READ, always required.
+# Least privilege: a direct GET of the single publish Service (no Service informer),
+# so `get` alone suffices — no list/watch.
 - apiGroups: [""]
   resources: ["services"]
-  verbs: ["get", "list", "watch"]
+  verbs: ["get"]
 {{- if not $scopedWrites }}
 # Cluster-wide WRITES (default: all namespaces). When controller.namespaces is set these
 # move to per-namespace Roles below so the controller cannot write status/Events globally.
@@ -341,17 +343,27 @@ spec:
             - name: https
               containerPort: {{ .Values.containerPorts.https }}
               protocol: TCP
+          # Startup + readiness use the reserved warm-readiness endpoint: cadish serves
+          # /.cadish/readyz with 503 until the controller's FIRST reconcile builds the
+          # routing table from synced listers, then 200. A TCP probe passes the instant
+          # the listener binds — before routing exists — so on a rollout k8s would route
+          # to an un-warmed pod and serve transient 502/404s. The HTTP probe gates traffic
+          # on real readiness instead. (Raw-manifest parity: deploy/k8s/*-controller.yaml.)
           startupProbe:
-            tcpSocket:
+            httpGet:
+              path: /.cadish/readyz
               port: http
             failureThreshold: 30
             periodSeconds: 5
           readinessProbe:
-            tcpSocket:
+            httpGet:
+              path: /.cadish/readyz
               port: http
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3
+          # Liveness stays TCP on purpose: it must check PROCESS-ALIVE, not warm. A
+          # warm-based liveness would kill a pod that is merely between configs.
           livenessProbe:
             tcpSocket:
               port: http

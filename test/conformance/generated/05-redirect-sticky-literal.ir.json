@@ -1,5 +1,5 @@
 {
-  "irVersion": 4,
+  "irVersion": 6,
   "site": {
     "hosts": [
       "old.example.com"

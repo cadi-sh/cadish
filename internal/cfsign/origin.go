@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/cadi-sh/cadish/internal/origin"
@@ -59,7 +60,16 @@ func NewOrigin(signer *Signer, ttl time.Duration, opts ...OriginOption) *Origin 
 // Fetch signs in.Key for the configured distribution and streams a GET of the
 // signed URL.
 func (o *Origin) Fetch(ctx context.Context, in *origin.Request) (*origin.Response, error) {
-	signed, err := o.signer.SignedURL(in.Key, o.now().Add(o.ttl))
+	// in.Key is the URL path (server derives it from r.URL.Path, which always has a
+	// leading slash; "A leading slash is tolerated" per origin.Request.Key). The
+	// sibling s3origin/httporigin both TrimPrefix(key, "/") so the object key is
+	// "media/clip.mp4", not "/media/clip.mp4". CloudFront fronts that SAME object, so
+	// the signed resource path must be the single-slash "/media/clip.mp4"
+	// (EncodeKeyPath re-adds exactly one leading slash). Without this trim a leading
+	// slash doubles to "//media/clip.mp4", which CloudFront forwards to S3 as the
+	// wrong key "/media/clip.mp4" => 403/404, a silent fallback outage.
+	key := strings.TrimPrefix(in.Key, "/")
+	signed, err := o.signer.SignedURL(key, o.now().Add(o.ttl))
 	if err != nil {
 		return nil, fmt.Errorf("cfsign: sign %q: %w", in.Key, err)
 	}

@@ -538,6 +538,32 @@ func (f *freshness) storedAt(key string) (time.Time, bool) {
 	return e.storedAt, true
 }
 
+// lifetime returns the FRESH lifetime cadish assigned to key's object (expires −
+// storedAt, i.e. the effective TTL), for synthesizing an operator-authoritative
+// downstream `Cache-Control: max-age` on a HIT (R13). It takes the SHARED RLock and
+// does not mutate, so it adds no contention to the hot HIT path. Returns
+// (0, false) when there is no entry or the entry is a hit-for-miss marker (not a
+// stored object) — the caller then emits no synthesized Cache-Control (restart
+// safety: a missing freshness entry never fabricates freshness). The returned
+// duration is the FULL assigned TTL (not the remaining time), so paired with the
+// Age header a downstream cache derives the correct remaining freshness; a
+// stale-in-grace serve (now > expires) therefore reports an Age that already
+// exceeds max-age, telling downstream to revalidate.
+func (f *freshness) lifetime(key string) (time.Duration, bool) {
+	sh := f.shard(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	e, ok := sh.entries[key]
+	if !ok || !e.hfmUntil.IsZero() {
+		return 0, false
+	}
+	d := e.expires.Sub(e.storedAt)
+	if d < 0 {
+		d = 0
+	}
+	return d, true
+}
+
 // forget drops any entry for key (used by purge).
 func (f *freshness) forget(key string) {
 	sh := f.shard(key)

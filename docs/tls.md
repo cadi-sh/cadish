@@ -33,6 +33,13 @@ tls {
 site. It is **opt-in** (sending HSTS commits every browser to HTTPS-only for
 `max-age` seconds — don't enable it until HTTPS is solid).
 
+`http_redirect_except /path …` exempts the listed **exact** request paths from
+the `:80` HTTP→HTTPS redirect — they are answered on plain `:80` by the site
+pipeline instead of being `301`'d (for an L4/DNS health-check probe, webhook, or
+monitoring endpoint a direct client hits over HTTP while cadish terminates TLS).
+It is strictly an opt-**out** for the named paths; every other path still
+redirects. Each path must start with `/`.
+
 ## How it works
 
 - **Issuer:** `golang.org/x/crypto/acme/autocert` (battle-tested, stdlib-adjacent),
@@ -66,7 +73,13 @@ site. It is **opt-in** (sending HSTS commits every browser to HTTPS-only for
     and `301`-redirects everything else to `https://`. A request that already arrived
     over HTTPS at an upstream terminator (`X-Forwarded-Proto: https`) is **not**
     redirected — it is served plain, to avoid a redirect loop behind a TLS-terminating
-    LB (the LB must set `X-Forwarded-Proto` and strip client-supplied values). See
+    LB. **The `X-Forwarded-Proto` loop guard is trust-gated** (R15): cadish honors it
+    **only when the immediate socket peer is in `trust_proxy`**, so a direct client
+    cannot add `X-Forwarded-Proto: https` to a plain `:80` request to be served in
+    cleartext. **Behind a TLS terminator (Cloudflare / an LB), declare its network in
+    `trust_proxy`** (e.g. `trust_proxy 173.245.48.0/20 …`) so the legitimate loop guard
+    still suppresses the redirect; with no `trust_proxy` the header is ignored and every
+    plain `:80` request is redirected. See
     [`ingress-controller.md`](ingress-controller.md) §HTTP→HTTPS redirect.
   - **Undeclared hosts are still redirected.** The `:80` redirect applies to *any*
     `Host:` — an undeclared host on `:80` still gets `301 https://<that-host>/…`.

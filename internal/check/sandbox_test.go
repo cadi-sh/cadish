@@ -162,6 +162,70 @@ func TestSandboxedGeoMaxmindNoFileProbe(t *testing.T) {
 	}
 }
 
+// TestSandboxedCAFileNoFileProbe verifies that a `ca_file PATH` in an upstream does
+// NOT read/stat the path in sandbox mode (admin /api/validate). Pointing it at a
+// host-only secret (/etc/shadow) must NOT produce a filesystem-touching error
+// (no read-error oracle, no /dev/zero unbounded-read DoS), and a nonexistent path
+// must not yield a hard structural error either — structure is validated, the PEM
+// is not loaded. Mirrors TestSandboxedGeoMaxmindNoFileProbe.
+func TestSandboxedCAFileNoFileProbe(t *testing.T) {
+	for _, path := range []string{"/etc/shadow", "/nonexistent/path/to/ca.pem"} {
+		path := path
+		t.Run(path, func(t *testing.T) {
+			src := []byte("example.com {\n  upstream b {\n    to https://o\n    ca_file " + path + "\n  }\n}\n")
+			rep, err := CheckSourceSandboxed("Cadishfile", src)
+			if err != nil {
+				t.Fatalf("CheckSourceSandboxed: %v", err)
+			}
+			b, _ := json.Marshal(rep)
+			// No diagnostic may reference reading the file (the host-file oracle).
+			if strings.Contains(string(b), "cannot read") {
+				t.Errorf("sandbox emitted a ca_file read error (probed the filesystem): %s", string(b))
+			}
+			check := func(d Diagnostic) {
+				if d.Severity == SevError && strings.Contains(d.Message, "ca_file") && strings.Contains(d.Message, path) {
+					t.Errorf("sandbox emitted a hard ca_file error referencing the path (file probe): %+v", d)
+				}
+			}
+			for _, d := range rep.Diagnostics {
+				check(d)
+			}
+			for _, s := range rep.Sites {
+				for _, d := range s.Diagnostics {
+					check(d)
+				}
+			}
+		})
+	}
+}
+
+// TestCheckCAFileMissingIsWarning verifies the NON-sandbox CLI (`cadish check`) treats
+// a missing ca_file as a deploy-time WARNING (file-not-found), not a hard error — so a
+// config authored for another host stays portable, matching cert/key/maxmind/sign.
+func TestCheckCAFileMissingIsWarning(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "nope.pem")
+	src := []byte("example.com {\n  upstream b {\n    to https://o\n    ca_file " + missing + "\n  }\n}\n")
+	rep, err := CheckSource("Cadishfile", src)
+	if err != nil {
+		t.Fatalf("CheckSource: %v", err)
+	}
+	for _, d := range rep.Diagnostics {
+		if d.Severity == SevError {
+			t.Errorf("missing ca_file produced a hard error (want a warning): %+v", d)
+		}
+	}
+	for _, s := range rep.Sites {
+		for _, d := range s.Diagnostics {
+			if d.Severity == SevError {
+				t.Errorf("missing ca_file produced a hard site error (want a warning): %+v", d)
+			}
+		}
+	}
+	if !hasDiagCode(rep, "file-not-found") {
+		t.Errorf("missing ca_file did not emit a file-not-found warning: %+v", rep.Diagnostics)
+	}
+}
+
 // TestSandboxedPreservesOtherDiagnostics verifies that the sandboxed path still
 // produces all non-filesystem diagnostics (e.g. unknown-directive, arity errors).
 func TestSandboxedPreservesOtherDiagnostics(t *testing.T) {

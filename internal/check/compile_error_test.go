@@ -46,6 +46,34 @@ func TestCompileError(t *testing.T) {
 			substr:  "classify value must be non-empty",
 		},
 		{
+			// Finding I1: an `upstream_healthy NAME…` matcher naming an UNDECLARED pool
+			// is AST-clean but a hard compile-error (it would otherwise fail closed at
+			// runtime → a probe answers 503 forever). `cadish check` must reject it
+			// identically to `cadish run` (both reach pipeline.Compile).
+			name: "upstream_healthy names an undeclared pool",
+			src: "site.local {\n" +
+				"  upstream cache_pool { to http://127.0.0.1:8080 }\n" +
+				"  @probe path /aws-health-check\n" +
+				"  @live  upstream_healthy cache_poool\n" +
+				"  respond @probe @live 200 \"OK\"\n" +
+				"  respond @probe 503\n" +
+				"}\n",
+			wantErr: true,
+			substr:  "not a declared upstream/cluster",
+		},
+		{
+			// The same probe naming the REAL pool compiles clean — no over-rejection.
+			name: "upstream_healthy names the declared pool",
+			src: "site.local {\n" +
+				"  upstream cache_pool { to http://127.0.0.1:8080 }\n" +
+				"  @probe path /aws-health-check\n" +
+				"  @live  upstream_healthy cache_pool\n" +
+				"  respond @probe @live 200 \"OK\"\n" +
+				"  respond @probe 503\n" +
+				"}\n",
+			wantErr: false,
+		},
+		{
 			// Regression: a valid, compilable config produces NO compile-error.
 			// The classifier references only plain matchers (the supported pattern
 			// until Part 2 lands), so it compiles cleanly.

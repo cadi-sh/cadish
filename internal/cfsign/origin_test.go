@@ -66,6 +66,33 @@ func TestOriginSignsOutgoingRequest(t *testing.T) {
 	}
 }
 
+// TestOriginLeadingSlashKey guards the production data flow: the server derives
+// in.Key from r.URL.Path, which ALWAYS carries a leading slash (normalizePath
+// keeps it). The sibling s3origin in the same `origin chain s3 -> cloudfront`
+// trims that slash to form the S3 key "media/clip.mp4"; the CloudFront fallback
+// fronts the SAME bucket, so its resource path MUST also be the single-slash
+// "/media/clip.mp4". A double slash "//media/clip.mp4" makes CloudFront request
+// S3 object key "/media/clip.mp4" — a different (missing) object => 403/404, a
+// silent outage of the fallback path.
+func TestOriginLeadingSlashKey(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.EscapedPath()
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer srv.Close()
+
+	o := NewOrigin(testSigner(t, srv.URL), 5*time.Minute)
+	resp, err := o.Fetch(context.Background(), &origin.Request{Key: "/media/clip.mp4"})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	resp.Body.Close()
+	if gotPath != "/media/clip.mp4" {
+		t.Fatalf("outgoing path = %q, want %q (a leading-slash key must not double the slash)", gotPath, "/media/clip.mp4")
+	}
+}
+
 // TestOriginExpiryUsesClock verifies the signed Expires reflects now+ttl.
 func TestOriginExpiryUsesClock(t *testing.T) {
 	var gotExpires string

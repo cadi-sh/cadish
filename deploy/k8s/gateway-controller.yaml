@@ -110,17 +110,27 @@ spec:
             - name: https
               containerPort: 443
               protocol: TCP
+          # Startup + readiness use the reserved warm-readiness endpoint: cadish serves
+          # /.cadish/readyz with 503 until the controller's FIRST reconcile builds the
+          # routing table from synced listers, then 200. A TCP probe passes the instant
+          # the listener binds — before routing exists — so on a rollout k8s would route
+          # to an un-warmed pod and serve transient 404s. The HTTP probe gates traffic on
+          # real readiness instead.
           startupProbe:
-            tcpSocket:
+            httpGet:
+              path: /.cadish/readyz
               port: http
             failureThreshold: 30
             periodSeconds: 5
           readinessProbe:
-            tcpSocket:
+            httpGet:
+              path: /.cadish/readyz
               port: http
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3
+          # Liveness stays TCP on purpose: it must check PROCESS-ALIVE, not warm. A
+          # warm-based liveness would kill a pod that is merely between configs.
           livenessProbe:
             tcpSocket:
               port: http

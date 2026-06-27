@@ -192,16 +192,28 @@ func routingHostOwners(ingresses []*networkingv1.Ingress) map[string]string {
 	sortIngresses(ings) // oldest-first, then ns/name (same order Translate uses)
 	owner := map[string]string{}
 	var wildcardOrder []string // literal "*.suffix" hosts in oldest-claim (first-claim) order
+	// claimRank records the global first-claim order (oldest = lowest) of every host —
+	// concrete and wildcard alike — so Pass 3 can compare a concrete host's claim age
+	// against the covering wildcard's and apply true oldest-wins (a YOUNGER wildcard must
+	// NOT steal an already-established OLDER concrete host).
+	claimRank := map[string]int{}
+	rank := 0
+	claim := func(h, ns string) {
+		if _, ok := owner[h]; ok {
+			return
+		}
+		owner[h] = ns
+		claimRank[h] = rank
+		rank++
+		if strings.HasPrefix(h, "*.") {
+			wildcardOrder = append(wildcardOrder, h)
+		}
+	}
 	// Pass 1: rule hosts (higher priority — routing ownership takes precedence).
 	for _, ing := range ings {
 		for _, rule := range ing.Spec.Rules {
 			if h := normHost(rule.Host); h != "" {
-				if _, ok := owner[h]; !ok {
-					owner[h] = ing.Namespace
-					if strings.HasPrefix(h, "*.") {
-						wildcardOrder = append(wildcardOrder, h)
-					}
-				}
+				claim(h, ing.Namespace)
 			}
 		}
 	}
@@ -212,31 +224,37 @@ func routingHostOwners(ingresses []*networkingv1.Ingress) map[string]string {
 		for _, tlsEntry := range ing.Spec.TLS {
 			for _, h := range tlsEntry.Hosts {
 				if h = normHost(h); h != "" {
-					if _, ok := owner[h]; !ok {
-						owner[h] = ing.Namespace
-						if strings.HasPrefix(h, "*.") {
-							wildcardOrder = append(wildcardOrder, h)
-						}
-					}
+					claim(h, ing.Namespace)
 				}
 			}
 		}
 	}
 	// Pass 3 (wildcard subdomain ownership, Fix 2 — mirrors the Gateway controller's
-	// wildcardListenerOwner guard): a CONCRETE host (e.g. app.example.com) that a YOUNGER
-	// Ingress in a DIFFERENT namespace claimed exactly is REASSIGNED to the namespace of
-	// the OLDEST `*.suffix` wildcard that covers it. Without this a hostile namespace could
-	// register an exact Ingress for a subdomain of another namespace's wildcard — which
-	// wins at serving time (exact-before-wildcard) — and steal/blackhole the subdomain and
-	// its cert slot. A SAME-namespace exact-under-own-wildcard is left untouched (a
-	// namespace owns the concrete subdomains of its own wildcard). The OLDEST wildcard wins
-	// (wildcardOrder is first-claim order), keeping routing and TLS ownership in agreement.
+	// wildcardListenerOwner guard): a CONCRETE host (e.g. app.example.com) is REASSIGNED to
+	// the namespace of an OLDER `*.suffix` wildcard (in a DIFFERENT namespace) that covers
+	// it. Without this a hostile namespace could register an exact Ingress for a subdomain
+	// of another namespace's OLDER wildcard — which wins at serving time
+	// (exact-before-wildcard) — and steal/blackhole the subdomain and its cert slot.
+	//
+	// This is strict oldest-wins: the reassignment ONLY fires when the covering wildcard's
+	// first-claim is OLDER than the concrete host's. A YOUNGER foreign wildcard must NOT
+	// steal an already-established concrete host (otherwise one hostile `*.example.com`
+	// Ingress would capture every existing concrete subdomain other namespaces own). A
+	// SAME-namespace exact-under-own-wildcard is left untouched (a namespace owns the
+	// concrete subdomains of its own wildcard).
 	if len(wildcardOrder) > 0 {
 		for h, ns := range owner {
 			if strings.HasPrefix(h, "*.") {
 				continue // a wildcard host itself is owned by its own first claim
 			}
-			if wns, ok := wildcardHostOwner(h, wildcardOrder, owner); ok && wns != ns {
+			w, ok := wildcardHostOwner(h, wildcardOrder)
+			if !ok {
+				continue
+			}
+			wns := owner[w]
+			// Only an OLDER wildcard (strictly lower first-claim rank) wins over the
+			// concrete host's own claim; a younger one leaves the established owner alone.
+			if wns != ns && claimRank[w] < claimRank[h] {
 				owner[h] = wns
 			}
 		}
@@ -244,14 +262,14 @@ func routingHostOwners(ingresses []*networkingv1.Ingress) map[string]string {
 	return owner
 }
 
-// wildcardHostOwner returns the namespace of the OLDEST `*.suffix` wildcard that covers
-// the concrete host, mirroring the Gateway controller's wildcardListenerOwner. order is
-// the literal wildcard hosts in first-claim (oldest) order; owner maps each to its ns.
-func wildcardHostOwner(host string, order []string, owner map[string]string) (string, bool) {
+// wildcardHostOwner returns the literal of the OLDEST `*.suffix` wildcard that covers the
+// concrete host, mirroring the Gateway controller's wildcardListenerOwner. order is the
+// literal wildcard hosts in first-claim (oldest) order, so the first match is the oldest.
+func wildcardHostOwner(host string, order []string) (string, bool) {
 	for _, w := range order {
 		suffix := w[1:] // ".example.com" (w is "*.example.com")
 		if strings.HasSuffix(host, suffix) && len(host) > len(suffix) {
-			return owner[w], true
+			return w, true
 		}
 	}
 	return "", false

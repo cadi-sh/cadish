@@ -1,0 +1,21 @@
+{
+  "name": "55-json-trailing-tokens",
+  "cadishfile": "example.com {\n    @gate cookie_json c a 1\n    pass @gate\n    cache_key host path\n    cache_ttl default ttl 1m\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "Cookie": ["c={\"a\":1} true"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "Cookie": ["c={\"a\":1}garbage"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/", "header": { "Cookie": ["c={\"a\":1}"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

@@ -32,9 +32,10 @@ cadish version                       print version information
 cadish help                          show help
 ```
 
-`reload`, `logs`, `edge`, and `ingress` round out the set (see `cadish help`) —
-hot-reload a running server, tail the access log, build the Cloudflare Workers
-edge tier, and run as a Kubernetes Ingress controller.
+`reload`, `logs`, `edge`, `ingress`, and `gateway` round out the set (see
+`cadish help`) — hot-reload a running server, tail the access log, build the
+Cloudflare Workers edge tier, and run as a Kubernetes Ingress or Gateway API
+controller.
 
 Migrating from Varnish? Start with `cadish adapt your.vcl -o Cadishfile` — it
 converts the mechanical idioms and flags the rest with `# TODO(adapt)`. See
@@ -91,8 +92,10 @@ example.com {
      Regex evals / request:  0   (path_regex/host_regex/regex-valued header on the hot path)
      Directives by phase:    SETUP 3  RECV 2  KEY 0  ORIGIN 1  DELIVER 1
      Est. per-request cost:  3   (1 exact×1 + 1 glob×2 + 0 regex×10)
+     Findings:
+       warning Cadishfile:19:5: this site caches responses (cache_ttl) but defines no cache_key, so the default key is `method host path` — it OMITS the query string, so e.g. /api?id=1 and /api?id=2 share ONE cache entry (collide). Varnish hashes the query by default: if responses vary by query add `cache_key method host path query` (or `query_allow …` to key only some params, `query_strip …` to drop tracking params); if they do not vary by query, this is safe to ignore  [default-key-omits-query]
 
-   Summary: 1 site, 0 errors, 0 warnings
+   Summary: 1 site, 0 errors, 1 warning
    ```
 
    A non-zero exit means a real error (printed as `file:line:col: message`). See

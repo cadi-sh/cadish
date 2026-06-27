@@ -1,0 +1,25 @@
+# Keep the Docker build context small and free of secrets/cruft. The build does
+# `COPY . .`, so anything not excluded here is shipped to the daemon (and into the
+# build stage). The final image only carries the binary + LICENSE/NOTICE, but a
+# tight context is faster and avoids leaking local state into intermediate layers.
+
+# Version control + CI metadata (the binary is stamped via build-args, not VCS).
+.git
+.github
+.gitignore
+
+# Build artifacts / release output.
+build/
+dist/
+coverage.out
+cadish
+
+# Editor / OS / tooling junk and anything that could carry local secrets.
+.idea
+.vscode
+*.log
+*.pem
+*.key
+.env
+.env.*
+node_modules

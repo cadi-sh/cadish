@@ -1,0 +1,46 @@
+{
+  "name": "41-resp-header-ttl",
+  "cadishfile": "example.com {\n    cache_ttl resp_header X-Powered-By Express status 404 ttl 1m grace 24h\n    cache_ttl resp_header X-Powered-By Express ttl 1m grace 2w\n    cache_ttl status 404 ttl 10s grace 1m\n    cache_ttl default ttl 5s grace 1m\n    storage default -> ram\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/a" },
+      "origin": {
+        "status": 200,
+        "header": { "Content-Type": ["text/html"], "X-Powered-By": ["Express"] }
+      },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/a" },
+      "origin": {
+        "status": 200,
+        "header": { "Content-Type": ["text/html"] }
+      },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/missing" },
+      "origin": {
+        "status": 404,
+        "header": { "Content-Type": ["text/html"], "X-Powered-By": ["Express"] }
+      },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/missing" },
+      "origin": {
+        "status": 404,
+        "header": { "Content-Type": ["text/html"] }
+      },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/a" },
+      "origin": {
+        "status": 200,
+        "header": { "Content-Type": ["text/html"], "X-Powered-By": ["PHP/8.2"] }
+      },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

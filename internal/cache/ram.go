@@ -220,6 +220,39 @@ func (r *RAMTier) release(n int64) {
 	}
 }
 
+// Reset drops every committed object from the RAM tier (clearing each shard's map,
+// LRU ring and byte count). It does NOT touch the in-flight reservation budget, which
+// belongs to live writers, not committed objects. Used by Store.Reset on the reload
+// flush path against a store that is not yet serving; a freshly-opened store's RAM is
+// already empty (RAM is never persisted), so this is normally a no-op kept for
+// completeness and robustness.
+func (r *RAMTier) Reset() {
+	for _, s := range r.shards {
+		s.mu.Lock()
+		s.items = make(map[string]*ramEntry)
+		s.lru.Init()
+		s.curBytes = 0
+		atomic.StoreInt64(&s.atomicBytes, 0)
+		s.mu.Unlock()
+	}
+}
+
+// Delete removes key from its shard if present (no-op otherwise), mirroring the
+// replace path in commit. Used for cross-tier dedup by the Store.
+func (r *RAMTier) Delete(key string) {
+	s := r.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old, ok := s.items[key]
+	if !ok {
+		return
+	}
+	s.curBytes -= int64(len(old.data))
+	s.lru.Remove(old.el)
+	delete(s.items, key)
+	atomic.StoreInt64(&s.atomicBytes, s.curBytes)
+}
+
 func (r *RAMTier) Len() int {
 	n := 0
 	for _, s := range r.shards {
@@ -243,8 +276,10 @@ func (r *RAMTier) Bytes() int64 {
 func (r *RAMTier) Close() error { return nil }
 
 // commit installs an object into the shard owning its key, evicting that shard's LRU
-// entries until it fits within the shard's slice of the budget.
-func (r *RAMTier) commit(meta ObjectMeta, data []byte) {
+// entries until it fits within the shard's slice of the budget. It reports whether the
+// object was actually installed (false on a shard-cap drop) so the cross-tier dedup can
+// tell a real store from a silent discard (R14).
+func (r *RAMTier) commit(meta ObjectMeta, data []byte) bool {
 	s := r.shard(meta.Key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -258,7 +293,7 @@ func (r *RAMTier) commit(meta ObjectMeta, data []byte) {
 	// maxBytes/N, so the effective single-object ceiling is smaller — acceptable for a
 	// hot small-object cache; oversized objects belong on disk anyway.)
 	if size > s.maxBytes {
-		return
+		return false
 	}
 
 	// Replace existing entry of the same key.
@@ -304,6 +339,7 @@ func (r *RAMTier) commit(meta ObjectMeta, data []byte) {
 	// Mirror the updated count into the atomic so Bytes()/Stats() can read it without
 	// taking this shard's lock.
 	atomic.StoreInt64(&s.atomicBytes, s.curBytes)
+	return true
 }
 
 func key(m ObjectMeta) string { return m.Key }
@@ -323,6 +359,7 @@ type ramWriter struct {
 	buf      *bytes.Buffer
 	reserved int64 // bytes currently charged to the tier's in-flight budget
 	overflow bool  // tripped the per-object cap or global budget: no longer caching
+	stored   bool  // Commit actually installed the object (false on overflow / shard-cap drop)
 }
 
 // Write appends to the in-memory buffer until a bound is hit. On overflow it frees
@@ -375,12 +412,12 @@ func (w *ramWriter) Commit() error {
 			// alias the pooled buffer's backing.
 			data := make([]byte, len(b))
 			copy(data, b)
-			w.tier.commit(w.meta, data)
+			w.stored = w.tier.commit(w.meta, data)
 			putRAMBuf(w.buf)
 		} else {
 			// Large object: hand the buffer's backing straight to the entry (zero
 			// copy) and do not recycle it — the entry now owns that array.
-			w.tier.commit(w.meta, b)
+			w.stored = w.tier.commit(w.meta, b)
 		}
 	}
 	// On overflow w.buf is already nil (dropBuffer), so there is nothing to recycle.
@@ -389,6 +426,10 @@ func (w *ramWriter) Commit() error {
 	w.reserved = 0
 	return nil
 }
+
+// Stored reports whether Commit actually installed the object (false on an overflow —
+// per-object cap / global budget / shard-cap drop). See TierWriter.Stored.
+func (w *ramWriter) Stored() bool { return w.stored }
 
 // Abort discards the in-progress write and releases the reservation exactly once.
 func (w *ramWriter) Abort() error {

@@ -14,7 +14,7 @@
 // The worker is small, generic, and best-effort: anything it cannot do faithfully
 // is delegated to the Cadish server behind. The brain is 100% in the IR.
 
-import { evalRequest, evalResponse, evalDeliver, newRequest, resolveEdgeTier, cacheKeyHeaderValue, applyTransforms, resolveOnError, canonicalHeaderKey, selectedKeyCoversAllCookies } from "./interpreter.js";
+import { evalRequest, evalResponse, evalDeliver, newRequest, resolveEdgeTier, cacheKeyHeaderValue, applyTransforms, resolveOnError, canonicalHeaderKey, selectedKeyCoversAllCookies, selectedDerivedStripCookies, selectedDerivedForwardCookies, cacheCredentialedMatchesReq } from "./interpreter.js";
 import { resolveGeo } from "./geo.js";
 import { fetchOrigin, originURLFor } from "./origin.js";
 import { EdgeCache } from "./cache-tiers.js";
@@ -27,12 +27,27 @@ import { EdgeCache } from "./cache-tiers.js";
 // do NOT read any client-supplied X-Cadish-Device header: the edge is the first hop,
 // so such a header is attacker-controlled; the User-Agent the classifier reads is the
 // real client's, the same input the Go server's classify pre-pass uses.
-function buildIReq(request, geo) {
+export function buildIReq(request, geo) {
   const url = new URL(request.url);
   const query = {};
   for (const [k, v] of url.searchParams.entries()) (query[k] ||= []).push(v);
   const header = {};
-  for (const [k, v] of request.headers.entries()) header[k] = v;
+  for (const [k, v] of request.headers.entries()) {
+    // MULTI-COOKIE-LINE PARITY: the Go server's lenientCookies joins ALL inbound `Cookie:`
+    // request lines with "; " before splitting on ';' (request.go), so a cookie carried on a
+    // 2nd/Nth line is still seen by the cookie / cookie_json matchers, the cache-key cookie
+    // token and the credential-coverage gate. At the Workers runtime the Fetch Headers API has
+    // ALREADY collapsed multiple inbound `Cookie:` lines into ONE entries() value — and the
+    // GENERIC header-combine separator is ", " (0x2C 0x20), NOT the "; " the cookie grammar
+    // (and interpreter.js parseCookies' ';' split) expects. A bare ", " can never appear INSIDE
+    // a cookie-pair: comma is not a valid cookie-octet nor a name char (RFC 6265 §4.1.1), so a
+    // ", " in a combined Cookie value is unambiguously a cross-line combine boundary. Normalize
+    // it back to "; " so parseCookies sees every cookie, byte-identical to the Go server. The
+    // common single-line case ("a=1; b=2" or "a=1") carries no ", " and is left untouched. Some
+    // runtimes/undici already recombine Cookie with "; " (then this is a no-op), so we match the
+    // server WHICHEVER separator the host runtime chose — fail-closed parity, not a guess.
+    header[k] = k.toLowerCase() === "cookie" ? v.split(", ").join("; ") : v;
+  }
   let path = url.pathname;
   try {
     path = decodeURIComponent(url.pathname);
@@ -45,6 +60,12 @@ function buildIReq(request, geo) {
     path,
     query,
     header,
+    // scheme backs the {proto}/{scheme} token. On the REAL worker the inbound URL
+    // already carries the client-facing scheme (Cloudflare terminates TLS at the
+    // edge), so derive it from the URL — otherwise newRequest defaults to "http" and
+    // every HTTPS request would resolve {proto} to "http" (downgrading a
+    // `redirect … {proto}://…` and sending X-Forwarded-Proto: http on TLS traffic).
+    tls: url.protocol === "https:",
     clientIP: request.headers.get("CF-Connecting-IP") || "",
     // device is left "" so the interpreter self-classifies from the request's
     // User-Agent against the IR device ruleset (D70). Never taken from a client-
@@ -113,6 +134,23 @@ async function deliver(ir, ireq, resp, cacheStatus, statusOverride, key, opts = 
   const respHeader = respHeaderToObj(resp.headers);
   const dd = evalDeliver(ir, ireq, respHeader, cacheStatus);
   const headers = new Headers(resp.headers);
+  // Strip the from_header-family control headers a cache_ttl rule CONSUMED
+  // (X-Cache-Ttl/X-Cache-Grace/X-Cache-Max-Stale): an internal origin↔cache contract,
+  // not for the client — mirroring the Go server (handler.go). The evalResponse walk runs
+  // ONLY when (a) the IR declares a from_header rule (ir.response.hasStripHeaders) AND (b)
+  // this is a fresh-from-origin MISS: a HIT/HIT-STALE serves the STORED copy, which was
+  // already stripped at store time (storeResponse), so re-stripping it is redundant. The
+  // common config has no from_header rule, so it skips the walk entirely (Finding 5).
+  if (ir.response.hasStripHeaders && cacheStatus === "MISS") {
+    for (const n of evalResponse(ir, ireq, resp.status, respHeader).stripHeaders || []) headers.delete(n);
+  }
+  // cache_credentialed (D101): on a positive-signal MISS, strip the weak refusals (no-store/
+  // private/no-cache Cache-Control, Pragma, Expires) the in-scope signal force-overrode, so the
+  // client never sees a no-store cadish is caching anyway — mirroring the Go server. Only on a
+  // MISS: a HIT/STALE serves the STORED copy, already stripped at store time (storeResponse).
+  if (cacheStatus === "MISS" && credentialedStore(ir, ireq, resp, respHeader)) {
+    stripCredentialedWeakHeaders(headers);
+  }
   applyHeaderOps(headers, dd.respHeaderOps);
   if (dd.stripCookies) headers.delete("Set-Cookie");
   if (dd.cors) applyCORS(headers, dd.cors, ireq);
@@ -211,6 +249,34 @@ function concatChunks(chunks) {
   return out;
 }
 
+// clientAcceptsEncoding reports whether a client's Accept-Encoding header accepts the given
+// content-coding — a faithful port of the Go server's clientAcceptsEncoding (handler.go).
+// identity (or an empty coding) is always acceptable. A coding is accepted when listed with a
+// non-zero q, or when `*` is listed with a non-zero q. An empty Accept-Encoding means the
+// client expressed no preference, which per RFC 9110 §12.5.3 means identity only — so a
+// non-identity coding is NOT accepted. Token matching is case-insensitive. The whole stored
+// Content-Encoding string is passed as `coding` (mirroring the server), so a multi-coding value
+// only matches a `*` and otherwise fails closed to a fresh origin negotiation.
+function clientAcceptsEncoding(acceptEncoding, coding) {
+  if (coding === "" || coding.toLowerCase() === "identity") return true;
+  let star = false;
+  for (const part of acceptEncoding.split(",")) {
+    let tok = part.trim();
+    let q = "1";
+    const i = tok.indexOf(";");
+    if (i >= 0) {
+      const params = tok.slice(i + 1);
+      tok = tok.slice(0, i).trim();
+      const j = params.toLowerCase().indexOf("q=");
+      if (j >= 0) q = params.slice(j + 2).trim();
+    }
+    const accepted = q !== "0" && q !== "0.0" && q !== "0.00" && q !== "0.000";
+    if (tok.toLowerCase() === coding.toLowerCase()) return accepted;
+    if (tok === "*") star = accepted;
+  }
+  return star;
+}
+
 // storeResponse returns the Response to PERSIST in the edge cache. When a `strip_cookies`
 // rule fires for this response (the same decision evalDeliver makes on delivery), the
 // Set-Cookie header is physically removed BEFORE storing — mirroring the server, and the
@@ -219,25 +285,79 @@ function concatChunks(chunks) {
 // explicit opt-in, so the stored object — and every HIT served from it — carries no cookie.
 // Without a matching strip rule the Set-Cookie response is left intact and the store guard
 // refuses it (the ironclad default). resp is cloned so the caller's copy stays readable.
+// stripCredentialedWeakHeaders implements the cache_credentialed (D101) force-override of the
+// response's per-user markers (the custom-VCL `if (X-Cache-Ttl) { unset set-cookie; unset
+// Cache-Control; set ttl }`, and the old `strip_cookies @v3_readmodel`): on a positive-signal
+// store the in-scope cache_ttl signal force-stores under the SHARED key, so:
+//   - Set-Cookie is ALWAYS removed — the absolute "a Set-Cookie VALUE is NEVER written into a
+//     cached object" invariant stays intact (the STORED object and every HIT carry none), and
+//     the MISS delivery matches. This bounds the operator-bug case: a per-user route that
+//     erroneously emits X-Cache-Ttl never leaks its session/tracking cookie into the shared
+//     entry. Stripping it before store is ALSO what lets the edge store guard
+//     (isCacheableResponse) persist the object (it otherwise refuses a Set-Cookie response).
+//   - no-store/private/no-cache Cache-Control, `Pragma: no-cache`, and any `Expires` are
+//     removed too (mirrors the Go server's setSharedFreshness + Pragma delete). Removing the
+//     weak Cache-Control also lets the store guard persist the object. A positive `max-age=…`
+//     (without a weak directive) is left intact.
+function stripCredentialedWeakHeaders(headers) {
+  headers.delete("Set-Cookie");
+  const cc = headers.get("Cache-Control");
+  if (cc != null) {
+    const kept = cc
+      .split(",")
+      .map((p) => p.trim())
+      .filter((p) => {
+        if (p === "") return false;
+        const eq = p.indexOf("=");
+        const name = (eq >= 0 ? p.slice(0, eq) : p).trim().toLowerCase();
+        return name !== "no-store" && name !== "private" && name !== "no-cache";
+      });
+    if (kept.length) headers.set("Cache-Control", kept.join(", "));
+    else headers.delete("Cache-Control");
+  }
+  headers.delete("Pragma");
+  headers.delete("Expires");
+}
+
+// credentialedStore reports whether THIS response is a cache_credentialed (D101) positive-
+// signal store: the request is in an origin-authoritative scope AND evalResponse marked the
+// response cacheable (a positive in-scope cache_ttl signal fired — the sole storage gate). On
+// such a store the worker strips Set-Cookie + the weak controls before caching. Returns false
+// instantly on a site without the directive.
+function credentialedStore(ir, ireq, resp, respHeader) {
+  if (!cacheCredentialedMatchesReq(ir, ireq)) return false;
+  return !!evalResponse(ir, ireq, resp.status, respHeader).cacheable;
+}
+
 function storeResponse(ir, ireq, resp, respHeader) {
   const dd = evalDeliver(ir, ireq, respHeader, "MISS");
-  if (!dd.stripCookies || !resp.headers.has("Set-Cookie")) return resp.clone();
+  // The from_header-family control headers a cache_ttl rule CONSUMED must also be removed
+  // from the STORED copy, so a later HIT does not replay them to the client — mirroring the
+  // server, which strips before both store and deliver. The evalResponse walk runs ONLY
+  // when the IR declares a from_header rule (ir.response.hasStripHeaders); the common
+  // config skips it (Finding 5).
+  const strip = ir.response.hasStripHeaders ? evalResponse(ir, ireq, resp.status, respHeader).stripHeaders || [] : [];
+  // cache_credentialed (D101): on a positive-signal store, force-override the weak refusals so
+  // the object actually persists and a later HIT never replays a no-store cadish itself cached.
+  const credStore = credentialedStore(ir, ireq, resp, respHeader);
+  if (!credStore && (!dd.stripCookies || !resp.headers.has("Set-Cookie")) && strip.length === 0) return resp.clone();
   const headers = new Headers(resp.headers);
-  headers.delete("Set-Cookie");
+  if (dd.stripCookies) headers.delete("Set-Cookie");
+  for (const n of strip) headers.delete(n);
+  if (credStore) stripCredentialedWeakHeaders(headers);
   return new Response(resp.clone().body, { status: resp.status, headers });
 }
 
-async function revalidate(ir, ireq, request, geo, cookieAllowActive, originBase, fetchImpl, cache, key, ctx) {
+async function revalidate(ir, ireq, request, geo, credentialed, originBase, fetchImpl, cache, key, ctx) {
   try {
     const resp = await fetchOrigin(request, { originBase, reqHeaderOps: ireq._reqHeaderOps, geo, fetchImpl });
     const respHeader = respHeaderToObj(resp.headers);
     const rdec = evalResponse(ir, ireq, resp.status, respHeader);
-    // Defense in depth: never (re)store a credentialed request's response. This MUST match
-    // the main store guard (handle()): a Cookie only forces a bypass when it is NOT exempted
-    // by cookie_allow — otherwise a cookie_allow entry would store on its first MISS but never
-    // refresh on revalidation, so every post-grace request becomes a MISS (a server↔edge
-    // divergence, since the Go server re-stores). Authorization always bypasses.
-    if (rdec.cacheable && !request.headers.has("Authorization") && !(request.headers.has("Cookie") && !cookieAllowActive)) {
+    // Defense in depth: never (re)store a credentialed request's response. `credentialed` is
+    // the SAME decision the main store guard (handle()) computed AFTER cookie_allow filtering
+    // and the COOKIE-NORM derive→strip — so a controlled/normalized request re-stores on
+    // revalidation (matching the Go server) while a genuinely credentialed one never does.
+    if (rdec.cacheable && !credentialed) {
       await cache.store(
         key,
         storeResponse(ir, ireq, resp, respHeader),
@@ -273,7 +393,7 @@ function cookieNameAllowed(name, patterns) {
 // filterCookieHeader keeps only the cookies whose name is allow-listed, returning the
 // rebuilt Cookie header value (empty when none survive). Mirrors the Go server's
 // FilterRequestCookies so the edge caches the same controlled cookie traffic.
-function filterCookieHeader(raw, patterns) {
+function filterCookieHeader(raw, patterns, keep) {
   if (!raw) return "";
   const out = [];
   for (const pair of raw.split(";")) {
@@ -281,7 +401,28 @@ function filterCookieHeader(raw, patterns) {
     if (!s) continue;
     const eq = s.indexOf("=");
     const name = eq >= 0 ? s.slice(0, eq) : s;
-    if (cookieNameAllowed(name, patterns)) out.push(s);
+    // A `derives_from` axis input is KEPT through cookie_allow (even when not allow-
+    // listed) so the classifier can read it and the key is built from it; it is stripped
+    // later, post-key, by the COOKIE-NORM strip below — mirroring the server.
+    if (cookieNameAllowed(name, patterns) || (keep && keep.has(name))) out.push(s);
+  }
+  return out.join("; ");
+}
+
+// stripCookieNames removes the named cookies from a raw Cookie header value, returning
+// the rebuilt value (empty when none remain). The COOKIE-NORM derive→strip: after the
+// cache key (incl. {TOKEN}) is built from the originals, the declared axis cookies leave
+// the request so the origin is anonymous and the credential check sees no per-user cookie.
+function stripCookieNames(raw, stripSet) {
+  if (!raw) return "";
+  const out = [];
+  for (const pair of raw.split(";")) {
+    const s = pair.trim();
+    if (!s) continue;
+    const eq = s.indexOf("=");
+    const name = eq >= 0 ? s.slice(0, eq) : s;
+    if (stripSet.has(name)) continue;
+    out.push(s);
   }
   return out.join("; ");
 }
@@ -299,14 +440,26 @@ export async function handle(request, env, ctx, deps = {}) {
   // controlled cookie traffic the server does, and the origin (like the cache) never sees
   // the stripped cookies (incl. any session). An empty allowlist strips ALL cookies.
   const cookieAllowActive = !!ir.cookieAllowSet;
+  // COOKIE-NORM: the cookies the ACTIVE `derives_from` axes consume for this request,
+  // computed on the ORIGINAL (unfiltered) request. ALL of them (strip + forward) are KEPT
+  // through cookie_allow so the classifier reads the original value and the key (incl.
+  // {TOKEN}) is built from it. After the key is built, the STRIP-mode cookies are removed
+  // (below) while the FORWARD-mode cookies stay in the request (forwarded to origin, covered
+  // by {TOKEN}) — the same derive→strip/forward the server performs.
+  const derivedStripList = selectedDerivedStripCookies(ir, ireq);
+  const derivedForwardList = selectedDerivedForwardCookies(ir, ireq);
+  const derivedKeep = new Set([...derivedStripList, ...derivedForwardList]);
+  const derivedStripSet = new Set(derivedStripList);
+  const origCookie = request.headers.get("Cookie") || "";
+
   // Compute the filtered Cookie ONCE and rewrite it on the interpreter's request BEFORE
   // evalRequest, exactly as the server filters r.Header before EvalRequest. This makes the
   // cache key match the server for EVERY cookie key token — including `header:Cookie`, which
-  // reads the whole Cookie header (not just `cookie:NAME`). Without this, the edge would key
-  // on the unfiltered header while the server keys on the filtered one (a Go↔JS divergence).
+  // reads the whole Cookie header (not just `cookie:NAME`). The derived-axis inputs are KEPT
+  // here (derivedKeep) so the classifier can read them; they are stripped just below.
   let cookieFiltered = "";
   if (cookieAllowActive) {
-    cookieFiltered = filterCookieHeader(request.headers.get("Cookie") || "", ir.cookieAllow || []);
+    cookieFiltered = filterCookieHeader(origCookie, ir.cookieAllow || [], derivedKeep);
     const ck = canonicalHeaderKey("Cookie");
     if (cookieFiltered) ireq.header.set(ck, [cookieFiltered]);
     else ireq.header.delete(ck);
@@ -314,15 +467,49 @@ export async function handle(request, env, ctx, deps = {}) {
 
   const dec = evalRequest(ir, ireq);
 
-  // cookie_allow: the controlled cookies are exempt from the bypass (set below), and we
-  // forward only the ALLOW-LISTED cookies to the origin (a Cookie header op the fetch
-  // applies) so a stripped session can never reach the backend and produce per-user
-  // content. fetchOrigin builds its headers from the ORIGINAL Fetch Request, so the filtered
-  // value must be (re)applied there as an explicit op even though ireq is already filtered.
-  if (cookieAllowActive) {
-    dec.reqHeaderOps = [cookieFiltered ? { op: "set", name: "Cookie", value: cookieFiltered } : { op: "remove", name: "Cookie" }, ...(dec.reqHeaderOps || [])];
+  // COOKIE-NORM strip: now that the key (incl. {TOKEN}) was built from the ORIGINAL cookies,
+  // remove the active STRIP-mode derives_from cookies from the interpreter request AND from
+  // the value forwarded to origin. FORWARD-mode cookies are deliberately NOT stripped — they
+  // stay so the origin reads them (covered by {TOKEN}). Because the strip cookies are then
+  // absent, the credential bypass (below) sees no per-user strip cookie and the origin gets an
+  // anonymous-w.r.t.-the-axis request (Varnish `unset Cookie` for the static paths).
+  let forwardedCookie = cookieAllowActive ? cookieFiltered : origCookie;
+  if (derivedStripList.length) {
+    forwardedCookie = stripCookieNames(forwardedCookie, derivedStripSet);
+    const ck = canonicalHeaderKey("Cookie");
+    if (forwardedCookie) ireq.header.set(ck, [forwardedCookie]);
+    else ireq.header.delete(ck);
   }
-  ireq._reqHeaderOps = dec.reqHeaderOps; // carried for SWR revalidation
+
+  // cookie_allow / derive-strip: we forward only the controlled (and de-derived) cookies to
+  // the origin (a Cookie header op the fetch applies) so a stripped session or axis cookie can
+  // never reach the backend and produce per-user content. fetchOrigin builds its headers from
+  // the ORIGINAL Fetch Request, so the final value must be (re)applied there as an explicit op.
+  // A forward-mode cookie survives in forwardedCookie, so this op also (re)applies it to origin.
+  // The base ops (pre cookie normalization) are kept so the PASS path can swap the cookie op for
+  // one that forwards the ORIGINAL cookie (SPEC-PASS-FORWARDS-COOKIES), below.
+  const baseReqHeaderOps = dec.reqHeaderOps || [];
+  const cookieNormActive = cookieAllowActive || derivedStripList.length > 0;
+  if (cookieNormActive) {
+    dec.reqHeaderOps = [forwardedCookie ? { op: "set", name: "Cookie", value: forwardedCookie } : { op: "remove", name: "Cookie" }, ...baseReqHeaderOps];
+  }
+  ireq._reqHeaderOps = dec.reqHeaderOps; // carried for SWR revalidation (cacheable: keeps the filtered cookie)
+
+  // cache_credentialed (D101): a request matching a `cache_credentialed @scope` makes caching
+  // ORIGIN-AUTHORITATIVE — the worker (a) does NOT credential-bypass it (caches under the
+  // SHARED key) and (b) forwards the ORIGINAL cookies to origin so the per-user routes
+  // authenticate, mirroring the Go server restoring the original Cookie before the origin
+  // fetch on the cacheable path. The cache key is already built (shared, credential-free), so
+  // the restored cookie reaches only the origin, never the key. When cookieNormActive the
+  // default reqHeaderOps forward the FILTERED cookie — swap them for the original; otherwise
+  // fetchOrigin already forwards the original request cookies (no op). Zero cost without the
+  // directive (cacheCredentialedMatchesReq short-circuits on an empty set).
+  const originAuthoritative = cacheCredentialedMatchesReq(ir, ireq);
+  if (originAuthoritative && cookieNormActive) {
+    const credOps = [origCookie ? { op: "set", name: "Cookie", value: origCookie } : { op: "remove", name: "Cookie" }, ...baseReqHeaderOps];
+    dec.reqHeaderOps = credOps;
+    ireq._reqHeaderOps = credOps;
+  }
 
   if (dec.synthetic) return new Response(dec.synthetic.body, { status: dec.synthetic.status });
   if (dec.redirect) {
@@ -347,6 +534,9 @@ export async function handle(request, env, ctx, deps = {}) {
       // in EdgeCache when the IR omits them.
       kvTtlSeconds: (ir.edge && ir.edge.kvTtlSeconds) || 0,
       kvMaxBytes: (ir.edge && ir.edge.kvMaxBytes) || 0,
+      // cache_unsafe: let the store guard cache private/no-store responses the same way the
+      // interpreter's evalResponse does under cache_unsafe (Set-Cookie stays ironclad, R20).
+      cacheUnsafe: !!ir.cacheUnsafe,
     });
 
   // SAFE BY DEFAULT (security, AUTH-LEAK/COOKIE-LEAK): a request carrying credentials
@@ -363,19 +553,81 @@ export async function handle(request, env, ctx, deps = {}) {
   // same name-aware rule the server enforces (Pipeline.BypassForCredentials). Without
   // cookie_allow, any Cookie bypasses (the conservative edge default). Authorization always
   // bypasses (never cookie-exempt).
-  let credentialed = request.headers.has("Authorization");
-  if (!credentialed && request.headers.has("Cookie")) {
+  // Presence is judged on the interpreter request AFTER cookie_allow filtering and the
+  // COOKIE-NORM strip (ireq), NOT the original Fetch request — so a request whose only
+  // cookies were derives_from axis inputs (now stripped) is anonymous and caches, while a
+  // remaining uncontrolled/unkeyed cookie still forces the bypass. selectedKeyCoversAllCookies
+  // reads the same stripped ireq, so the coverage check matches.
+  //
+  // AUTHORIZATION (R23, DELIBERATE — see ADR D92): the edge ALWAYS bypasses a request carrying
+  // Authorization, even when the cache key covers it (`cache_key … header:Authorization`), where
+  // the server WOULD cache it (Pipeline.keyCoversAuthorization). This is a conscious conservative
+  // policy, NOT an oversight: the edge cache key is stored RAW in the Cache API request URL
+  // (_l1Request → encodeURIComponent(key)) and as the KV key NAME, so keying by Authorization
+  // would write raw bearer tokens into Cloudflare's cache-key namespace — a broader exposure than
+  // the server's in-memory keys. The server behind STILL caches keyed-Authorization traffic, so no
+  // capability is lost globally; the edge tier simply declines that one case. (Cookies ARE keyed
+  // at the edge — selectedKeyCoversAllCookies — because cookie-keyed personalization is common; a
+  // raw-token edge key is the narrower, riskier surface we keep server-only.)
+  // cache_credentialed (D101): in an ORIGIN-AUTHORITATIVE scope the credential bypass is
+  // SKIPPED entirely — neither Authorization NOR a Cookie forces a bypass (the response rules
+  // decide cacheability, and the cookies were forwarded to origin above). v1 covers BOTH
+  // Cookie and Authorization (owner decision); the entry stores under the SHARED key (never
+  // keyed by the credential), so the ADR-D92 "raw token in the edge cache key" concern does
+  // not apply here. Outside such a scope the conservative edge default is unchanged.
+  let credentialed = !originAuthoritative && request.headers.has("Authorization");
+  const remainingCookie = ireq.header.get(canonicalHeaderKey("Cookie"));
+  const hasRemainingCookie = Array.isArray(remainingCookie) && remainingCookie.some((v) => v && v.length);
+  if (!originAuthoritative && !credentialed && hasRemainingCookie) {
     credentialed = !cookieAllowActive || !selectedKeyCoversAllCookies(ir, ireq);
   }
 
-  // Bypass the cache entirely for `pass`, a credentialed request, and for HEAD / Range
-  // requests. A HEAD (bodyless) or a Range (206 partial) response must NEVER be stored
-  // under the method/range-agnostic cache key, where it would later satisfy a full GET
-  // with an empty or truncated body. The Cadish server behind handles Range/HEAD
-  // correctly (it slices a cached 200 — see D35); the edge just passes them.
-  if (dec.pass || credentialed || request.method === "HEAD" || request.headers.has("Range")) {
+  // UNSAFE METHOD (RFC 9111 §3 / §4): a shared cache serves stored responses only to safe
+  // methods and stores only their responses. The Go server never serves/stores an unsafe
+  // method (handler.go isSafeMethod gates both serveFromCache and doStore) — without the
+  // same guard here a POST/PUT/… under a broad `cache_ttl` would be STORED (rdec.cacheable
+  // is method-independent) and a 2nd identical anonymous POST would HIT the edge without
+  // ever reaching origin, silently dropping its side-effect. Safe methods are GET and HEAD;
+  // HEAD already bypasses below, so the unsafe set is "anything but GET/HEAD". Route every
+  // unsafe method through the bypass branch (never cache.lookup/store) — Go parity.
+  const isUnsafeMethod = request.method !== "GET" && request.method !== "HEAD";
+
+  // Bypass the cache entirely for `pass`, a credentialed request, an UNSAFE method, and for
+  // HEAD / Range requests. A HEAD (bodyless) or a Range (206 partial) response must NEVER be
+  // stored under the method/range-agnostic cache key, where it would later satisfy a full GET
+  // with an empty or truncated body. The Cadish server behind handles Range/HEAD correctly
+  // (it slices a cached 200 — see D35); the edge just passes them.
+  if (dec.pass || credentialed || isUnsafeMethod || request.method === "HEAD" || request.headers.has("Range")) {
+    // SPEC-PASS-FORWARDS-COOKIES: a passed / credential-bypassed (uncached) request forwards the
+    // ORIGINAL, pre-filter Cookie to the origin — cookie_allow / derives_from normalization is a
+    // pure cache-key concern with no benefit (and breaks auth: a `pass`ed /me reads a logged-in
+    // user as GUEST) when nothing is cached. SAFE: a passed response is never stored, so the
+    // per-user cookie cannot contaminate a shared entry. Mirrors the Go server's pass branch and
+    // the edge upgrade/tunnel intent. The cacheable path below keeps dec.reqHeaderOps (filtered).
+    let passReqHeaderOps = dec.reqHeaderOps;
+    if (cookieNormActive) {
+      passReqHeaderOps = [origCookie ? { op: "set", name: "Cookie", value: origCookie } : { op: "remove", name: "Cookie" }, ...baseReqHeaderOps];
+    }
     try {
-      const resp = await fetchOrigin(request, { originBase, reqHeaderOps: dec.reqHeaderOps, geo, fetchImpl });
+      const resp = await fetchOrigin(request, { originBase, reqHeaderOps: passReqHeaderOps, geo, fetchImpl });
+      // RFC 9111 §4.4 INVALIDATION: a SUCCESSFUL (2xx/3xx) response to an unsafe method on a
+      // URI invalidates any cached entry for that URI. Forget the SIBLING GET entry — the key
+      // a GET to this same URI would produce — so the next GET re-fetches the post-write body
+      // instead of serving the stale pre-write copy (mirrors the Go server's §4.4 single-key
+      // forget). The sibling key is re-derived from a GET-forced clone of the ORIGINAL request
+      // (its unfiltered Cookie restored implicitly — buildIReq reads request.headers directly,
+      // exactly as Go's siblingGetKey restores origCookie); a method-less custom `cache_key`
+      // yields the same key as the POST (the GET and POST share one entry — the very case §4.4
+      // protects). Best-effort: a delete failure never blocks the write response.
+      if (isUnsafeMethod && resp.status >= 200 && resp.status < 400) {
+        try {
+          const getReq = buildIReq({ method: "GET", url: request.url, headers: request.headers }, geo);
+          const getKey = evalRequest(ir, getReq).cacheKey || dec.cacheKey;
+          if (getKey) await cache.invalidate(getKey, ctx);
+        } catch {
+          /* §4.4 invalidation is best-effort — never fail the unsafe-method response on it */
+        }
+      }
       // HEAD/Range never body-transform (mirrors the server's transform skip).
       return await deliver(ir, ireq, resp, "MISS", undefined, undefined, {
         isHead: request.method === "HEAD",
@@ -390,12 +642,41 @@ export async function handle(request, env, ctx, deps = {}) {
 
   const key = dec.cacheKey;
   const lookup = await cache.lookup(key);
+  // ENCODING GUARD (parity with the Go server's serveFromCache, handler.go ~690): the cache key
+  // does NOT partition by Accept-Encoding (Vary: Accept-Encoding is treated as covered), so a
+  // stored copy may carry a Content-Encoding the origin negotiated for a DIFFERENT client.
+  // Serving it to a client that does not accept that coding hands back an undecodable body (gzip
+  // to an identity-only client, br to a gzip-only client). When the stored coding is not
+  // acceptable, treat the lookup as a MISS so this client gets a fresh origin negotiation —
+  // never a cross-encoding serve. (identity / no Content-Encoding is always acceptable, so the
+  // common case pays one header read and nothing else.)
+  if (lookup.response) {
+    const ce = lookup.response.headers.get("Content-Encoding") || "";
+    if (ce && !clientAcceptsEncoding(request.headers.get("Accept-Encoding") || "", ce)) {
+      lookup.state = "miss";
+      lookup.response = null;
+    }
+  }
+  // CLIENT-FORCED REVALIDATION (client_cache_control) — DELIBERATE edge/server difference,
+  // documented, NOT an oversight. The Go server, by default, honors a request `Cache-Control:
+  // no-cache` / `max-age=0` / `Pragma: no-cache` (RFC 9111 §5.2.1.4) and revalidates with origin
+  // before serving a fresh HIT; `client_cache_control ignore` opts out (handler.go
+  // clientForcesRevalidate). The edge worker intentionally does NOT scan request Cache-Control
+  // and serves the operator-TTL-fresh copy UNCONDITIONALLY: a CDN-style additive tier must not
+  // let a client `no-cache` punch through the shared edge cache to origin (the cache-bust / DoS
+  // vector). This is the by-design `client_cache_control` posture for the edge — equivalent to a
+  // permanent `ignore` at this tier — and Cloudflare's own cache layer ahead of the worker
+  // applies whatever request-Cache-Control handling the zone is configured for. Spec:
+  // developer-docs/specs/done/2026-06-26-client-cache-control-ignore.md ("Edge: N/A — the worker
+  // doesn't scan request Cache-Control; CF cache handles it"). Reference doc: the
+  // client_cache_control entry in docs/cadishfile-reference.md (edge-tier note). So there is no
+  // ignoreClientRevalidation flag in the EdgeIR and nothing to fail closed on here.
   if (lookup.state === "fresh") {
     if (lookup.fromL2) await cache.populateL1(key, lookup.response.clone(), lookup.meta, ctx);
     return await deliver(ir, ireq, lookup.response, "HIT", undefined, key);
   }
   if (lookup.state === "stale") {
-    if (ctx) ctx.waitUntil(revalidate(ir, ireq, request, geo, cookieAllowActive, originBase, fetchImpl, cache, key, ctx));
+    if (ctx) ctx.waitUntil(revalidate(ir, ireq, request, geo, credentialed, originBase, fetchImpl, cache, key, ctx));
     return await deliver(ir, ireq, lookup.response, "HIT-STALE", undefined, key);
   }
 
@@ -449,7 +730,13 @@ export async function handle(request, env, ctx, deps = {}) {
 
   const respHeader = respHeaderToObj(originResp.headers);
   const rdec = evalResponse(ir, ireq, originResp.status, respHeader);
-  if (rdec.cacheable && !request.headers.has("Authorization")) {
+  // cache_credentialed (D101) stores under the SHARED key, so the ADR-D92 "never key the edge
+  // cache by a raw Authorization token" refusal does NOT apply — the token never enters the
+  // key. In an origin-authoritative scope an Authorization-bearing request's response is stored
+  // when evalResponse marks it cacheable (a positive in-scope signal — the sole storage gate;
+  // storeResponse strips Set-Cookie before caching). Outside such a scope the edge still declines
+  // to store any Authorization-bearing response (the conservative default).
+  if (rdec.cacheable && (originAuthoritative || !request.headers.has("Authorization"))) {
     await cache.store(
       key,
       storeResponse(ir, ireq, originResp, respHeader),

@@ -92,6 +92,9 @@ func Run(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	if rejectStrayConfigArgs("run", fs.Args()) {
+		return 2
+	}
 
 	maxBodyBytes, mbErr := parseMaxRequestBodyFlag(*maxRequestBody)
 	if mbErr != nil {
@@ -204,6 +207,10 @@ func Run(args []string) int {
 		AccessLogOff:        accessLogOff,
 		AuditLog:            auditLog,
 		MaxRequestBodyBytes: maxBodyBytes,
+		// Carry the startup --kubeconfig into reloads so a SIGHUP recompile resolves
+		// k8s:// targets against the SAME kubeconfig the process started with (a plain
+		// config.Load on reload would drop it and fall back to the default chain).
+		ReloadOptions: config.LoadOptions{Kubeconfig: *kubeconfig},
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cadish run: %v\n", err)
@@ -248,6 +255,11 @@ func Run(args []string) int {
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
+	// The startup config was applied at construction (NewServer built the routing table
+	// before serving began), so a plain `cadish run` is warm the moment it serves: mark
+	// it so the reserved /.cadish/readyz probe returns 200. (The ingress/gateway
+	// controllers instead mark warm after their FIRST reconcile builds the routing table.)
+	srv.MarkWarm()
 
 	// Start the opt-in admin/dashboard server on its own listener.
 	var adminSrv *admin.Server
@@ -415,12 +427,28 @@ func (a liveAdapter) LiveState() []admin.SiteState {
 // Flags: -strict makes warnings fail the check; -json emits the report as JSON.
 // Exit code: 0 on success (warnings allowed unless -strict), non-zero on errors
 // or parse failures (printed as "file:line:col: msg").
+// rejectStrayConfigArgs reports a loud error (and returns true) when flag parsing
+// left unconsumed positional arguments. The config-loading subcommands take their
+// path via -config, so a stray positional (e.g. `cadish check site.Cadishfile`)
+// would otherwise be SILENTLY ignored and the default ./Cadishfile loaded instead —
+// the operator would validate/serve a different file than they named. Fail loud.
+func rejectStrayConfigArgs(cmd string, rest []string) bool {
+	if len(rest) == 0 {
+		return false
+	}
+	fmt.Fprintf(os.Stderr, "cadish %s: unexpected argument %q; the config path is set with -config (e.g. cadish %s -config %s)\n", cmd, rest[0], cmd, rest[0])
+	return true
+}
+
 func Check(args []string) int {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	cfg := fs.String("config", defaultConfigPath, "path to the Cadishfile")
 	strict := fs.Bool("strict", false, "treat warnings as errors")
 	asJSON := fs.Bool("json", false, "emit the report as JSON")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if rejectStrayConfigArgs("check", fs.Args()) {
 		return 2
 	}
 	return runCheck(*cfg, *strict, *asJSON, os.Stdout, os.Stderr)

@@ -83,7 +83,7 @@ its default so it lands in `/var/lib/cadish/acme`. Reload + start:
 ```sh
 systemctl daemon-reload
 systemctl enable --now cadish
-journalctl -u cadish -f          # cadish logs one access line per request to stderr
+journalctl -u cadish -f          # cadish's operational logs (startup, reloads, errors) — the per-request access log is streamed by `cadish logs`, not written to stderr
 ```
 
 cadish handles SIGINT/SIGTERM with a graceful drain, so `systemctl restart` won't

@@ -35,6 +35,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/net/netutil"
+
 	"github.com/cadi-sh/cadish/internal/cache"
 	"github.com/cadi-sh/cadish/internal/config"
 	"github.com/cadi-sh/cadish/internal/lb"
@@ -127,6 +129,30 @@ type Handler struct {
 	// serves a stored variant must NOT increment it. It is a no-cost atomic add on
 	// the (already opt-in) encode path; the inactive fast path never touches it.
 	encodeCompressions atomic.Int64
+
+	// httpDateCache memoizes the formatted "Date" response header (set on every cache
+	// HIT) at one-second granularity — http.TimeFormat has 1s resolution, so all serves
+	// within the same wall-clock second produce the byte-identical string. The lock-free
+	// atomic read skips a time.Time.Format (and its allocation) on the hot HIT path; the
+	// reformat+store happens at most once per second (a benign race re-stores the same
+	// value). Driven by h.now() so an injected/frozen test clock stays exact.
+	httpDateCache atomic.Pointer[httpDate]
+
+	// warm is the warm-readiness gate for the Kubernetes controllers. It starts FALSE at
+	// construction and is flipped to true (idempotently) by Server.MarkWarm — the
+	// ingress/gateway controllers call it after their FIRST successful reconcile builds
+	// the routing table from synced listers, and `cadish run` calls it once the server is
+	// serving. ServeHTTP reads it lock-free at the very top to answer the reserved
+	// /.cadish/readyz probe (503 until warm, 200 after) so Kubernetes does not route
+	// traffic to a pod whose routing table is not yet built (no rollout 502/404).
+	warm atomic.Bool
+}
+
+// httpDate is a memoized RFC 7231 Date header value plus the unix second it was
+// formatted for (see Handler.httpDate).
+type httpDate struct {
+	sec int64
+	str string
 }
 
 // routing is an immutable routing table: the bound sites plus the host index used
@@ -231,6 +257,17 @@ type Options struct {
 	// 404 (GW-P1): a Gateway API client expects 404 for an unmatched host, and only the
 	// gateway controller opts in — the core (non-gateway) server's 502 is unchanged.
 	UnmatchedHostStatus int
+
+	// ReloadOptions carries the run-time config.LoadOptions a SIGHUP reload must reuse so
+	// the recompiled config keeps the flags the process started with — chiefly the
+	// `--kubeconfig` path for out-of-cluster k8s:// resolution (without it, Reload would
+	// recompile with the ZERO options and the rebuilt k8s client would silently fall back
+	// to the default chain). Set by `cadish run` to LoadOptions{Kubeconfig: *kubeconfig};
+	// the zero value (empty) preserves the default chain, so an unset --kubeconfig is
+	// unchanged. EndpointResolver is deliberately NOT carried here: in `cadish run` the
+	// k8s client is config-owned and a reload intentionally rebuilds it (the ingress
+	// controller, which injects a resolver, drives ApplyConfig directly, not Reload).
+	ReloadOptions config.LoadOptions
 }
 
 func (o Options) withDefaults() Options {
@@ -445,6 +482,19 @@ type Server struct {
 	// store transplant with an old-config teardown.
 	reloadMu sync.Mutex
 
+	// reloadOpts are the run-time LoadOptions a SIGHUP reload recompiles with, so the new
+	// config inherits the startup flags (chiefly --kubeconfig). Set once in NewServer from
+	// Options.ReloadOptions; read by Reload. Immutable after construction.
+	reloadOpts config.LoadOptions
+
+	// tlsBoundAtStart records whether the server bound a TLS-capable :443 listener at
+	// STARTUP (the startup config declared tls/ACME, or ForceTLS). The :443 listener and
+	// the autocert source are fixed at construction and never rebuilt, so a server that
+	// started plain cannot serve a config that a reload later switches to needing TLS —
+	// ApplyConfig reads this to WARN on such a reload. Captured in NewServer (before any
+	// reload mutates the TLS manager's state) and immutable thereafter.
+	tlsBoundAtStart bool
+
 	mu sync.Mutex
 	// tlsServers is the live TLS server pair (nil in plain-HTTP mode).
 	tlsServers *tlsacme.Servers
@@ -496,17 +546,22 @@ func NewServer(cfg *config.Config, httpAddr string, opts Options) (*Server, erro
 		log:         opts.Logger,
 		servingCtx:  ctx,
 		cancel:      cancel,
+		reloadOpts:  opts.ReloadOptions,
 		poolCancels: map[*lb.Upstream]context.CancelFunc{},
 		httpSrv: &http.Server{
 			Addr:              announcedAddr(httpAddr),
 			Handler:           h,
 			ReadHeaderTimeout: serverReadHeaderTimeout,
-			ReadTimeout:       serverReadTimeout,
-			IdleTimeout:       serverIdleTimeout,
+			ReadTimeout:       serverInboundReadTimeout(cfg),
+			IdleTimeout:       serverInboundIdleTimeout(cfg),
 			MaxHeaderBytes:    serverMaxHeaderBytes,
 			// WriteTimeout intentionally unset — see the const block.
 		},
 	}
+	// Capture the startup TLS-listener decision BEFORE any reload can mutate the
+	// manager's host state: mgr.NeedsTLS() here is exactly what ListenAndServe uses to
+	// decide whether to bind :443 (true for an ACME/static startup site or ForceTLS).
+	s.tlsBoundAtStart = s.NeedsTLS()
 	// Start the config's background workers now (fail-fast): when a k8s:// target
 	// exists this blocks on the informer cache sync and FAILS construction if the
 	// API is unreachable or RBAC is missing, rather than serving empty pools. Static
@@ -545,6 +600,62 @@ const (
 	serverMaxHeaderBytes = 64 << 10 // 64 KiB
 )
 
+// serverInboundReadTimeout / serverInboundIdleTimeout resolve the inbound (data-plane)
+// http.Server timeouts: the global `server { read_timeout/idle_timeout }` knob when set
+// to a non-zero value, otherwise the shipped default constant. An absent `server` block
+// (cfg.Server == nil) or an omitted field keeps the default, so behaviour is unchanged.
+func serverInboundReadTimeout(cfg *config.Config) time.Duration {
+	if cfg != nil && cfg.Server != nil && cfg.Server.ReadTimeout > 0 {
+		return cfg.Server.ReadTimeout
+	}
+	return serverReadTimeout
+}
+
+func serverInboundIdleTimeout(cfg *config.Config) time.Duration {
+	if cfg != nil && cfg.Server != nil && cfg.Server.IdleTimeout > 0 {
+		return cfg.Server.IdleTimeout
+	}
+	return serverIdleTimeout
+}
+
+// serverMaxConn returns the configured global inbound connection cap (the `server {
+// maxconn N }` knob), or 0 when no block/knob is set (meaning NO limit — the bare
+// listener, unchanged).
+func (s *Server) serverMaxConn() int {
+	if s.cfg != nil && s.cfg.Server != nil {
+		return s.cfg.Server.MaxConn
+	}
+	return 0
+}
+
+// dataPlaneListenerWrap returns the composed inbound listener wrapper for the public
+// data plane: the opt-in PROXY-protocol reader (when configured) BENEATH the optional
+// `server { maxconn N }` connection limiter (golang.org/x/net/netutil.LimitListener).
+// It returns NIL when neither feature is active, so the default accept path is the bare
+// listener, untouched (zero cost). The limiter is the OUTERMOST wrapper so it bounds the
+// number of simultaneously-accepted connections (the PROXY reader runs per accepted conn).
+func (s *Server) dataPlaneListenerWrap() func(net.Listener) (net.Listener, error) {
+	proxy := s.proxyListenerWrap()
+	max := s.serverMaxConn()
+	if proxy == nil && max <= 0 {
+		return nil
+	}
+	return func(inner net.Listener) (net.Listener, error) {
+		ln := inner
+		if proxy != nil {
+			wrapped, err := proxy(ln)
+			if err != nil {
+				return nil, err
+			}
+			ln = wrapped
+		}
+		if max > 0 {
+			ln = netutil.LimitListener(ln, max)
+		}
+		return ln, nil
+	}
+}
+
 func announcedAddr(addr string) string {
 	if addr == "" {
 		return ":80"
@@ -554,6 +665,14 @@ func announcedAddr(addr string) string {
 
 // Handler exposes the underlying http.Handler (for httptest and embedding).
 func (s *Server) Handler() http.Handler { return s.handler }
+
+// MarkWarm marks the data plane READY to serve (idempotent): the reserved
+// /.cadish/readyz probe returns 200 instead of 503 once this is called. The
+// ingress/gateway controllers call it after their FIRST successful reconcile builds the
+// routing table from synced listers; `cadish run` calls it once the server is serving
+// (its startup config was applied at construction). It is a single lock-free atomic
+// store, safe for concurrent use, and a no-op on every call after the first.
+func (s *Server) MarkWarm() { s.handler.warm.Store(true) }
 
 // AccessHub exposes the server's in-memory access-log fan-out (D44), so the run
 // command can start the unix-socket stream server `cadish logs` consumes.
@@ -597,16 +716,22 @@ func (s *Server) ListenAndServe() error {
 		servers := s.mgr.BuildServers(s.handler, s.httpAddr, s.httpsAddr)
 		// tlsacme.BuildServers sets ReadHeaderTimeout + IdleTimeout; add the
 		// streaming-safe ReadTimeout too (security review #7). WriteTimeout stays
-		// unset so large media downloads over TLS are not truncated.
-		servers.HTTP.ReadTimeout = serverReadTimeout
-		servers.HTTPS.ReadTimeout = serverReadTimeout
+		// unset so large media downloads over TLS are not truncated. The global
+		// `server { read_timeout/idle_timeout }` knob overrides the defaults on BOTH
+		// the :80 and :443 servers (an absent knob keeps the BuildServers defaults).
+		readTO := serverInboundReadTimeout(s.cfg)
+		idleTO := serverInboundIdleTimeout(s.cfg)
+		servers.HTTP.ReadTimeout = readTO
+		servers.HTTPS.ReadTimeout = readTO
+		servers.HTTP.IdleTimeout = idleTO
+		servers.HTTPS.IdleTimeout = idleTO
 		s.mu.Lock()
 		s.tlsServers = servers
 		s.mu.Unlock()
 		// Install the opt-in PROXY-protocol listener wrapper BENEATH TLS (the wire order
 		// is PROXY -> ClientHello -> HTTP). Nil when the feature is off, leaving the bare
 		// net.Listen path untouched (zero cost).
-		servers.WrapListener = s.proxyListenerWrap()
+		servers.WrapListener = s.dataPlaneListenerWrap()
 		if s.log != nil {
 			s.log.Info("cadish serving (TLS)", "http", s.httpAddr, "https", s.httpsAddr, "sites", s.handler.siteCount(), "proxy_protocol", s.proxyProtoEnabled())
 		}
@@ -619,9 +744,10 @@ func (s *Server) ListenAndServe() error {
 	if err != nil {
 		return err
 	}
-	// Wrap the plain-HTTP listener with the PROXY-protocol reader when enabled (zero
-	// cost / bare listener when off).
-	if wrap := s.proxyListenerWrap(); wrap != nil {
+	// Wrap the plain-HTTP listener with the PROXY-protocol reader and/or the
+	// `server { maxconn N }` connection limiter when enabled (zero cost / bare
+	// listener when off).
+	if wrap := s.dataPlaneListenerWrap(); wrap != nil {
 		wrapped, werr := wrap(ln)
 		if werr != nil {
 			_ = ln.Close()
@@ -814,6 +940,27 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// Drain the plain-HTTP server (a no-op in TLS mode, where it never served).
 	err := s.httpSrv.Shutdown(ctx)
 
+	// In TLS mode the in-flight requests live on the :443/:80 tlsacme Servers, NOT on
+	// httpSrv. s.cancel() above unblocks their run loop so they drain THEMSELVES on the
+	// ListenAndServe goroutine, but that drain runs concurrently with this function:
+	// without waiting for it we would close the cache stores + handler machinery (below)
+	// — and the cli, which exits the process the moment Shutdown returns — WHILE an HTTPS
+	// request is still being served, dropping the in-flight request and tearing down the
+	// cache underneath it. Drain the TLS servers here, under the caller's deadline, before
+	// any teardown. http.Server.Shutdown is safe to call concurrently with the run loop's
+	// own call (both simply wait for the connections to go idle).
+	s.mu.Lock()
+	tlsSrv := s.tlsServers
+	s.mu.Unlock()
+	if tlsSrv != nil {
+		if herr := tlsSrv.HTTP.Shutdown(ctx); herr != nil && err == nil {
+			err = herr
+		}
+		if herr := tlsSrv.HTTPS.Shutdown(ctx); herr != nil && err == nil {
+			err = herr
+		}
+	}
+
 	s.handler.Shutdown()
 	// Read the current config under the lock: a concurrent Reload swaps s.cfg under the
 	// same lock. (In practice the cli run loop serializes SIGHUP and SIGTERM, but the
@@ -855,7 +1002,11 @@ func (s *Server) Reload() error {
 	path := s.cfg.ConfigPath
 	s.mu.Unlock()
 
-	next, err := config.Load(path)
+	// Recompile with the SAME run-time options the process started with (chiefly the
+	// --kubeconfig path) so a reload does not silently drop them — config.Load == the ZERO
+	// LoadOptions, which would rebuild a config-owned k8s client against the default chain
+	// instead of the operator's kubeconfig. See specs/.../kubeconfig-lost-on-reload.
+	next, err := config.LoadWithOptions(path, s.reloadOpts)
 	if err != nil {
 		if s.log != nil {
 			s.log.Error("cadish reload: keeping old config", "err", err)
@@ -921,6 +1072,11 @@ func (s *Server) ApplyConfig(next *config.Config) error {
 		return err
 	}
 
+	// LOUD-ON-SILENT-DEGRADATION (reload observability). Two reload-time footguns are
+	// genuinely no-ops on what gets applied but silently mislead the operator; surface
+	// them as WARNINGs BEFORE the transplant overwrites the surviving sites' stores.
+	s.warnReloadFootguns(next, old)
+
 	// Move warm cache stores from the old config onto the matching new sites (close +
 	// discard the cold stores Load just opened) before swapping routing, so the new
 	// routing points at warm caches and the hit ratio survives the swap.
@@ -972,6 +1128,53 @@ func (s *Server) ApplyConfig(next *config.Config) error {
 		s.log.Info("cadish config applied", "config", next.ConfigPath, "sites", s.handler.siteCount())
 	}
 	return nil
+}
+
+// warnReloadFootguns emits a high-signal WARNING for the two reload-time changes that
+// cadish CANNOT apply live but that look applied to the operator (silent degradation):
+//
+//  1. A surviving site's cache RAM/disk BUDGET or disk PATH changed. cache.Store has no
+//     live resize, so TransplantStoresFrom carries the OLD store unchanged — the resize
+//     takes effect only on a full restart. Gated on the actual budget/path values
+//     (config.CacheBudgetChanges), so it fires ONLY when a value really changed, never on
+//     an unrelated reload. Called BEFORE TransplantStoresFrom, while next still holds the
+//     cold stores' new budget/path.
+//  2. The new config NEEDS TLS but the server started PLAIN (no :443 listener bound). The
+//     routing swaps, but HTTPS never serves: the :443 listener and the autocert source are
+//     fixed at startup. Gated on "started plain AND new config needs TLS", so a plain→plain
+//     reload is silent and a TLS-at-startup server never warns.
+//
+// It changes NOTHING about what is applied — observability only.
+func (s *Server) warnReloadFootguns(next, old *config.Config) {
+	if s.log == nil {
+		return
+	}
+	// #1 cache budget/path resize ignored until restart.
+	for _, ch := range next.CacheBudgetChanges(old) {
+		s.log.Warn("cadish reload: cache budget/path change is ignored until restart (cache.Store has no live resize); the running cache keeps its old size/path",
+			"site", ch.Host,
+			"changed", strings.Join(ch.Details, ", "))
+	}
+	// #2 newly-needed TLS not served because the server started plain.
+	if !s.tlsBoundAtStart {
+		if hosts := tlsHostsNeedingTLS(next.TLS); len(hosts) > 0 {
+			s.log.Warn("cadish reload: new config declares TLS but the server started without a :443 listener; HTTPS will NOT be served until a restart (the :443 listener and ACME source are bound at startup)",
+				"hosts", strings.Join(hosts, ", "))
+		}
+	}
+}
+
+// tlsHostsNeedingTLS returns every host across sites that terminates TLS (ACME or a
+// static keypair) — i.e. the hosts that require a bound :443 listener. ModeOff sites
+// contribute nothing. Used to detect (and name) a plain→TLS reload footgun.
+func tlsHostsNeedingTLS(sites []tlsacme.SiteConfig) []string {
+	var hosts []string
+	for _, sc := range sites {
+		if sc.TLS.Mode == tlsacme.ModeACME || sc.TLS.Mode == tlsacme.ModeStatic {
+			hosts = append(hosts, sc.Hosts...)
+		}
+	}
+	return hosts
 }
 
 // reloadDrainGrace is how long Reload waits before closing the cache stores of sites

@@ -11,6 +11,7 @@ require (
 	github.com/oschwald/maxminddb-golang/v2 v2.4.0
 	go.uber.org/automaxprocs v1.6.0
 	golang.org/x/crypto v0.53.0
+	golang.org/x/net v0.55.0
 	k8s.io/api v0.36.2
 	k8s.io/apimachinery v0.36.2
 	k8s.io/client-go v0.36.2
@@ -55,7 +56,6 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
-	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/term v0.44.0 // indirect

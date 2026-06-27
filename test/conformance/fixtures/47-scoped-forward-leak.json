@@ -1,0 +1,21 @@
+{
+  "name": "47-scoped-forward-leak",
+  "cadishfile": "example.com {\n    @premium cookie premium 1\n    classify {tier} {\n        derives_from cookie premium\n        when @premium -> p\n        default       -> f\n    }\n    classify {loyal} {\n        derives_from cookie loyalty forward\n        when cookie loyalty gold -> g\n        default                  -> z\n    }\n    cookie_allow premium loyalty\n    cache_key @premium host url {tier}\n    cache_key default host url {loyal}\n    cache_ttl default ttl 60s\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/p", "header": { "Cookie": ["premium=1; loyalty=gold"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/p", "header": { "Cookie": ["premium=1; loyalty=silver"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/p", "header": { "Cookie": ["loyalty=gold"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

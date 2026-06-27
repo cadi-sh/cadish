@@ -61,9 +61,11 @@
 //     chain can fall through on it AND the server can negatively cache the actual
 //     error page (full-body negative caching, backlog #21). A backend that
 //     reports not-found with no usable body (S3 NoSuchKey) still maps to the
-//     bodyless ErrNotFound sentinel. Other non-2xx statuses (e.g. 5xx) are
-//     returned as a *StatusError (body closed) so a chain can fall through on a
-//     configurable status set without the caller streaming an error page.
+//     bodyless ErrNotFound sentinel. Other non-2xx statuses (e.g. 401/403/5xx) are
+//     returned as a *StatusError so a chain can fall through on a configurable
+//     status set; an HTTP origin attaches the LIVE error body + headers to the
+//     *StatusError (the holder MUST Close it) so the server can stream the origin's
+//     real error response verbatim instead of a synthetic placeholder.
 package origin
 
 import (
@@ -72,6 +74,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -84,15 +87,34 @@ var ErrNotFound = errors.New("origin: object not found")
 
 // StatusError reports that an origin received an HTTP response whose status is
 // neither a success (200/206) nor a plain not-found (which maps to ErrNotFound).
-// The upstream body has already been drained/closed; the caller never streams an
-// error page. A chain.Chain consults its fall-through status set against
-// StatusError.Status to decide whether to try the next origin.
+// A chain.Chain consults its fall-through status set against StatusError.Status
+// to decide whether to try the next origin.
+//
+// BODY OWNERSHIP. An HTTP origin attaches the LIVE upstream non-2xx body + headers
+// (Body, Header, ContentLength) so the server can stream the real error response
+// (an auth challenge, a JSON error envelope, a maintenance page) to the client
+// VERBATIM instead of a synthetic placeholder — a passed/uncached error is never
+// stored, so there is no cache-poisoning risk. When Body is non-nil the holder OWNS
+// it and MUST Close it exactly once (use CloseBody): a chain.Chain that falls
+// through closes the abandoned body; the server streams then closes it. Body is nil
+// for origins that obtained no streamable body (s3origin, a transport-level status),
+// in which case the caller has nothing to close and serves a synthetic status.
 type StatusError struct {
 	// Status is the upstream HTTP status code (e.g. 500, 502, 403).
 	Status int
 	// Origin is a short identifier of the origin that produced it (for logs),
 	// e.g. "httporigin" or "s3origin". Optional.
 	Origin string
+	// Header is the upstream response header set (Content-Type, WWW-Authenticate,
+	// Retry-After, …) so the server delivers the origin's real error headers. May
+	// be nil (no headers captured).
+	Header http.Header
+	// Body is the LIVE upstream error body. When non-nil the holder MUST Close it
+	// exactly once (see CloseBody). nil when no streamable body was captured.
+	Body io.ReadCloser
+	// ContentLength is the length of Body (-1 when unknown/chunked). Meaningful only
+	// when Body is non-nil.
+	ContentLength int64
 }
 
 func (e *StatusError) Error() string {
@@ -100,6 +122,25 @@ func (e *StatusError) Error() string {
 		return fmt.Sprintf("origin: %s upstream status %d", e.Origin, e.Status)
 	}
 	return fmt.Sprintf("origin: upstream status %d", e.Status)
+}
+
+// CloseBody closes the captured upstream body if this StatusError carries one and
+// clears it, so it is safe to call more than once (and a no-op when Body is nil).
+func (e *StatusError) CloseBody() {
+	if e != nil && e.Body != nil {
+		_ = e.Body.Close()
+		e.Body = nil
+	}
+}
+
+// CloseStatusErrBody closes the captured upstream body of a *StatusError wrapped
+// anywhere in err's chain (a no-op for any other error). A chain.Chain uses it to
+// release the body of a fall-through error it is abandoning.
+func CloseStatusErrBody(err error) {
+	var se *StatusError
+	if errors.As(err, &se) {
+		se.CloseBody()
+	}
 }
 
 // StatusOf extracts the HTTP status an error represents for fall-through
@@ -258,11 +299,50 @@ func (r *Response) ContentRange() string { return r.Header.Get("Content-Range") 
 //     #21); caller owns and MUST Close Response.Body. A chain falls through on it.
 //   - (nil, ErrNotFound) when a backend reports not-found WITHOUT a usable body
 //     (e.g. S3 NoSuchKey / 403 for OAI buckets) — no body to close.
-//   - (nil, *StatusError) for any other non-success HTTP status — body already
-//     closed; never streamed.
+//   - (nil, *StatusError) for any other non-success HTTP status. An HTTP origin
+//     attaches the live error body + headers to the *StatusError (holder MUST
+//     Close it) so the server can stream it verbatim; origins with no streamable
+//     body (s3origin, a transport-level status) leave it nil.
 //   - (nil, err) for a connection/transport error or a context cancellation
 //     BEFORE the response headers arrived. (A failure AFTER headers — mid-stream —
 //     surfaces from Response.Body.Read, not here.)
 type Origin interface {
 	Fetch(ctx context.Context, req *Request) (*Response, error)
 }
+
+// UpgradeTarget describes ONE backend an upgrade tunnel should dial: a base URL
+// (scheme + host [+ base path]) plus the per-upstream RoundTripper that already
+// carries the configured transport knobs (connect/TLS timeouts, `sni`,
+// `http_reuse`, `tls_insecure`/`ca_file`/`alpn`). It is the seam the server uses to
+// aim an httputil.ReverseProxy at the routed upstream for a WebSocket /
+// `Connection: Upgrade` passthrough — REUSING the existing per-upstream transport
+// (never a second independent dialer) so lb pick + transport policy stay honored.
+type UpgradeTarget struct {
+	// URL is the backend base URL to dial (scheme + host, plus any base path).
+	URL *url.URL
+	// Transport is the per-upstream round-tripper. nil is allowed (the caller then
+	// falls back to a default transport), but a configured origin always supplies its
+	// own so the upgrade dial honors the same TLS/keepalive policy as a normal fetch.
+	Transport http.RoundTripper
+	// Host is the Host header to send upstream per the upstream's `host_header`
+	// policy. "" means "preserve the client Host" (the cadish default), which the
+	// ReverseProxy honors by leaving the outbound Host as the inbound request's.
+	Host string
+}
+
+// Upgrader is the OPTIONAL capability an Origin implements to support a
+// connection-upgrade (WebSocket / `Connection: Upgrade`) passthrough tunnel. The
+// server type-asserts the routed Origin to this interface; an origin that does not
+// implement it cannot tunnel (the server answers a clean error instead of dialing).
+// ResolveUpgrade returns ONE backend to dial for req, honoring lb health/sticky for
+// a pool. It returns ErrNoUpgradeBackend when no backend is currently eligible. ctx
+// carries the lb routing key (lb.WithRoutingKey) so a sticky / shard-by-key pool pins
+// the tunnel to the SAME backend the Fetch path would pick (Finding 3); pools that do
+// not consult a routing key ignore it.
+type Upgrader interface {
+	ResolveUpgrade(ctx context.Context, req *Request) (UpgradeTarget, error)
+}
+
+// ErrNoUpgradeBackend is returned by Upgrader.ResolveUpgrade when no backend is
+// currently eligible to host the tunnel (e.g. an lb pool with no live backend).
+var ErrNoUpgradeBackend = errors.New("origin: no eligible backend for upgrade tunnel")

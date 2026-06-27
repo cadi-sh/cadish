@@ -91,6 +91,10 @@ type reqInput struct {
 	Geo          string              `json:"geo"`
 	GeoContinent string              `json:"geoContinent"`
 	GeoRegion    string              `json:"geoRegion"`
+	// TLS marks the request as TLS-terminated (backs the {proto}/{scheme} token).
+	// Mirrors the JS fixture's boolean `tls` field so Go and JS resolve {proto} the
+	// same; absent ⇒ false ⇒ {proto} = "http".
+	TLS bool `json:"tls"`
 }
 
 type originResp struct {
@@ -135,6 +139,30 @@ type reqDecision struct {
 	CacheKey     string        `json:"cacheKey"`
 	Purge        *purge        `json:"purge"`
 	ReqHeaderOps []headerOpOut `json:"reqHeaderOps"`
+	// DerivedStrip is the COOKIE-NORM derive→strip probe: the cookies the ACTIVE
+	// derives_from axes consume for this request (stripped post-key, pre-credential/
+	// origin). omitempty so a fixture without derives_from keeps its golden unchanged;
+	// the JS side mirrors it via selectedDerivedStripCookies, proving Go==JS strip sets.
+	DerivedStrip []string `json:"derivedStrip,omitempty"`
+	// DerivedForward is the COOKIE-NORM forward probe: the cookies the ACTIVE
+	// `derives_from … forward` axes FORWARD to origin (kept, covered by {TOKEN}). omitempty
+	// keeps non-forward fixtures unchanged; the JS side mirrors it via
+	// selectedDerivedForwardCookies, proving Go==JS partition strip vs forward identically.
+	DerivedForward []string `json:"derivedForward,omitempty"`
+	// DerivedStripPostStrip / DerivedForwardPostStrip are the Finding-2 SEAM probes: the
+	// strip/forward partition recomputed AFTER the active derives_from cookies are stripped
+	// (the exact seam the credential/forward gate runs on). The gate must judge coverage
+	// against the recipe that BUILT the key — resolvedKeyTokens reuses req.selKey, captured
+	// PRE-strip — never a fresh selectKeyTokens on the now-stripped request. Without this
+	// probe the fixture is byte-identical for the correct (resolvedKeyTokens) and the buggy
+	// (fresh selectKeyTokens) code: both pick the SAME recipe on the un-stripped request, so
+	// it proves nothing about the leak gate. Recomputed on the post-strip request, a scoped
+	// config (≥2 recipes whose selector reads the stripped cookie, e.g. 44/47) FLIPS the
+	// recipe under a fresh re-selection → the partition diverges → the golden catches the
+	// regression. For a single-recipe config (11/45) the partition is stable, so these equal
+	// the pre-strip sets (a pinned no-op). omitempty: only strip-active fixtures carry them.
+	DerivedStripPostStrip   []string `json:"derivedStripPostStrip,omitempty"`
+	DerivedForwardPostStrip []string `json:"derivedForwardPostStrip,omitempty"`
 }
 
 type synthetic struct {
@@ -159,6 +187,22 @@ type respDecision struct {
 	HitForMissNs int64  `json:"hitForMissNs"`
 	StoreTier    string `json:"storeTier"`
 	Cacheable    bool   `json:"cacheable"`
+	// StripHeaders is the from_header-family control headers a matching cache_ttl rule
+	// CONSUMES (X-Cache-Ttl/Grace/Max-Stale) — the headers the runtime removes before
+	// store + deliver so they never leak to the client. The JS interpreter surfaces the
+	// SAME set on its response decision, so a matching golden proves Go and JS strip the
+	// identical headers (Finding 6). omitempty keeps fixtures without a from_header rule
+	// unchanged.
+	StripHeaders []string `json:"stripHeaders,omitempty"`
+	// CredentialedStore mirrors ResponseDecision.CredentialedStore: this response is being
+	// stored under a SHARED key in a cache_credentialed scope ON A PER-RESPONSE ORIGIN SIGNAL
+	// (from_header present / origin max-age) — the SOLE gate authorizing a credentialed share. A
+	// STATIC operator `ttl N` never sets it (the response falls through to the normal Set-Cookie/
+	// shareability refusal). The JS interpreter surfaces the SAME field, so a matching golden
+	// proves Go and JS both REFUSE the static-TTL-only credentialed response and both STORE the
+	// from_header-signal one. omitempty keeps fixtures outside a cache_credentialed scope
+	// unchanged.
+	CredentialedStore bool `json:"credentialedStore,omitempty"`
 }
 
 type delDecision struct {
@@ -228,6 +272,7 @@ func buildRequest(in reqInput) *pipeline.Request {
 		Geo:          in.Geo,
 		GeoContinent: in.GeoContinent,
 		GeoRegion:    in.GeoRegion,
+		TLS:          in.TLS,
 	}
 }
 
@@ -268,10 +313,12 @@ func evalCase(p *pipeline.Pipeline, c kase) decision {
 
 	rq := p.EvalRequest(req)
 	rd := reqDecision{
-		Pass:         rq.Pass,
-		Upstream:     rq.Upstream,
-		CacheKey:     rq.CacheKey,
-		ReqHeaderOps: lowerOps(rq.ReqHeaderOps),
+		Pass:           rq.Pass,
+		Upstream:       rq.Upstream,
+		CacheKey:       rq.CacheKey,
+		ReqHeaderOps:   lowerOps(rq.ReqHeaderOps),
+		DerivedStrip:   p.SelectedDerivedStripCookies(req),
+		DerivedForward: p.SelectedDerivedForwardCookies(req),
 	}
 	if rq.Synthetic != nil {
 		rd.Synthetic = &synthetic{Status: rq.Synthetic.Status, Body: rq.Synthetic.Body}
@@ -294,12 +341,14 @@ func evalCase(p *pipeline.Pipeline, c kase) decision {
 	}
 	rs := p.EvalResponse(req, c.Origin.Status, origHeader)
 	respDec := respDecision{
-		TTLNs:        int64(rs.TTL),
-		GraceNs:      int64(rs.Grace),
-		MaxStaleNs:   int64(rs.MaxStale),
-		HitForMissNs: int64(rs.HitForMiss),
-		StoreTier:    rs.StoreTier,
-		Cacheable:    rs.Cacheable,
+		TTLNs:             int64(rs.TTL),
+		GraceNs:           int64(rs.Grace),
+		MaxStaleNs:        int64(rs.MaxStale),
+		HitForMissNs:      int64(rs.HitForMiss),
+		StoreTier:         rs.StoreTier,
+		Cacheable:         rs.Cacheable,
+		StripHeaders:      rs.StripHeaders,
+		CredentialedStore: rs.CredentialedStore,
 	}
 
 	dl := p.EvalDeliver(req, origHeader, cacheStatusFromToken(c.CacheStatus))
@@ -340,6 +389,18 @@ func evalCase(p *pipeline.Pipeline, c kase) decision {
 	// transport failure has no status → 502).
 	if c.OriginFailed {
 		dec.Outage = outageRef(p, req, origHeader, c.Salvageable, c.OutageStatus)
+	}
+	// Finding-2 SEAM probe: reproduce the derive→strip seam the credential/forward gate runs
+	// on. EvalRequest captured the SELECTED recipe (req.selKey) on the PRE-strip request and
+	// built the key; the server then STRIPS the active derives_from cookies and recomputes the
+	// strip/forward partition — which MUST still reference req.selKey (resolvedKeyTokens), not
+	// re-select on the stripped request. Strip the request HERE (after every other phase has
+	// read the original cookies, and after outageRef) and recompute, so the golden flips if the
+	// gate ever regresses to a fresh selectKeyTokens. req keeps selKey across the strip.
+	if len(rd.DerivedStrip) > 0 {
+		p.StripDerivedCookies(req)
+		dec.Request.DerivedStripPostStrip = p.SelectedDerivedStripCookies(req)
+		dec.Request.DerivedForwardPostStrip = p.SelectedDerivedForwardCookies(req)
 	}
 	return dec
 }
