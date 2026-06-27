@@ -57,7 +57,11 @@ jobs:
           {
             echo "version=0.0.0-${short}"
             echo "date=${date}"
-            echo "tags=ghcr.io/cadi-sh/cadish:${primary}"$'\n'"ghcr.io/cadi-sh/cadish:${short}"
+            # Multi-line output value -> heredoc delimiter form (one tag per line).
+            echo "tags<<__TAGS__"
+            echo "ghcr.io/cadi-sh/cadish:${primary}"
+            echo "ghcr.io/cadi-sh/cadish:${short}"
+            echo "__TAGS__"
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
