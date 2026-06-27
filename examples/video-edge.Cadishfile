@@ -34,6 +34,10 @@ video.example.com {
     storage @vod -> disk
     cache_ttl default ttl 1m
 
+    # Key on path + query so query-varying playlists/media stay distinct (the default
+    # key omits the query), but drop tracking params that never change the response.
+    cache_key method host path query_strip utm_* gclid fbclid
+
     cors * # <video>/MSE players are cross-origin
     header +cache_status X-Cache
 }

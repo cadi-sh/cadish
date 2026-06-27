@@ -36,6 +36,11 @@ cdn.example.com, *.cdn.example.com {
     @segments path *.ts
     pass @segments
 
+    # Key on object path + query, but drop tracking params so the same object isn't
+    # re-fetched per ad/referrer URL (the default key omits the query — make it
+    # explicit; trackers never change the bytes served).
+    cache_key host path query_strip utm_* gclid fbclid
+
     cache_ttl @segments ttl 7d
     cache_ttl status 404 410 ttl 60s grace 1h
     cache_ttl default ttl 2s grace 24h
