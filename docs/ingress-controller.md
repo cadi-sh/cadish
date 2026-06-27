@@ -46,6 +46,74 @@ Ingress / IngressClass / Secret / ConfigMap          (the desired state)
 - **A bad Ingress never takes serving down**: it is skipped with a Kubernetes warning
   Event and the last good routing keeps serving.
 
+## 5-minute Quickstart
+
+The minimal path from a fresh cluster to cadish serving an Ingress. Every command is
+copy-pasteable.
+
+> The shipped manifests pull `ghcr.io/cadi-sh/cadish` — if your pods land in
+> `ImagePullBackOff`, the package is private; see
+> [Troubleshooting → image pull fails](#a-imagepullbackoff--errimagepull).
+
+**1. Install the controller** (IngressClass + RBAC + base ConfigMap + Deployment + LB
+Service). The controller is **not** part of `kubectl apply -k deploy/k8s` (that deploys
+the standalone server), so apply its three manifests explicitly:
+
+```bash
+kubectl apply -f deploy/k8s/namespace.yaml
+kubectl apply -f deploy/k8s/rbac-controller.yaml
+kubectl apply -f deploy/k8s/ingress-controller.yaml
+kubectl rollout status deploy/cadish-ingress -n cadish
+```
+
+(or via Helm: `helm install cadish deploy/helm/cadish --namespace cadish
+--create-namespace --set controller.enabled=true --set
+controller.publishService=cadish/cadish-ingress`.)
+
+**2. Create a tiny backend** — a `whoami` Deployment + Service in its own namespace:
+
+```bash
+kubectl create namespace demo
+kubectl create deployment whoami --image=traefik/whoami:v1.10 -n demo
+kubectl expose deployment whoami --port=80 -n demo
+```
+
+**3. Create an Ingress** with `ingressClassName: cadish`:
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: whoami
+  namespace: demo
+spec:
+  ingressClassName: cadish
+  rules:
+    - host: whoami.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: whoami, port: { number: 80 } } }
+EOF
+```
+
+**4. Curl it through the LoadBalancer** with a `Host` header (no DNS needed):
+
+```bash
+# The external address (.ip for most clouds; .hostname for AWS ELBs):
+LB=$(kubectl get svc cadish-ingress -n cadish \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}')
+curl -H 'Host: whoami.example.com' "http://${LB}/"
+```
+
+You should get the `whoami` pod's request dump. The Ingress `ADDRESS` column
+(`kubectl get ingress -n demo`) is populated by the leader once `--publish-service`
+resolves. No `tls:` block was set, so the host is served over plain HTTP — add one (and
+a Secret, or let cadish ACME-issue) per the [TLS](#tls--from-ingress-spectls-secrets-if-present-else-acme)
+section.
+
 ## Install
 
 ### Manifests
@@ -124,6 +192,13 @@ data:
 
 The fragment is validated in isolation before it is layered in. An **invalid fragment is
 skipped** (a warning Event) and the routes still apply.
+
+> **Cache size/path changes need a pod restart.** Editing a `cache { ram … }` budget or
+> disk path in a live fragment is applied to routing immediately, but the running cache
+> store keeps its original size/path until the pod restarts (a `WARN cadish reload: cache
+> budget/path change is ignored until restart` is logged — it is not silent). Roll the
+> Deployment (`kubectl rollout restart deploy/cadish-ingress -n cadish`) to pick up a new
+> cache budget. TTLs, matchers and other policy hot-reload normally.
 
 A policy fragment is **policy-only** and is compiled in a restricted mode (see
 [Security model](#security-model)): it may carry cache / header / CORS / security /
@@ -276,6 +351,64 @@ guarantees below, which are correct in **any** trust model.
 > previously-deferred hostile-multi-tenant fronts are closed. Hardening remains operator-
 > curated and **off by default** — a single-trust-domain cluster keeps the original behaviour.
 
+## Multi-tenant runbook
+
+The default posture is **single-trust-domain** ([Security model](#security-model)):
+cluster RBAC is the tenant boundary. To run cadish ingress across **untrusted
+namespaces**, layer the controls below — all are **off by default** and a
+single-trust-domain cluster keeps its original behaviour. The invariants in
+[Security model](#security-model) (policy-fragment confinement, first-claim host/TLS
+ownership, SSRF guard, one-bad-tenant-can't-freeze-serving) apply in any trust model;
+this runbook adds the operator-curated bounds on top.
+
+1. **Scope the namespaces you serve.** Run with `-namespace ns1,ns2` (Helm
+   `controller.namespaces=ns1,ns2`) so the controller only reconciles Ingresses in the
+   tenant namespaces you opt in. Reconcile filters by namespace in code even though the
+   informers list cluster-wide.
+
+2. **Scope the Secret/ConfigMap blast radius (C1).** By default the controller caches
+   **every** Secret and ConfigMap cluster-wide. Bound it two ways, combined:
+   - **Label-scope the cached reads** — `-watch-label-selector cadi.sh/managed=true`
+     (or `-secret-label-selector` / `-configmap-label-selector` for one each). Only
+     labelled objects ever enter the informer cache, so a compromise reads only what you
+     labelled. You **must** then label your BYO/cert-manager TLS Secrets and your
+     `cadi.sh/policy` ConfigMaps, or a TLS host falls through to ACME and a fragment
+     resolves to empty.
+   - **Scope the granted RBAC** — apply
+     [`deploy/k8s/rbac-controller-scoped.yaml`](../deploy/k8s/rbac-controller-scoped.yaml)
+     instead of `rbac-controller.yaml` (or Helm `controller.rbac.scoped=true` with
+     `controller.namespaces`). This drops the cluster-wide `secrets`/`configmaps` read
+     rule and grants those reads via per-namespace `Role`s. Core k8s RBAC cannot filter
+     by label, so the selector bounds **which objects** are cached and the per-namespace
+     Roles bound **which namespaces** are readable — use both. (EndpointSlice/Ingress
+     reads stay cluster-wide.) See [RBAC & least privilege](#rbac--least-privilege).
+
+3. **Cap each tenant's footprint.** A noisy or hostile namespace can't starve the others:
+   `-max-sites-per-namespace N`, `-max-routes-per-namespace N`, and `-max-fragment-bytes N`
+   reject the excess **oldest-Ingress-first** (the namespace's earlier sites/routes keep
+   serving; only the newest over-the-line ones are dropped, each with a per-Ingress
+   warning Event). An over-size `cadi.sh/policy` fragment is rejected before it is
+   compiled. Every cap is `0` = unlimited; other namespaces are never affected.
+
+4. **Restrict ACME to permitted domains.** ACME issuance is always bounded to the
+   watched-host union, but with untrusted tenants also set `-acme-domain-policy
+   'team-a=a.example.com;team-b=b.example.com'` so a namespace can only auto-issue for
+   its own domain suffixes (the apex and any subdomain; a leading `*.` is normalised
+   away). A host whose **owning** namespace is not permitted its domain is excluded from
+   the issuer HostPolicy (no `tls acme` rendered) and surfaced as a warning Event.
+
+5. **Rely on first-claim host ownership.** A host's routing **and** TLS are owned by the
+   **oldest** Ingress that declared a rule for it; an Ingress in a *different* namespace
+   that tries to contribute rules, a `spec.defaultBackend`, or a `spec.tls` cert for that
+   host is **rejected for that host** (per-Ingress Event) and never merged — a tenant
+   cannot claim, parasitize, or hijack the cert of another namespace's hostname. Same
+   namespace still merges. No flag needed; this is always on. (See
+   [Security model](#security-model) for the full statement.)
+
+Recommended baseline for an untrusted-multi-tenant cluster: `rbac-controller-scoped.yaml`
+**+** `-watch-label-selector` **+** `-namespace` **+** the per-namespace caps **+**
+`-acme-domain-policy`.
+
 ## HA & leader election
 
 Every replica **serves traffic** with no coordination — run 2+ for HA. A `client-go`
@@ -320,6 +453,137 @@ controller terminates TLS, `/.cadish/readyz` is **exempt from the HTTP→HTTPS r
 never a `301`. This matters because a Kubernetes `httpGet` probe treats **both 2xx and 3xx
 as success** — if the probe were redirected it would pass regardless of warm state,
 silently defeating the gate. Keep the probe on the HTTP scheme/`:80` port for this reason.
+
+## Troubleshooting
+
+Quick diagnoses for the failures you are most likely to hit. Each has a symptom, the
+command to confirm it, and the fix.
+
+### (a) `ImagePullBackOff` / `ErrImagePull`
+
+**Symptom.** Controller pods never start; `kubectl get pods -n cadish` shows
+`ImagePullBackOff`.
+
+**Diagnose.**
+
+```bash
+kubectl describe pod -n cadish -l app.kubernetes.io/name=cadish-ingress | grep -A3 -i pull
+```
+
+A `denied`/`unauthorized`/`manifest unknown` on `ghcr.io/cadi-sh/cadish` means the
+image is private to the node's pull credentials.
+
+**Fix** — pick one:
+
+- **Make the GHCR package public** (simplest): on github.com/cadi-sh, open the `cadish`
+  package → *Package settings* → *Change visibility* → Public.
+- **Use an imagePullSecret.** Create a docker-registry Secret in the `cadish` namespace
+  and reference it: with Helm set `imagePullSecrets: [{name: ghcr}]`; with the raw
+  manifest add `imagePullSecrets` under the Deployment pod `spec`.
+
+  ```bash
+  kubectl create secret docker-registry ghcr -n cadish \
+    --docker-server=ghcr.io --docker-username=<user> --docker-password=<token>
+  ```
+
+- **Sideload the image** (air-gapped / k3s): pull elsewhere, `docker save`, copy, then on
+  each node `sudo k3s ctr images import cadish.tar` and set `image.pullPolicy=IfNotPresent`.
+
+### (b) Ingress `ADDRESS` stays empty
+
+**Symptom.** `kubectl get ingress -n <ns>` shows no `ADDRESS`, even though traffic works.
+
+**Diagnose.**
+
+```bash
+kubectl get svc cadish-ingress -n cadish                     # does the LB have an EXTERNAL-IP?
+kubectl logs -n cadish -l app.kubernetes.io/name=cadish-ingress | grep -i 'publish\|leader\|status'
+```
+
+The status writer is **leader-only** and reads the publish Service's address.
+
+**Fix.**
+
+- Confirm the LoadBalancer Service actually got an external address (a bare cluster with
+  no cloud LB / MetalLB leaves it `<pending>` — there is then no address to publish).
+- Confirm `-publish-service cadish/cadish-ingress` is set (it is in the shipped manifest;
+  Helm needs `controller.publishService=cadish/cadish-ingress`). Empty disables status
+  writing.
+- The ClusterRole must grant `get` on `services` (the leader does a direct GET of the
+  publish Service) — see error (d). Without it the address resolves to `""`.
+
+### (c) 404 / 502 / no route
+
+**Symptom.** The request returns 404, a `502 no site configured for host`, or the wrong
+backend instead of yours.
+
+**Diagnose.**
+
+```bash
+kubectl get ingress -n <ns> <name> -o jsonpath='{.spec.ingressClassName}{"\n"}'  # must be 'cadish'
+kubectl describe ingress -n <ns> <name>                                          # Events: conflicts/rejects
+kubectl get endpointslices -n <ns> -l kubernetes.io/service-name=<svc>           # any READY endpoints?
+```
+
+**Fix.**
+
+- **Class mismatch** — `ingressClassName` must be `cadish` (or the legacy
+  `kubernetes.io/ingress.class: cadish` annotation, or mark the IngressClass default).
+  An Ingress with another class is simply not served by cadish.
+- **Host mismatch** — cadish is host-routed; the request `Host` must equal a `rules[].host`.
+  Test with `curl -H 'Host: <host>'`. With two or more sites, an unknown host gets a
+  **`502` with body `no site configured for host`** — it is never silently sent to another
+  Ingress's `defaultBackend`. (Special case: with exactly **one** site configured, cadish
+  serves that lone site for *every* host, so a wrong host still returns `200` from the
+  single backend; add a second host and the match becomes strict.)
+- **No ready backends** — if the Service has no ready EndpointSlices (pods not ready /
+  scaled to zero / wrong `port`) the upstream is empty and returns 503/closes. Check the
+  pods are `Ready` and the Service `port` matches.
+- **Path-scoped 404** — a site with only explicit paths and no `Prefix /` catch-all (and
+  no `spec.defaultBackend`) returns 404 for any unmatched path by design.
+
+### (d) RBAC `forbidden` in controller logs
+
+**Symptom.** Logs show `... is forbidden: User "system:serviceaccount:cadish:cadish-ingress"
+cannot list/get/watch resource ...`.
+
+**Diagnose.**
+
+```bash
+kubectl logs -n cadish -l app.kubernetes.io/name=cadish-ingress | grep -i forbidden
+kubectl auth can-i list secrets --as=system:serviceaccount:cadish:cadish-ingress
+```
+
+**Fix.** Apply (or re-apply) `deploy/k8s/rbac-controller.yaml` — it grants exactly the
+needed verbs: `get/list/watch` on `endpointslices`, `ingresses`, `ingressclasses`,
+`secrets`, `configmaps`; `get` on `services`; `update/patch` on `ingresses/status`;
+`create/patch` on `events`; and the leader `leases` Role. A `forbidden` on `secrets`
+after switching to the **scoped** RBAC usually means a TLS Secret lives in a namespace
+not listed in `controller.namespaces` (its per-namespace `Role` was never created).
+
+### (e) TLS not terminating
+
+**Symptom.** HTTPS fails (cert error, or the host falls back to plain HTTP / a self-signed
+cert).
+
+**Diagnose.**
+
+```bash
+kubectl get secret -n <ns> <secretName> -o jsonpath='{.type}{"\n"}'   # must be kubernetes.io/tls
+kubectl describe ingress -n <ns> <name> | grep -i 'BadTLSSecret\|tls\|acme'
+```
+
+**Fix.**
+
+- **BYO cert** — the Secret named in `spec.tls[].secretName` must exist in the Ingress's
+  namespace, be type `kubernetes.io/tls`, and carry a parseable `tls.crt`/`tls.key`. An
+  unparseable keypair falls back to ACME with a `BadTLSSecret` Event.
+- **Label selector** — if you set `-watch-label-selector`, the TLS Secret must carry that
+  label or the controller never sees it (the host falls through to ACME).
+- **ACME issuance** — for an auto-issued host the LB must be reachable on `:80` for HTTP-01,
+  and (if set) the owning namespace must be permitted the domain by `-acme-domain-policy`,
+  else the host is excluded from the issuer HostPolicy (warning Event). Set `--acme-email`
+  and a persistent `--acme-cache` to avoid re-issuing on restart (Let's Encrypt rate limits).
 
 ## CLI flags
 

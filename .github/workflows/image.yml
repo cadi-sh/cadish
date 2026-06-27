@@ -1,0 +1,94 @@
+name: image
+
+# Build + push the multi-arch container image WITHOUT cutting a full release.
+#
+# Two triggers:
+#   * workflow_dispatch — manual "build me an image" button. Pick the tag
+#     (defaults to "edge"); useful for ad-hoc rebuilds of :latest/:edge.
+#   * push to main touching the binary or the image recipe — keeps a rolling
+#     ghcr.io/cadi-sh/cadish:edge (+ :<short-sha>) tracking the tip of main.
+#
+# Versioned, signed, SBOM'd release images still come from release.yml on a
+# `v*` tag. This workflow is the lightweight, on-demand path.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to push (e.g. edge, rc1, latest)"
+        required: true
+        default: "edge"
+  push:
+    branches: [main]
+    paths:
+      - "cmd/**"
+      - "internal/**"
+      - "deploy/Dockerfile"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/image.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout only
+      packages: write # push the multi-arch image to GHCR
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Derive tags + build metadata
+        id: meta
+        run: |
+          short="$(git rev-parse --short HEAD)"
+          date="$(git log -1 --format=%cI)"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            primary="${{ inputs.tag }}"
+          else
+            primary="edge"
+          fi
+          {
+            echo "version=0.0.0-${short}"
+            echo "date=${date}"
+            echo "tags=ghcr.io/cadi-sh/cadish:${primary}"$'\n'"ghcr.io/cadi-sh/cadish:${short}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: true
+          sbom: true
+          build-args: |
+            VERSION=v${{ steps.meta.outputs.version }}
+            COMMIT=${{ github.sha }}
+            DATE=${{ steps.meta.outputs.date }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=cadish
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/cadi-sh/cadish
