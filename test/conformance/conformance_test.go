@@ -19,6 +19,15 @@
 // run without it (the CI default) to assert the committed files still match a
 // fresh projection + evaluation (so neither the projector nor the pipeline can
 // drift from the contract the JS side is pinned to).
+//
+// NOTE — route exclusions (D102, EdgeIR.routeExclusions / `edge { bypass_passes }`)
+// have NO conformance fixture ON PURPOSE: they are a DEPLOY/ROUTING concern (which CF
+// routes to create), not a Go↔JS runtime decision. The worker runtime never reads the
+// field — a request that still reaches the worker is passed correctly regardless — so
+// there is nothing for the JS interpreter to decide and nothing to cross-check here.
+// The analysis is covered by internal/edgeir/exclusions_test.go and the deploy plane by
+// internal/edgedeploy/deploy_test.go. (The only effect on these fixtures was the v7→v8
+// irVersion bump.)
 package conformance
 
 import (
@@ -173,6 +182,7 @@ type synthetic struct {
 type redirect struct {
 	Status   int    `json:"status"`
 	Location string `json:"location"`
+	NoStore  bool   `json:"noStore,omitempty"`
 }
 
 type purge struct {
@@ -217,6 +227,14 @@ type delDecision struct {
 	CacheKeyHeader string `json:"cacheKeyHeader"`
 	CacheKeyRaw    bool   `json:"cacheKeyRaw"`
 	CacheKeyValue  string `json:"cacheKeyValue"`
+	// CacheAgeHeader mirrors the `header +cache_age` directive: the configured target
+	// header name ("" when no directive). The actual age VALUE is NOT in the golden
+	// because it is computed from storedAt at delivery time (time-dependent, not
+	// deterministic at the decision level). The conformance suite asserts Go and JS
+	// surface the SAME configured header name; the exact integer age is exercised by
+	// the server integration test (cache_age_header_test.go). omitempty so fixtures
+	// without +cache_age keep unchanged goldens.
+	CacheAgeHeader string `json:"cacheAgeHeader,omitempty"`
 
 	// Transforms is the ordered list of `replace` rules whose scope matched this
 	// response (the deliver-phase body-substitution decision, D75). BodyTransformed +
@@ -304,10 +322,11 @@ func evalCase(p *pipeline.Pipeline, c kase) decision {
 
 	// {device} pre-pass parity (D70): the server resolves req.Device from the
 	// User-Agent via the site's classifier before EvalRequest. Mirror that here when the
-	// fixture does not pre-set a device and the site keys on {device}, so the Go golden
-	// reflects the SAME classification the edge worker performs natively from the IR
-	// device ruleset — the conformance probe that the two classifiers agree.
-	if req.Device == "" && p.UsesDeviceToken() {
+	// fixture does not pre-set a device and the site uses {device} ANYWHERE — keyed OR
+	// reflected in a header/redirect (UsesDeviceClassification, matching the server's
+	// handler.go gate) — so the Go golden reflects the SAME classification the edge
+	// worker performs natively from the IR device ruleset.
+	if req.Device == "" && p.UsesDeviceClassification() {
 		req.Device = p.DeviceClassifier().Classify(userAgentOf(c.Request))
 	}
 
@@ -324,7 +343,7 @@ func evalCase(p *pipeline.Pipeline, c kase) decision {
 		rd.Synthetic = &synthetic{Status: rq.Synthetic.Status, Body: rq.Synthetic.Body}
 	}
 	if rq.Redirect != nil {
-		rd.Redirect = &redirect{Status: rq.Redirect.Status, Location: rq.Redirect.Location}
+		rd.Redirect = &redirect{Status: rq.Redirect.Status, Location: rq.Redirect.Location, NoStore: rq.Redirect.NoStore}
 	}
 	if rq.Purge != nil {
 		rd.Purge = &purge{Authorized: rq.Purge.Authorized, Regex: rq.Purge.Regex}
@@ -358,6 +377,7 @@ func evalCase(p *pipeline.Pipeline, c kase) decision {
 		CacheStatusHeader: dl.CacheStatusHeader,
 		CacheKeyHeader:    dl.CacheKeyHeader,
 		CacheKeyRaw:       dl.CacheKeyRaw,
+		CacheAgeHeader:    dl.CacheAgeHeader,
 		Transforms:        lowerReplacements(dl.Transforms),
 	}
 	// `replace` body transform (D75): apply the matched transforms to the case body,

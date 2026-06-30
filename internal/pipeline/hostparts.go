@@ -12,7 +12,7 @@ import "strings"
 // curated table that both runtimes embed verbatim (see edge/runtime/interpreter.js
 // BASE_SUFFIXES — it MUST stay in sync with this map). Single-label TLDs need no
 // entry: an unlisted final label is treated as a one-label suffix (the PSL default
-// "*" rule), so `nudity.tv` → base `nudity.tv` falls out without listing `tv`.
+// "*" rule), so `brand-a.example` → base `brand-a.example` falls out without listing `example`.
 //
 // The table lists common ICANN multi-label ccTLD suffixes plus selected
 // private/whitelabel suffixes (the PSL's "PRIVATE DOMAINS" idiom — a vendor base
@@ -47,10 +47,10 @@ const maxSuffixLabels = 4
 // template tokens.
 //
 //   - base — the registrable domain: the public suffix plus one more label
-//     (`es.nudity.tv` → `nudity.tv`, `www.amateur.tv` → `amateur.tv`,
+//     (`es.brand-a.example` → `brand-a.example`, `www.brand-b.example` → `brand-b.example`,
 //     `cam4you.tech555.io` → `cam4you.tech555.io`).
 //   - sub  — the label(s) below the registrable domain (`es`, `www`, `pt`), EMPTY
-//     for a bare base host (`nudity.tv` → "").
+//     for a bare base host (`brand-a.example` → "").
 //
 // The input is normally already lower-cased and port-stripped (it is the VALIDATED
 // {host} value); hostParts re-normalizes defensively so it is correct on any input.

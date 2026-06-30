@@ -105,7 +105,7 @@ func TestEveryProjectableKindHasFixture(t *testing.T) {
 	wantMatcherKinds := []string{
 		"path", "path_regex", "host", "host_regex", "header", "method", "upstream",
 		"content_type", "resp_header", "cookie", "cookie_json", "header_json", "set_cookie",
-		"classify", "geo", "query_present",
+		"classify", "geo", "query_present", "query", "all",
 	}
 	// Cache-key token kinds: the Kind values of pipeline.toEdgeKeyToken.
 	wantTokenKinds := []string{
@@ -381,8 +381,6 @@ func bytesIndex(s, sub string) int {
 // asserted by TestServerOnlyKindsInLockstep so this can never silently drift again. A kind
 // here need not have a JS matchOne case — it must never silently match at the edge.
 var serverOnlyMatcherKinds = map[string]bool{
-	"all":              true,
-	"query":            true,
 	"upstream_healthy": true, // live lb-pool liveness probe — no edge analogue (D49)
 	"ip":               true, // IP/CIDR ACL — resolves the real client IP, no edge analogue (R02)
 }

@@ -1,5 +1,5 @@
 {
-  "irVersion": 6,
+  "irVersion": 9,
   "site": {
     "hosts": [
       "qa.example.com"
@@ -103,6 +103,7 @@
     "cacheStatusHeader": "X-Cache",
     "cacheKeyHeader": "X-Cache-Key"
   },
+  "usesGeo": false,
   "keyHeaderNames": [
     "x-variant"
   ],

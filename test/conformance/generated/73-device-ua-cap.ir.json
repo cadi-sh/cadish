@@ -1,0 +1,99 @@
+{
+  "irVersion": 9,
+  "site": {
+    "hosts": [
+      "cap.example.com"
+    ],
+    "redirectHosts": [
+      "cap.example.com"
+    ],
+    "canonicalHost": "cap.example.com"
+  },
+  "upstream": {},
+  "matchers": {},
+  "device": {
+    "rules": [
+      {
+        "class": "special",
+        "substrings": [
+          "uniquepasttoken"
+        ]
+      }
+    ],
+    "default": "desktop"
+  },
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      },
+      {
+        "kind": "device"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          },
+          {
+            "kind": "device"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "set",
+            "name": "X-Device-Class",
+            "value": "{device}",
+            "valueIsTmpl": true
+          }
+        ]
+      },
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache"
+  },
+  "usesGeo": false,
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

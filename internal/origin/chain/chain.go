@@ -188,6 +188,15 @@ func (c *Chain) Fetch(ctx context.Context, req *origin.Request) (*origin.Respons
 		// body for whoever finally surfaces it.
 		origin.CloseStatusErrBody(lastErr)
 		lastErr = err
+		// ErrSkip is a no-op decline: the origin returned WITHOUT reading req.Body, so the
+		// body is intact and we MUST fall through to the next origin even for a write — a
+		// PeerOrigin that skips a read-through (bypass/write/loop/self guard) must hand the
+		// request to the real origin, not 404 it (F-C / silent write loss). Don't hold it
+		// as the surfaced error.
+		if errors.Is(err, origin.ErrSkip) {
+			lastErr = nil
+			continue
+		}
 		// Do NOT fall through to another origin when the request carries a body — the
 		// consumed-and-non-replayable body plus non-idempotency rationale above. Surface
 		// the first origin's error.
@@ -217,6 +226,13 @@ func (c *Chain) Fetch(ctx context.Context, req *origin.Request) (*origin.Respons
 	if lastNeg != nil {
 		origin.CloseStatusErrBody(lastErr)
 		return lastNeg, nil
+	}
+	// If every origin merely SKIPPED (ErrSkip → lastErr cleared) and none answered,
+	// there is no real error to surface — report a miss so the caller (server) treats
+	// it as a not-found rather than a nil/nil contract violation. In practice the real
+	// origin is always last and never skips, so this is a defensive backstop.
+	if lastErr == nil {
+		return nil, origin.ErrNotFound
 	}
 	return nil, lastErr
 }

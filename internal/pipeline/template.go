@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -31,6 +32,20 @@ type TemplateEnv struct {
 	Geo          string
 	GeoContinent string
 	GeoRegion    string
+
+	// Device is the resolved device class for the {device} template token (desktop /
+	// mobile / tablet / bot). Mirrors the {device} cache-key token but makes the
+	// resolved bucket available in header values and redirect targets. Filled from
+	// req.Device on both the header path and the redirect path (redirect.go sets
+	// Device: req.Device). Left "" only when no device pre-pass ran — i.e. the cache
+	// key does not use {device}; see Pipeline.UsesDeviceToken.
+	Device string
+
+	// QueryParams holds the parsed query parameters (url.Values) for the {query.NAME}
+	// placeholder, which resolves to NAME's first decoded value from the query string
+	// (empty string when the parameter is absent). Filled from req.Query on the header
+	// path and the redirect path; nil means the placeholder is left verbatim.
+	QueryParams url.Values
 
 	// Scheme is the request scheme for the {proto}/{scheme} placeholder: "https"
 	// when cadish terminated TLS for the inbound connection, else "http". It is filled
@@ -169,8 +184,8 @@ func (e *TemplateEnv) named(name string, cr classifyResolver) (string, bool) {
 	case "host":
 		return e.Host, true
 	case "host.base":
-		// Registrable base domain of {host}, public-suffix aware (es.nudity.tv ->
-		// nudity.tv). Derived from e.Host — which on the redirect path is the VALIDATED
+		// Registrable base domain of {host}, public-suffix aware (es.brand-a.example ->
+		// brand-a.example). Derived from e.Host — which on the redirect path is the VALIDATED
 		// redirect host (p.redirectHost), never the raw attacker Host — so the computed
 		// host keeps the F12 open-redirect defense.
 		b, _ := hostParts(e.Host)
@@ -194,6 +209,14 @@ func (e *TemplateEnv) named(name string, cr classifyResolver) (string, bool) {
 		return e.GeoContinent, true
 	case "geo.region":
 		return e.GeoRegion, true
+	case "device":
+		// {device} echoes the same resolved device bucket the cache key uses
+		// (desktop/mobile/tablet/bot). The value comes from the pre-pass (req.Device
+		// filled by the server/conformance harness before EvalDeliver). An empty Device
+		// (no device_detect configured, or device unused) expands to "" — consumed,
+		// not kept verbatim — matching the intention to emit a possibly-empty reflected
+		// value (same as {geo} when no geo block is configured).
+		return e.Device, true
 	case "proto", "scheme":
 		// {proto}/{scheme}: "https" when cadish terminated TLS for the inbound
 		// connection, else "http". Both the header and redirect paths set Scheme from
@@ -202,6 +225,12 @@ func (e *TemplateEnv) named(name string, cr classifyResolver) (string, bool) {
 			return "https", true
 		}
 		return "http", true
+	}
+	if qn, ok := strings.CutPrefix(name, "query."); ok && qn != "" {
+		// {query.NAME} resolves to NAME's first decoded value from the parsed query
+		// (empty string when absent). url.Values.Get returns "" for an absent key,
+		// which matches the intention to emit a possibly-empty reflected value.
+		return e.QueryParams.Get(qn), true
 	}
 	if hn, ok := strings.CutPrefix(name, "http."); ok && hn != "" {
 		if e.Header == nil {

@@ -1,0 +1,173 @@
+[
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "q.example.com\u001f/video",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 0,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        },
+        {
+          "op": "set",
+          "name": "X-Genre",
+          "value": "comedy"
+        },
+        {
+          "op": "set",
+          "name": "X-Age",
+          "value": "25"
+        },
+        {
+          "op": "set",
+          "name": "X-CamLang",
+          "value": "en-US"
+        },
+        {
+          "op": "set",
+          "name": "X-Miss",
+          "value": ""
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "q.example.com\u001f/video",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 0,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "HIT"
+        },
+        {
+          "op": "set",
+          "name": "X-Genre",
+          "value": "drama"
+        },
+        {
+          "op": "set",
+          "name": "X-Age",
+          "value": "30"
+        },
+        {
+          "op": "set",
+          "name": "X-CamLang",
+          "value": ""
+        },
+        {
+          "op": "set",
+          "name": "X-Miss",
+          "value": ""
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  },
+  {
+    "request": {
+      "pass": false,
+      "synthetic": null,
+      "redirect": null,
+      "upstream": "",
+      "cacheKey": "q.example.com\u001f/video",
+      "purge": null,
+      "reqHeaderOps": []
+    },
+    "response": {
+      "ttlNs": 60000000000,
+      "graceNs": 0,
+      "maxStaleNs": 0,
+      "hitForMissNs": 0,
+      "storeTier": "",
+      "cacheable": true
+    },
+    "deliver": {
+      "respHeaderOps": [
+        {
+          "op": "set",
+          "name": "X-Cache",
+          "value": "MISS"
+        },
+        {
+          "op": "set",
+          "name": "X-Genre",
+          "value": ""
+        },
+        {
+          "op": "set",
+          "name": "X-Age",
+          "value": ""
+        },
+        {
+          "op": "set",
+          "name": "X-CamLang",
+          "value": ""
+        },
+        {
+          "op": "set",
+          "name": "X-Miss",
+          "value": ""
+        }
+      ],
+      "stripCookies": false,
+      "cors": null,
+      "cacheStatusHeader": "X-Cache",
+      "cacheKeyHeader": "",
+      "cacheKeyRaw": false,
+      "cacheKeyValue": "",
+      "transforms": [],
+      "bodyTransformed": false,
+      "transformedBody": ""
+    }
+  }
+]

@@ -13,7 +13,10 @@
 // Keep this in lockstep with the Go pipeline: a change to the Go matcher/eval
 // semantics must be mirrored here, and the conformance suite must stay green.
 
-export const IR_VERSION = 6;
+// v8 (D102) adds the deploy-plane-only EdgeIR.routeExclusions; no runtime semantics
+// change. Bumped in lockstep with internal/edgeir.IRVersion so the baked version check
+// matches the runtime.
+export const IR_VERSION = 9;
 
 // ---------------------------------------------------------------------------
 // Header / cookie / host helpers (port of net/http + request.go semantics).
@@ -608,10 +611,11 @@ function compiledRegExp(src, flags) {
 // matchOne evaluates a single IR matcher against the context.
 function matchOne(ir, m, ctx) {
   const req = ctx.req;
-  // A server-only matcher kind (`all`/`query` — slice-2 Gateway matchers with no edge
-  // runtime) is marked serverOnly + delegated by the Go projector; fail it CLOSED here
-  // so it never silently matches if one slipped into the IR (Fix #4), mirroring
-  // regexUntranslatable.
+  // A server-only matcher kind (`ip`/`upstream_healthy` — no edge analogue: real-client-IP
+  // ACL / live lb-pool liveness) is marked serverOnly + delegated by the Go projector; fail
+  // it CLOSED here so it never silently matches if one slipped into the IR (Fix #4),
+  // mirroring regexUntranslatable. (`all`/`query` became edge-native in v7 and have cases
+  // below.)
   if (m.serverOnly) return false;
   switch (m.kind) {
     case "path":
@@ -704,8 +708,41 @@ function matchOne(ir, m, ctx) {
     }
     case "query_present": {
       if (req.query.size === 0) return false;
-      for (const name of req.query.keys()) if (nameGlobMatch(m.queryNames, name)) return true;
+      const nonEmpty = m.queryNamesNonEmpty;
+      const hasNonEmptySet = nonEmpty && nonEmpty.length > 0;
+      for (const [name, vals] of req.query.entries()) {
+        if (!nameGlobMatch(m.queryNames, name)) continue;
+        // If this name is in the non-empty subset, require ≥1 non-empty value —
+        // Varnish `=[^&]+` parity: `?t=` (empty) does NOT match `t+`, `?t=abc` does.
+        if (hasNonEmptySet && nameGlobMatch(nonEmpty, name)) {
+          if (vals.some((v) => v !== "")) return true;
+          continue; // all values empty — keep scanning other params
+        }
+        return true; // presence-only: any value (including empty) counts
+      }
       return false;
+    }
+    case "query": {
+      // One named query param vs an OR set of exact values (v7). Reads the same parsed
+      // multimap (req.query: Map<string,string[]>) entry.js builds; mirrors the Go matcher
+      // (matcher.go kindQuery): absent => false; empty values => presence-only; else OR over
+      // ALL occurrences of a repeated param (?a=1&a=2). Case-sensitive, byte-exact.
+      const vals = req.query.get(m.name);
+      if (!vals) return false;
+      if (!m.values || m.values.length === 0) return true;
+      return vals.some((got) => m.values.includes(got));
+    }
+    case "all": {
+      // AND-conjunction of named sub-matchers, each XOR'd with its negate (v7). Mirrors the
+      // Go respondTermsMatch: short-circuit on the first failing term, empty => true. Subs
+      // are depth-1 (compile forbids all-of-all and response-phase subs); a missing ref is
+      // failed CLOSED (false) so a corrupt IR never silently matches.
+      for (const t of m.subs || []) {
+        const sub = ir.matchers[t.ref];
+        const got = sub ? matchOne(ir, sub, ctx) : false;
+        if (got === !!t.negate) return false;
+      }
+      return true;
     }
   }
   return false;
@@ -830,18 +867,41 @@ function deviceRuleMatches(rule, lua) {
   return true;
 }
 
-// applyDeviceFold follows the fold chain, bounded by the fold count so a configured
-// cycle terminates (mirrors classify.applyFold).
+// applyDeviceFold follows the fold chain to its terminal class. A misconfigured
+// CYCLE (a→b→a) is detected via a visited set and terminates DETERMINISTICALLY at
+// the revisited class — a byte-for-byte port of Go's classify.applyFold (classify.go).
+// The old iteration-count loop (`i <= folds.length`) did one extra step, so a 2-cycle
+// returned "b" where Go returns "a" (CLS-P1); keep the two in lockstep.
 function applyDeviceFold(folds, cls) {
   if (!folds || folds.length === 0) return cls;
   const map = new Map();
   for (const f of folds) map.set(f.from, f.into);
-  for (let i = 0; i <= folds.length; i++) {
-    const next = map.get(cls);
-    if (next === undefined) break;
-    cls = next;
+  let seen = null;
+  for (;;) {
+    if (!map.has(cls)) return cls;
+    if (seen !== null && seen.has(cls)) return cls; // cycle: stop at the revisited class
+    if (seen === null) seen = new Set();
+    seen.add(cls);
+    cls = map.get(cls);
   }
-  return cls;
+}
+
+// MAX_CLASSIFY_UA_LEN mirrors Go's maxClassifyUALen (classify.go) — the device
+// classifier caps the User-Agent to this many BYTES before lower-casing/matching,
+// so a match token sitting past the cap is invisible to BOTH runtimes (CLS-P2).
+const MAX_CLASSIFY_UA_LEN = 1024;
+
+// capClassifyUA bounds a User-Agent to MAX_CLASSIFY_UA_LEN UTF-8 BYTES, matching
+// Go's `ua[:maxClassifyUALen]` byte slice. Without this the edge would match against
+// the full UA while the Go origin truncates it, so a >1KB UA with its only device
+// token past byte 1024 would classify differently across the server/edge boundary
+// and fork the {device} cache variant. The short-UA fast path avoids encoding on the
+// hot path: <=341 UTF-16 units can be at most 1023 UTF-8 bytes (<=3 bytes/unit).
+function capClassifyUA(ua) {
+  if (ua.length <= 341) return ua;
+  const bytes = new TextEncoder().encode(ua);
+  if (bytes.length <= MAX_CLASSIFY_UA_LEN) return ua;
+  return new TextDecoder().decode(bytes.subarray(0, MAX_CLASSIFY_UA_LEN));
 }
 
 // classifyDevice resolves the {device} bucket for a request from the IR's device
@@ -854,7 +914,7 @@ function classifyDevice(ir, req) {
   const ua = headerGet(req, "User-Agent");
   let cls = dc.default || DEVICE_BUILTIN_DEFAULT;
   if (ua !== "") {
-    const lua = ua.toLowerCase();
+    const lua = capClassifyUA(ua).toLowerCase();
     for (const r of dc.rules || []) {
       if (deviceRuleMatches(r, lua)) {
         cls = r.class;
@@ -1409,6 +1469,11 @@ function templateNamed(env, name, classifyFn) {
       return [env.geoContinent || "", true];
     case "geo.region":
       return [env.geoRegion || "", true];
+    case "device":
+      // {device} echoes the resolved device bucket (desktop/mobile/tablet/bot).
+      // env.device is pre-computed in headerTemplateEnv / evalRedirect env so this
+      // mirrors Go's TemplateEnv.Device: consumed (ok=true) even when empty.
+      return [env.device || "", true];
     case "proto":
     case "scheme":
       // {proto}/{scheme}: "https" when the original request reached the edge over
@@ -1416,6 +1481,14 @@ function templateNamed(env, name, classifyFn) {
       // envs all populate env.scheme from req.scheme, so this reflects TLS on every
       // path; it falls back to "http" only when scheme is genuinely unset.
       return [env.scheme === "https" ? "https" : "http", true];
+  }
+  if (name.startsWith("query.") && name.length > 6) {
+    // {query.NAME}: first decoded value of query param NAME, or "" when absent.
+    // env.queryParams is the request's Map<string,string[]> (from newRequest /
+    // buildIReq). An absent key or a null queryParams yields "" (consumed, not
+    // kept verbatim) — mirrors Go's url.Values.Get semantics.
+    const vals = env.queryParams && env.queryParams.get(name.slice(6));
+    return [vals && vals.length ? vals[0] : "", true];
   }
   if (name.startsWith("http.") && name.length > 5) {
     if (!env.header) return ["", true];
@@ -1430,6 +1503,50 @@ function templateNamed(env, name, classifyFn) {
 function headerGetFromMap(headerMap, name) {
   const v = headerMap.get(canonicalHeaderKey(name));
   return v && v.length ? v[0] : "";
+}
+
+// REDIRECT_SCHEME_PREFIX mirrors Go's redirectSchemePrefix (redirect.go): a leading RFC 3986
+// scheme followed by its ':' separator. A SPECIAL scheme (http/https) introduces the
+// authority right after the ':' regardless of slash count/direction (browsers fold '\'→'/').
+const REDIRECT_SCHEME_PREFIX = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+
+// locationAuthority extracts the AUTHORITY span (host[:port], INCLUDING any leading userinfo
+// before an '@') of a CONCRETE, already-expanded Location — a faithful port of Go's
+// redirectAuthorityRest + locationAuthority (redirect.go). It folds '\'→'/', trims all leading
+// slashes after the scheme/`//` boundary, and returns the substring up to the first '/', '?'
+// or '#' (or the whole remainder). A relative result (no scheme, no leading "//") has no
+// authority → ["", false]. Keeping the full span (userinfo included) makes
+// `nudity.tv@evil.example.com` compare UNEQUAL to the reference `nudity.tv`.
+function locationAuthority(s) {
+  let rest;
+  const m = REDIRECT_SCHEME_PREFIX.exec(s);
+  if (m) {
+    rest = s.slice(m[0].length).replace(/\\/g, "/").replace(/^\/+/, "");
+  } else {
+    const norm = s.replace(/\\/g, "/");
+    if (!norm.startsWith("//")) return ["", false];
+    rest = norm.replace(/^\/+/, "");
+  }
+  const j = rest.search(/[/?#]/);
+  if (j >= 0) return [rest.slice(0, j), true];
+  return [rest, true];
+}
+
+// normalizeRedirectLocation reduces an expanded Location to EXACTLY the bytes the HTTP layer
+// puts on the wire — a byte-identical port of Go's normalizeRedirectLocation (redirect.go).
+// The Fetch API `Headers.set`/response serialization trims leading/trailing optional
+// whitespace (OWS), and user agents IGNORE control bytes embedded in a URL, so a Location
+// like "  //evil.example.com/" (leading OWS) or one carrying an embedded TAB/CR/LF would
+// report NO authority to a naive inspector yet navigate off-origin once those bytes are
+// stripped (an embedded CR/LF is also a header-splitting vector). We (1) remove every byte a
+// UA ignores or that mangles a header — TAB, LF, CR, FF, NUL — anywhere, then (2) trim EVERY
+// leading/trailing byte <= 0x20 (ASCII space + the whole C0 control range). Step (2) matters:
+// per the WHATWG URL spec a UA strips ALL leading C0-control-or-space before parsing, so a
+// leading "\x0b" (vertical tab, or any 0x01-0x08/0x0B/0x0E-0x1F) would otherwise survive and
+// let the authority check be skipped while the UA still resolves off-origin. Byte-identical
+// port of Go's normalizeRedirectLocation (redirect.go) — keep the two in lockstep.
+function normalizeRedirectLocation(s) {
+  return s.replace(/[\t\n\r\f\x00]/g, "").replace(/^[\x00-\x20]+/, "").replace(/[\x00-\x20]+$/, "");
 }
 
 function expandTemplate(tmpl, env, classifyFn) {
@@ -1490,27 +1607,66 @@ function cacheStatusToken(cacheStatus) {
   return "MISS";
 }
 
-function headerTemplateEnv(ctx) {
+// headerTemplateEnv builds the value-resolution env from `vreq` — the VALUE-context
+// request, which for a request-phase header is the MASKED request (unkeyed class fields
+// blanked) so neither a raw class token nor a class-derived {device} forwards an unkeyed
+// class to origin (F-A1). Scope matching uses the real request elsewhere.
+function headerTemplateEnv(ir, vreq) {
   return {
-    host: normalizeHost(ctx.req.host),
-    path: ctx.req.path,
-    query: canonicalQuery(ctx.req, false, null),
-    header: ctx.req.header,
-    clientIP: ctx.req.clientIP,
-    geo: ctx.req.geo,
-    geoContinent: ctx.req.geoContinent,
-    geoRegion: ctx.req.geoRegion,
-    scheme: ctx.req.scheme,
+    host: normalizeHost(vreq.host),
+    path: vreq.path,
+    query: canonicalQuery(vreq, false, null),
+    queryParams: vreq.query, // Map<name,string[]> for {query.NAME}
+    header: vreq.header,
+    clientIP: vreq.clientIP,
+    geo: vreq.geo,
+    geoContinent: vreq.geoContinent,
+    geoRegion: vreq.geoRegion,
+    // {device}: a masked value-request carries the ALREADY-resolved bucket (real class
+    // when keyed, "" when unkeyed — _deviceResolved), so we must NOT re-classify it (that
+    // would turn a deliberately-blanked "" back into a UA classification). Otherwise
+    // resolve the bucket: explicit vreq.device wins, else native UA classification.
+    device: vreq._deviceResolved ? (vreq.device || "") : (vreq.device || classifyDevice(ir, vreq)),
+    scheme: vreq.scheme,
     capture: null,
   };
 }
 
-function applyHeaderRules(ir, rules, ctx, cacheStatus, resolveStatus) {
+// maskedValueRequest returns the request to RESOLVE request-phase header values against:
+// a copy of ctx.req whose class fields (device/geo*) are blanked unless the SELECTED
+// cache-key recipe varies on them (ISO-1/ISO-2 edge twin of pipeline.maskedValueContext).
+// Returns ctx.req unchanged when the recipe keys on every class the request could forward.
+function maskedValueRequest(ir, ctx, selectedToks) {
+  let device = false, geo = false, geoContinent = false, geoRegion = false;
+  for (const t of selectedToks || []) {
+    if (t.kind === "device") device = true;
+    else if (t.kind === "geo") geo = true;
+    else if (t.kind === "geo.continent") geoContinent = true;
+    else if (t.kind === "geo.region") geoRegion = true;
+  }
+  if (device && geo && geoContinent && geoRegion) return ctx.req;
+  const mreq = { ...ctx.req };
+  // Resolve the device bucket ONCE from the REAL request, then keep it only when the
+  // selected recipe keys on device (mirrors Go, where req.Device is the pre-resolved
+  // bucket that masking blanks). _deviceResolved tells headerTemplateEnv not to
+  // re-classify (which would resurrect an unkeyed class from the UA).
+  mreq.device = device ? (ctx.req.device || classifyDevice(ir, ctx.req)) : "";
+  mreq._deviceResolved = true;
+  if (!geo) mreq.geo = "";
+  if (!geoContinent) mreq.geoContinent = "";
+  if (!geoRegion) mreq.geoRegion = "";
+  return mreq;
+}
+
+function applyHeaderRules(ir, rules, ctx, valReq, cacheStatus, resolveStatus) {
   const ops = [];
   let env = null;
+  // valCtx resolves VALUES against the (request-phase: masked) request, so a class-derived
+  // {classify.NAME} buckets on the blanked class fields too. Scope matching uses ctx.
+  const valCtx = valReq === ctx.req ? ctx : { req: valReq, upstream: ctx.upstream, respHeader: ctx.respHeader };
   const classifyFn = (name) => {
     if (!ir.classifiers || !ir.classifiers[name]) return ["", false];
-    return [classifyResolve(ir, name, ctx), true];
+    return [classifyResolve(ir, name, valCtx), true];
   };
   for (const r of rules || []) {
     if (!scopeMatches(ir, r.scope, ctx)) continue;
@@ -1525,9 +1681,15 @@ function applyHeaderRules(ir, rules, ctx, cacheStatus, resolveStatus) {
         // cacheKeyRaw) and materialized from the built key — never emitted as an op.
         continue;
       }
+      if (op.op === "cache_age") {
+        // The object age is derived from the storedAt timestamp at delivery time,
+        // not from the header op value. It is surfaced on the deliver decision
+        // (cacheAgeHeader) and materialized from now − storedAt in entry.js.
+        continue;
+      }
       let value = op.value || "";
       if (op.valueIsTmpl) {
-        if (!env) env = headerTemplateEnv(ctx);
+        if (!env) env = headerTemplateEnv(ir, valReq);
         value = expandTemplate(value, env, classifyFn);
       }
       ops.push({ op: op.op, name: op.name, value });
@@ -1591,7 +1753,12 @@ export function evalRequest(ir, req) {
       break;
     }
   }
-  dec.reqHeaderOps = applyHeaderRules(ir, (ir.recv && ir.recv.headerReq) || [], ctx, "MISS", false);
+  // Select the cache-key recipe FIRST so request-phase header values are masked against
+  // the class tokens THIS request's key varies on (the selected recipe, not a union) —
+  // ISO-1. The masked request also neutralizes a class-derived {classify.NAME} (ISO-2).
+  const selectedToks = selectKeyTokens(ir, ctx);
+  const valReq = maskedValueRequest(ir, ctx, selectedToks);
+  dec.reqHeaderOps = applyHeaderRules(ir, (ir.recv && ir.recv.headerReq) || [], ctx, valReq, "MISS", false);
   dec.cacheKey = buildKey(ir, req, ctx);
   return dec;
 }
@@ -1639,12 +1806,16 @@ function evalRedirect(ir, r, ctx) {
     host: redirectHost(ir, req),
     path: req.path,
     query: canonicalQuery(req, false, null),
+    queryParams: req.query, // Map<name,string[]> for {query.NAME}
     capture: null,
     header: req.header,
     clientIP: req.clientIP,
     geo: req.geo,
     geoContinent: req.geoContinent,
     geoRegion: req.geoRegion,
+    // {device}: resolve the same bucket the cache key uses — mirrors Go's redirect.go
+    // which sets Device: req.Device from the pre-pass result.
+    device: req.device || classifyDevice(ir, req),
     // scheme backs {proto}/{scheme} in the redirect Location, mirroring the Go server
     // (redirectRule.eval populates TemplateEnv.Scheme from req.TLS). Without it a
     // `redirect … {proto}://…` over TLS would wrongly emit "http" — a Go↔edge divergence.
@@ -1665,7 +1836,44 @@ function evalRedirect(ir, r, ctx) {
     if (!ir.classifiers || !ir.classifiers[name]) return ["", false];
     return [classifyResolve(ir, name, ctx), true];
   };
-  return { status: r.status, location: expandTemplate(r.target, env, classifyFn) };
+  const loc = normalizeRedirectLocation(expandTemplate(r.target, env, classifyFn));
+  // Open-redirect RUNTIME defense — byte-identical to the Go server (redirect.go
+  // redirectRule.eval + locationAuthority). The compile-time guard treats a $N backref and
+  // literal text in the authority as safe, so `https://{host}$1$2?{query}` ships — but at
+  // runtime a request like `/index.php@evil.example.com/` drives a capture into the authority,
+  // making the validated {host} mere USERINFO and the attacker string the real origin (and a
+  // relative target like {query.next} can expand to an absolute off-origin Location). After
+  // expansion, re-derive the authority with every request-sourced input NEUTRALIZED (captures
+  // + request tokens → "", validated host family + scheme KEPT). If it differs, the request
+  // injected an off-origin host → SUPPRESS the redirect (return null) so the request falls
+  // through to normal handling. Only computed for an absolute/protocol-relative Location.
+  const [gotAuth, gotHas] = locationAuthority(loc);
+  if (gotHas) {
+    const refEnv = {
+      ...env,
+      capture: null,
+      path: "",
+      query: "",
+      queryParams: null,
+      header: null,
+      clientIP: "",
+      geo: "",
+      geoContinent: "",
+      geoRegion: "",
+      device: "",
+      // host + scheme are KEPT (validated host family + scheme are trusted).
+    };
+    const refLoc = normalizeRedirectLocation(expandTemplate(r.target, refEnv, null));
+    const [refAuth, refHas] = locationAuthority(refLoc);
+    if (!refHas || refAuth !== gotAuth) return null;
+  }
+  const result = { status: r.status, location: loc };
+  // noStore: additive v7 field. When present in the IR (the `no_store` modifier),
+  // include it in the decision so entry.js attaches the Cache-Control header and the
+  // conformance suite can assert Go and JS agree. Omit when falsy so a plain redirect
+  // decision stays byte-identical to the pre-modifier golden (mirrors Go's omitempty).
+  if (r.noStore) result.noStore = true;
+  return result;
 }
 
 function selectorMatches(rule, status, ir, ctx) {
@@ -1899,12 +2107,25 @@ export function evalResponse(ir, req, status, respHeader) {
     // per-response signal: it FALLS THROUGH to the normal shareability refusal — never authorizing a
     // credentialed share — so a per-user response (Set-Cookie, no X-Cache-Ttl) under a co-existing
     // `cache_ttl default ttl 60s` is refused, not leaked cross-user (mirrors Go's EvalResponse).
-    if (perResponseSignal && cacheCredentialedMatches(ir, ctx)) {
+    const credMatches = cacheCredentialedMatches(ir, ctx);
+    if (credMatches && perResponseSignal) {
       // dec.cacheable stays true; the worker strips Set-Cookie + weak headers on store+deliver.
       // credentialedStore is surfaced on the decision so the Go==JS conformance golden distinguishes
       // a per-response-signal credentialed share (true) from a static-TTL-only refusal (cacheable
-      // flips false in the else branch). Mirrors the Go ResponseDecision.CredentialedStore field.
+      // flips false in the else-if branch). Mirrors the Go ResponseDecision.CredentialedStore field.
       dec.credentialedStore = true;
+    } else if (credMatches) {
+      // In a cache_credentialed scope with NO per-response signal: a STATIC `ttl N` (the in-scope
+      // rule OR a co-existing `cache_ttl default ttl N`) set dec.cacheable, but a static TTL is NOT
+      // authorization to share a credentialed response. The per-response signal is the SOLE storage
+      // gate (fail-closed), so REFUSE UNCONDITIONALLY — even with no Set-Cookie / no Vary / no
+      // uncacheable Cache-Control. Without this the edge would store a personalized in-scope 200
+      // lacking X-Cache-Ttl under the SHARED key (the confirmed cross-user leak). Byte-identical to
+      // the Go EvalResponse fail-closed branch.
+      dec.cacheable = false;
+      dec.ttlNs = 0;
+      dec.graceNs = 0;
+      dec.maxStaleNs = 0;
     } else {
       const setCookieBlocks = hasSetCookie(respHeader) && !stripCookiesMatches(ir, ctx);
       if (varyStar(respHeader) || setCookieBlocks || (!ir.cacheUnsafe && !safelyShareable(respHeader, keyHeaders))) {
@@ -1929,12 +2150,13 @@ export function evalDeliver(ir, req, respHeader, cacheStatus) {
   const ctx = { req, upstream, respHeader: respHeader || null };
   const headerResp = (ir.response && ir.response.headerResp) || [];
   const dec = {
-    respHeaderOps: applyHeaderRules(ir, headerResp, ctx, cacheStatus, true),
+    respHeaderOps: applyHeaderRules(ir, headerResp, ctx, ctx.req, cacheStatus, true),
     stripCookies: false,
     cors: null,
     cacheStatusHeader: "",
     cacheKeyHeader: "",
     cacheKeyRaw: false,
+    cacheAgeHeader: "",
   };
   for (const r of headerResp) {
     if (!scopeMatches(ir, r.scope, ctx)) continue;
@@ -1944,6 +2166,7 @@ export function evalDeliver(ir, req, respHeader, cacheStatus) {
         dec.cacheKeyHeader = op.name;
         dec.cacheKeyRaw = op.value === "raw";
       }
+      if (op.op === "cache_age") dec.cacheAgeHeader = op.name;
     }
   }
   for (const sc of (ir.response && ir.response.stripCookies) || []) {
@@ -2231,6 +2454,10 @@ export function decide(ir, input) {
   deliver.cacheKeyValue = deliver.cacheKeyHeader
     ? cacheKeyHeaderValue(request.cacheKey, deliver.cacheKeyRaw)
     : "";
+  // Trim cacheAgeHeader when empty: mirrors Go's json:",omitempty" on CacheAgeHeader
+  // so fixtures without +cache_age produce identical goldens to the pre-feature state
+  // (the field is absent in both Go and JS output, not a diverging empty string).
+  if (!deliver.cacheAgeHeader) delete deliver.cacheAgeHeader;
   // `replace` body transform probe (D75): apply the matched transforms to the case
   // body with the IR cap + skip gating, the Go↔JS byte-identity assertion (incl.
   // over-cap pass-through). With no body the result is ("", false), matching Go.

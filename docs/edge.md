@@ -46,7 +46,7 @@ The IR JSON goes to the file/stdout you choose; the **coverage report goes to st
 
 ```console
 $ cadish edge build -config storefront.cadish -o storefront.edgeir.json
-edge coverage — example.com,*.example.com (IR v6)
+edge coverage — example.com,*.example.com (IR v9)
   edge-native: 21 directive(s)
   delegated:   1 directive(s)
     - purge x1 → pass: purge auth guards compare a SECRET token (the purge token, D12) that must never ship to a public edge worker; delegated to the Cadish server behind
@@ -137,11 +137,12 @@ reason — never silently dropped — and surfaced in the coverage report.
 | `cache_key` — **all tokens AND scoped, first-match-wins recipes** (`cache_key @scope …`, D65/D70): `{device}`/`{geo}`/`{geo.continent}`/`{geo.region}`/`{tenant}`/`{sticky}`, `normalize`, `classify`, `query_allow`, `header:` | |
 | `device_detect` — the `{device}` User-Agent classifier runs **natively** at the edge (D70): the worker classifies from the request's `User-Agent` against the projected ruleset, no `X-Cadish-Device` header needed | |
 | `cache_ttl` (ttl / grace / hit_for_miss / **`max_stale`**, D70 — the edge bounds stale-on-error to the configured window) | |
+| `cache_credentialed` (D101) — origin-authoritative caching of in-scope credentialed requests: the worker skips the credential bypass and stores under the SHARED key **only** on a positive in-scope `cache_ttl` signal (fail-closed — no signal ⇒ not stored), stripping the per-user Set-Cookie/weak controls before store | |
 | `storage` (tier intent) | |
-| `respond`, `redirect` (regex + scoped + map) | |
+| `respond`, `redirect` (regex + scoped + map; `no_store` modifier — see below) | |
 | `strip_cookies`, `cors` | |
-| `header` (set/append/remove, `+cache_status`, `+cache_key`, dynamic `{…}` values) | `purge` — **all** forms (single-key + regex BAN): the guard compares a secret token a public edge worker must not hold (D34) |
-| matchers: `path`/`path_regex`/`host`/`host_regex`/`header`/`header_regex`/`method`/`upstream`/`cookie`/`cookie_json`/`header_json`/`set_cookie`/`content_type`/`geo`/`query_present`/`classify` | `allow` / `deny` / `block` / `rate_limit` — the **security gate** is SERVER-ONLY (see "What the edge intentionally does NOT do" below) |
+| `header` (set/append/remove, `+cache_status`, `+cache_key`, `+cache_age`, dynamic `{…}` values incl. `{device}` and `{query.NAME}`) | `purge` — **all** forms (single-key + regex BAN): the guard compares a secret token a public edge worker must not hold (D34) |
+| matchers: `path`/`path_regex`/`host`/`host_regex`/`header`/`header_regex`/`method`/`upstream`/`cookie`/`cookie_json`/`header_json`/`set_cookie`/`content_type`/`geo`/`query_present`/`query`/`all`/`classify` | `allow` / `deny` / `block` / `rate_limit` — the **security gate** is SERVER-ONLY (see "What the edge intentionally does NOT do" below) |
 
 Every `purge` is delegated — its guard compares a secret token that must never ship to
 a public edge worker (see "Secrets never reach the edge" above, and D34). A site's
@@ -169,6 +170,8 @@ conformance suite asserts it across representative UAs. The edge deliberately ig
 client-supplied `X-Cadish-Device` header (attacker-controllable at the first hop) and does
 not trust Cloudflare's own device signal — it runs the Cadishfile's own ruleset so the two
 runtimes stay in lockstep.
+
+> **Note:** `{device}` resolves to empty string in header templates (e.g. `header X-Device {device}`) unless the cache key also uses `{device}`. The classifier runs only when the key varies on device; add `cache_key … {device}` to enable it.
 
 ### `max_stale` bounds edge stale-on-error (D70)
 
@@ -235,21 +238,60 @@ matching no `on_error` scope falls back to the bare status (or 502 for a thrown 
 synthetic body is operator config (never reflected request data) and is not cached — it is an
 availability stopgap, identical to the server's `writeOnError`.
 
+### `redirect no_store` — personalized-redirect cache guard
+
+Appending `no_store` to a `redirect` line tells **both** the cadish server and the edge
+worker to attach `Cache-Control: no-store, no-cache, must-revalidate, private` to the 3xx
+response:
+
+```
+@lang cookie lang es
+redirect @lang 302 https://es.example.com{uri} no_store
+```
+
+Use it when the redirect is **personalized** (driven by a cookie or `Accept-Language` token)
+so no shared cache or browser serves one user's redirect target to a different user. The edge
+worker reads the IR field `recv.redirect[].noStore` (additive v7 — a stale runtime simply omits
+the header, which is the pre-modifier behavior) and includes it in its redirect `Response`.
+
+### Redirect open-redirect runtime guard (server + edge)
+
+A `redirect` whose expanded `Location` would place a request-sourced value (a `$N` regex
+capture, or a relative target driven by `{query.NAME}`/`{http.NAME}`) in the **authority**
+(host) position is an open redirect. Beyond the compile-time check, **both** the cadish server
+and the edge worker apply a **runtime post-expansion authority assertion** (byte-identical):
+after expanding the Location they re-expand with every request-sourced input neutralized (the
+validated `{host}` family + scheme kept); if the resulting authority differs, the request
+injected an off-origin host → the redirect is **suppressed** (the request falls through to
+normal handling). The Location is first normalized to exactly the bytes the HTTP layer sends —
+embedded TAB/LF/CR/FF/NUL stripped, leading/trailing whitespace trimmed — so a value like
+`?next=%20%20//evil` (which the wire would trim) cannot hide an off-origin authority. No config
+opt-in; it protects every `redirect`. (Server `internal/pipeline/redirect.go`, edge
+`edge/runtime/interpreter.js`.)
+
 ## The IR contract
 
 The `EdgeIR` is a **versioned, serializable** projection of the compiled pipeline — an
 **explicit contract** (not raw internal structs). The JS interpreter mirrors these field
-names 1:1, so they are stable. `irVersion` is `6` (D70 added `key.recipes`, `device`, and
+names 1:1, so they are stable. `irVersion` is `9` (D70 added `key.recipes`, `device`, and
 `response.ttl[].maxStale`; D74 added `site.redirectHosts` + `site.canonicalHost`; D75/D76
 added `response.transforms` + `response.transformMaxBytes` and `response.onError`; v5 added
-`response.ttl[].stripHeaders`; v6 (D101) added `cacheCredentialed`); the runtime refuses a
-version it does not understand.
+`response.ttl[].stripHeaders`; v6 (D101) added `cacheCredentialed`; v7 added
+`matcher.subs`/`matcher.queryNamesNonEmpty` + `recv.redirect[].noStore` (additive — stale
+runtime omits the `Cache-Control` header on a `no_store` redirect, which is safe); v8 (D105)
+added `routeExclusions` — the host+prefix CF route globs for `edge { bypass }` /
+`bypass_passes`, a DEPLOY-PLANE-ONLY field the worker runtime ignores; v9 added `usesGeo`
+— SECURITY-relevant: the worker neutralizes an UNKEYED `{device}`/`{geo*}` (raw or a
+class-derived `{classify.NAME}`) reflected in a request-phase header (forwarded to origin)
+so it never forwards a class the cache key does not segment on, deriving the keyed-class
+set per request from the SELECTED cache_key recipe (no static field), and injects the CF
+geo headers only when `usesGeo`); the runtime refuses a version it does not understand.
 
 Top-level shape:
 
 ```jsonc
 {
-  "irVersion": 6,
+  "irVersion": 9,
   "site":     { "hosts": ["example.com", "*.example.com"] },
   "upstream": { "to": "web" },            // default upstream name ("" if none)
 
@@ -275,7 +317,8 @@ Top-level shape:
   "recv": {                               // RECV phase, in source order
     "pass":      [ { "names": ["ajax"] }, { "inline": [ { "kind": "method", "methods": ["POST"] } ] } ],
     "respond":   [ { "path": "/health-check", "status": 200, "body": "OK" } ],
-    "redirect":  [ { "regex": "^/old", "status": 301, "target": "https://{host}/new" } ],
+    "redirect":  [ { "regex": "^/old", "status": 301, "target": "https://{host}/new" },
+                   { "scope": { "names": ["lang"] }, "status": 302, "target": "https://es.example.com{uri}", "noStore": true } ],
     "purge":     [],   // always empty: every purge is delegated (the guard holds a secret), see delegate[]
     "route":     [ { "scope": { "names": ["static"] }, "upstream": "images" } ],
     "headerReq": [ /* request-phase header ops */ ]
@@ -320,7 +363,20 @@ Top-level shape:
     "kvMaxBytes": 1048576                  // omitted unless kv_max_bytes is set
   },
 
-  "delegate": [ { "directive": "rewrite", "reason": "…", "scope": { "names": ["old"] } } ]
+  "delegate": [ { "directive": "rewrite", "reason": "…", "scope": { "names": ["old"] } } ],
+
+  // routeExclusions (v8/D105): host+prefix CF route globs the deploy plane carves out as
+  // origin-direct (no-worker) routes — `edge { bypass … }` (always) and the auto-derived
+  // pass set (only under `bypass_passes`). DEPLOY-PLANE ONLY: the worker runtime never
+  // reads this field. Omitted when there are no exclusions.
+  "routeExclusions": [ "example.com/transmit*", "example.com/captures/*" ],
+
+  // usesGeo (v9): whether the site uses geo at all. The worker blanks an UNKEYED
+  // {device}/{geo*} (raw or class-derived {classify.NAME}) reflected in a request-phase
+  // header (forwarded to origin) so it never forwards a class the cache key does not
+  // segment on — deriving the keyed-class set per request from the SELECTED cache_key
+  // recipe (no static IR field) — and injects the CF geo headers only when usesGeo.
+  "usesGeo": true
 }
 ```
 
@@ -372,6 +428,20 @@ switch + the `EvalRequest/EvalResponse/EvalDeliver` walk; the IO modules orchest
 | `cache-tiers.js` | L1 (Cache API) + L2 (KV) as one cache: read-through, store-by-tier, fresh/stale/expired, SWR, the security invariant |
 | `entry.js` | `export default { fetch }` — geo → RECV/KEY → lookup (HIT / HIT-STALE+SWR) → miss → origin → store → DELIVER; origin failure → stale-on-error else 502 |
 
+> **Geo parity is a deploy contract.** The edge is the single source of truth for geo:
+> it resolves `{geo}`/`{geo.continent}`/`{geo.region}` from `request.cf` on every request,
+> and — **whenever the site uses geo** (`usesGeo`) — injects them to origin as `CF-IPCountry`
+> / `X-Cadish-Geo-Continent` / `X-Cadish-Geo-Region` (a site that never keys on or reflects
+> geo gets no injected headers, so an origin cannot vary on a signal the edge key ignores).
+> The Cadish server behind has no `request.cf`, so it resolves geo
+> ONLY from a configured `geo { … }` source. If you reflect or key on `{geo*}` on an
+> edge-enabled site, you MUST configure a server `geo { … }` source pointed at those
+> injected headers (e.g. `geo { source header CF-IPCountry; region_header X-Cadish-Geo-Region }`
+> — a `source` is required, and `region_header` adds `{geo.region}`) — otherwise the
+> same request resolves the geo value when edge-served but empty when origin-served (an
+> edge-miss). `cadish check` warns (`geo-unconfigured`) when a `{geo*}` token is used with
+> no geo source; treat it as load-bearing for an edge deployment.
+
 **The conformance suite is the contract.** `test/conformance` runs both runtimes over
 the same fixtures and asserts identical decisions, so the JS can never silently drift
 from the Go pipeline (see D42). The dependency-free Node harnesses
@@ -394,6 +464,8 @@ edge {
     skip       @assets             # never cache at the edge (let Cloudflare's native cache serve)
     kv_ttl       5m                # cap KV (L2) retention (default: object ttl+grace)
     kv_max_bytes 1MB               # bodies larger than this stay L1-only (never KV)
+    bypass_passes                  # opt-in: auto-carve path-only-pass paths OUT of the worker
+    bypass /transmit* /v2/*        # operator-declared carve-outs (path_beg-style); see below
 }
 ```
 
@@ -437,6 +509,145 @@ KV write error → ignored (the object still lives in L1 at that POP). KV is **n
 point of failure**, and the security invariant (a `Set-Cookie`/private/`Authorization`
 response is never written to **either** tier) holds across L1 and L2 regardless.
 
+### `bypass_passes` — skip the worker for paths it would only ever pass (D105)
+
+The worker attaches to broad routes (`example.com/*`), so **every** request invokes it —
+including paths the edge can only ever `pass` (a wasted worker invocation + an extra hop +
+needless attack surface, for zero caching benefit). `bypass_passes` derives, from the
+compiled config, the path patterns the worker would **only** ever pass and projects them as
+Cloudflare **worker-route exclusions**: a route that matches but runs **no worker**, so CF
+proxies it straight to origin (skipping the worker entirely).
+
+```
+edge {
+    …
+    bypass_passes        # bare toggle, default OFF
+}
+```
+
+**Always reported, opt-in to apply.** `cadish edge build` ALWAYS prints the excludable set
+it finds (a `route-excludable:` section), so you can review the opportunity *before* turning
+it on:
+
+```
+edge coverage — example.com (IR v9)
+  …
+  route-excludable: 2 path pattern(s) would skip the worker → origin direct (review then enable with `edge { bypass_passes }`)
+    ~ example.com/transmit*
+    ~ example.com/broadcast*
+```
+
+With `bypass_passes` set, those patterns are projected into the IR (`routeExclusions`) and
+`cadish edge enable` creates a **no-script Cloudflare route** for each (Workers API: a route
+whose `script` is omitted matches but runs no worker — "this will act to negate any less
+specific patterns" — so the more-specific `example.com/transmit*` carves the path out of the
+worker's `example.com/*`). `cadish edge disable` removes them (full revert).
+
+**Why so few directives disqualify (the additive-edge reasoning).** cadish edge is
+**additive**: a route-excluded request still reaches the cadish server **behind** the worker
+(the worker's origin), which runs the **same compiled config** and reproduces every request-
+header op, response/deliver-header op, `route`, `cors`, body `replace`, and `strip_cookies`
+for that request. So a pure-`pass` path carrying any of those is **still excludable** —
+excluding it loses nothing, because the server behind does exactly what the worker would have.
+Setting `bypass_passes` is your assertion that this server-behind topology holds. The **only**
+things a route-exclusion gives up are **edge-unique**, and they are the only disqualifiers:
+
+- a path the edge would **cache** at the POP (a **scoped** `cache_ttl` / `cache_key` / `storage`
+  that stores it) — excluding it loses edge caching, so it stays in the worker; and
+- a path the edge would **short-circuit** with a `redirect` / `respond` (saving an origin hop) —
+  excluding it loses the latency win, so it stays in the worker.
+
+A conditional pass (any non-path matcher — cookie/header/method/geo/`all @bypass …`) or a
+non-glob-reducible regex still disqualifies (rules a and c): the worker must evaluate the
+condition, and CF routes are glob, not regex.
+
+**Default OFF on purpose** — turning it on changes production routing, so you opt in after
+reviewing the reported set. It does not affect `-strict` (exclusions are an optimization, not
+a coverage gap).
+
+**The safety rule (strict + fail-safe).** A path pattern is excludable **only** when ALL of:
+
+1. **An unconditional, path-only `pass` covers it.** The pass selector is built solely from
+   `path` / `path_regex` matchers, each reducible to a `<host>/<prefix>*` CF glob (a literal
+   prefix/exact, or an anchored-literal regex `^/lit` with no metacharacters). A **conditional**
+   pass (on a cookie/header/method/geo/query/classify/`all`/`ip` term) is NOT excludable — the
+   worker has to evaluate the condition.
+2. **No edge-UNIQUE behaviour on it.** Only two things disqualify (they are the only behaviours
+   the cadish server behind cannot reproduce for an excluded request): a **scoped** `cache_ttl` /
+   `cache_key` / `storage` that would cache it at the POP, or a `redirect` / `respond` short-circuit
+   that saves an origin hop. Request/response `header` ops, scoped `route`, `cors`, `replace`,
+   `strip_cookies`, and `on_error` do **NOT** disqualify — the additive server behind applies all
+   of them itself when CF proxies the excluded path straight to it (see the additive note above).
+3. **It reduces to a CF route glob.** A `path_regex` that is not reducible to a host+prefix glob
+   (an alternation, a char class, a quantifier) is NOT excludable — CF routes are glob, not regex.
+
+When in doubt, it does **not** exclude: a wrong exclusion can at worst forgo an edge-cache hit or
+a saved origin hop for that path — never strip behaviour the path needed, because the server
+behind supplies it.
+
+> **Readmodel note:** with `/v3/*` excluded, `/v3/readmodel/cache/*` also skips the worker and
+> is served origin-authoritatively (consistent with the `cache_credentialed` fail-closed
+> outcome). If edge-caching the readmodel is later desired, that is the separate "propagate the
+> signal to the edge" track, not this one.
+
+### `X-Cadish-Edge` — the worker-served marker
+
+The worker stamps **`X-Cadish-Edge`** (value = the Cloudflare colo, e.g. `MAD`) on **every**
+response it returns. Its **absence** means the response was served **directly by the origin** —
+i.e. the path was carved out of the worker by a `bypass` route. This is the reliable "did the
+edge worker run?" signal: the cadish **server behind** emits its own `+cache_status` header
+(commonly the same name on both tiers), so that header does **not** distinguish worker-served
+from origin-direct, but `X-Cadish-Edge` does (the server never sets it). Always on; no config.
+
+### `bypass PATTERN…` — operator-declared route exclusions (D105)
+
+`bypass_passes` is the **auto-derived** path: cadish proves, from the compiled config, which
+paths the worker would *only* ever pass and carves those out. But some configs model their
+pass set in a way the auto-derive deliberately refuses — e.g. a single non-glob regex inside
+a conditional `all` composite (the HAProxy `acl bypass_* path_beg /prefix` → `@bypass
+(?i)^/(atvpanel|transmit|…)` shape): rules (a)/(c) reject it, so the auto set is empty even
+though the operator *knows* those prefixes are pure pass-through.
+
+`edge { bypass PATTERN… }` lets the operator **declare** the carve-outs explicitly — the
+direct analog of HAProxy's `path_beg` bypass ACLs:
+
+```
+edge {
+    …
+    bypass /transmit* /v2/*     # one or more path patterns; multiple lines accumulate
+    bypass /atvpanel
+}
+```
+
+Each pattern is a **leading-`/`** path that is either an **exact path** (`/atvpanel`) or a
+**trailing-`*` prefix glob** (`/transmit*`). A pattern with no leading `/`, a leading/interior
+`*`, or more than one `*` is a **compile error** (CF routes are `<prefix>*` globs, not arbitrary
+patterns). Each pattern is crossed with every catch-all worker-route host (`example.com/*`,
+`es.example.com/*`, …) to become one CF route exclusion per host.
+
+**Declaring `bypass …` is itself the opt-in** — it does **not** require `bypass_passes`. The
+patterns go into `EdgeIR.RouteExclusions` (the same field the auto-derive uses) and `cadish
+edge enable` creates the same no-script CF routes for them; when both are set, the two sets are
+deduped/collapsed into one carve-out set. Because they are operator-declared, they are taken at
+your word — there is **no excludability gate** on them.
+
+**Safety warning (loud, never fails).** A route-excluded path is **never edge-cached** (CF
+proxies it straight to origin). So if a `bypass` pattern OVERLAPS a path you *do* cache at the
+edge (a scoped `cache_ttl`/`cache_key`/`storage` rule whose path falls under the pattern),
+`cadish edge build` emits a **WARNING** naming the pattern and the cached path it shadows:
+
+```
+  route-excludable: 1 path pattern(s) would skip the worker → origin direct (operator-declared via `edge { bypass … }` — projected into the IR)
+    bypass example.com/v3*
+    ! WARNING: bypass /v3* would skip the worker for /v3/readmodel* which is cached — POP caching lost for it
+```
+
+The pattern is **still applied** (operator-declared ⇒ warn, don't fail) — the warning just makes
+the lost POP-caching impossible to miss so you can narrow the pattern if it was unintended.
+
+In the coverage report, auto-derived exclusions are marked `~` and operator-declared ones
+`bypass`, so the two sources are always distinguishable.
+
 ## Deploy / enable / disable
 
 ```
@@ -449,6 +660,23 @@ cadish edge disable                    # detach routes → instant bypass (kill 
 - **Auth:** a Cloudflare API token in `CF_API_TOKEN` (never in the file). The origin URL
   is a deploy-time binding (`-origin` or `CADISH_EDGE_ORIGIN`) — the IR carries upstream
   *names* only.
+- **Origin mode (`-origin`) — two topologies:**
+  - **Separate cadish server behind** (its own host) → `-origin https://cadish-behind.example.com`
+    (**REWRITE** mode): the worker rewrites the request authority to that host and forwards the
+    canonical original `Host`.
+  - **Fronting a multi-host origin in the *same* Cloudflare zone** → **`-origin passthrough`**
+    (**fetch-through** mode): the worker fetches the original request URL **verbatim** (host **and**
+    scheme preserved → HTTPS:443) and reaches the real origin via CF same-zone loop-prevention —
+    exactly like a hand-written `fetch(request)` worker. Use this whenever the worker route and the
+    origin share the zone. Rewriting the host there would make a canonicalizing origin (apex→www,
+    http→https) **redirect-loop forever**, because Cloudflare `fetch()` ignores a `Host`-header
+    override (the URL host wins). ⚠️ `passthrough` is correct **only** same-zone; pointing it at a
+    host *outside* the zone loops back into the worker. An empty/missing origin binding is an
+    **error** (throws), never a silent passthrough.
+- **Non-secret literal values (`-allow-public-values`):** if the config carries literal cookie/header
+  *values* (not secrets — e.g. `userType`, `verified-prod`), the deploy safety gate flags them; pass
+  `-allow-public-values` to acknowledge them. It relaxes only that secret-looking-literal gate — it
+  does **not** relax a `forced-pass` (a build that forces a pass still fails).
 - **Deploy ≠ activation:** `deploy` uploads without routes (test via the `*.workers.dev`
   URL, no production traffic); `enable` goes live; `disable` is the instant kill switch
   back to the Cadish server behind. KV is created/bound only when a `distribute` policy

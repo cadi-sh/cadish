@@ -131,6 +131,82 @@ func TestQueryPresentNeedsName(t *testing.T) {
 	}
 }
 
+// mustParseQuery parses a raw query string the way the server does (url.ParseQuery,
+// the same parser feeding Request.Query), so a test can prove the parse path — e.g.
+// that a bare `?p` (no `=`) yields {"p":[""]}.
+func mustParseQuery(t *testing.T, raw string) url.Values {
+	t.Helper()
+	v, err := url.ParseQuery(raw)
+	if err != nil {
+		t.Fatalf("ParseQuery(%q): %v", raw, err)
+	}
+	return v
+}
+
+// TestQueryPresentNonEmpty tests the `+` modifier: a `+`-flagged name requires the
+// param to be present AND have at least one non-empty value. An unflagged name keeps
+// plain presence semantics (empty value still matches).
+func TestQueryPresentNonEmpty(t *testing.T) {
+	tests := []struct {
+		name  string
+		args  []string
+		query url.Values
+		want  bool
+	}{
+		// +modifier: non-empty required
+		{"nonempty-match", []string{"p+"}, url.Values{"p": {"x"}}, true},
+		{"nonempty-empty-val", []string{"p+"}, url.Values{"p": {""}}, false},
+		// Bare `?p` (no `=`): url.ParseQuery("p") yields {"p":[""]} — present with an
+		// empty value, IDENTICAL to `?p=` and DISTINCT from "param absent entirely". A
+		// `+`-flagged name must NOT match it (no non-empty value), proving the bare-param
+		// form is treated as empty (Varnish `=[^&]+` parity). Built from the real parser
+		// so the parse path itself is exercised, not just a hand-built map.
+		{"nonempty-bare-param", []string{"p+"}, mustParseQuery(t, "p"), false},
+		// Same bare param, but the name is UNflagged (presence-only) → it DOES match,
+		// confirming the bare-param form is "present".
+		{"plain-bare-param", []string{"p"}, mustParseQuery(t, "p"), true},
+		{"nonempty-absent", []string{"p+"}, url.Values{"other": {"x"}}, false},
+		// +modifier: repeated param, at least one non-empty wins
+		{"nonempty-repeated-one-nonempty", []string{"p+"}, url.Values{"p": {"", "abc"}}, true},
+		{"nonempty-repeated-all-empty", []string{"p+"}, url.Values{"p": {"", ""}}, false},
+		// unflagged name still matches with empty value
+		{"plain-empty-val", []string{"q"}, url.Values{"q": {""}}, true},
+		{"plain-nonempty-val", []string{"q"}, url.Values{"q": {"y"}}, true},
+		// mixed: one +flagged, one plain
+		{"mixed-flagged-hits", []string{"p+", "q"}, url.Values{"p": {"x"}}, true},
+		{"mixed-plain-empty-hits", []string{"p+", "q"}, url.Values{"q": {""}}, true},
+		{"mixed-flagged-empty-plain-absent", []string{"p+", "q"}, url.Values{"p": {""}}, false},
+		// glob with + modifier
+		{"glob-nonempty-match", []string{"ff-*+"}, url.Values{"ff-foo": {"bar"}}, true},
+		{"glob-nonempty-empty-val", []string{"ff-*+"}, url.Values{"ff-foo": {""}}, false},
+		{"glob-plain-name", []string{"ff-*"}, url.Values{"ff-foo": {""}}, true},
+		// no query params
+		{"no-query", []string{"p+"}, nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := mkMatcher(t, "query_present", tt.args...)
+			req := &Request{Path: "/", Query: tt.query}
+			if got := m.match(newMatchContext(req, "")); got != tt.want {
+				t.Errorf("query_present %v over %v = %v, want %v", tt.args, tt.query, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestQueryPresentBarePlusRejected: a degenerate bare `+` (no name before it) strips to
+// an empty name and must be rejected at compile, not silently become a dead empty-name
+// glob.
+func TestQueryPresentBarePlusRejected(t *testing.T) {
+	if _, err := compileMatcher("m", "query_present", []string{"+"}, cadishfile.Pos{}); err == nil {
+		t.Fatal("want error for query_present with a bare `+` arg")
+	}
+	// Also reject it when mixed with a valid name.
+	if _, err := compileMatcher("m", "query_present", []string{"ok", "+"}, cadishfile.Pos{}); err == nil {
+		t.Fatal("want error for query_present with a bare `+` among valid names")
+	}
+}
+
 func TestUnknownMatcherType(t *testing.T) {
 	_, err := compileMatcher("m", "bogus", []string{"x"}, cadishfile.Pos{File: "f", Line: 3, Col: 5})
 	if err == nil {

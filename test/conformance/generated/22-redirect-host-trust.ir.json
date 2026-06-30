@@ -1,5 +1,5 @@
 {
-  "irVersion": 6,
+  "irVersion": 9,
   "site": {
     "hosts": [
       "shop.example.com",
@@ -57,6 +57,7 @@
     ]
   },
   "deliver": {},
+  "usesGeo": false,
   "edge": {
     "default": "local",
     "kvMaxBytes": 1048576

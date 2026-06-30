@@ -1,5 +1,5 @@
 {
-  "irVersion": 6,
+  "irVersion": 9,
   "site": {
     "hosts": [
       "ck.example.com"
@@ -117,6 +117,7 @@
     "cacheKeyHeader": "X-Cache-Key",
     "cacheKeyRaw": true
   },
+  "usesGeo": false,
   "edge": {
     "default": "local",
     "kvMaxBytes": 1048576

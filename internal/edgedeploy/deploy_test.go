@@ -227,6 +227,100 @@ func TestDisableDetachesWorkerRoutes(t *testing.T) {
 	}
 }
 
+// TestEnableCreatesNoScriptExclusionRoutes proves Enable attaches the worker routes
+// AND creates a no-script (origin-direct) route per RouteExclusions pattern,
+// idempotently (an already-present exclusion route is not recreated).
+func TestEnableCreatesNoScriptExclusionRoutes(t *testing.T) {
+	m := &mockCF{t: t, routes: []workerRoute{
+		{ID: "r1", Pattern: "example.com/*", Script: "w"},        // worker route already present
+		{ID: "x1", Pattern: "example.com/transmit*", Script: ""}, // one exclusion already present
+	}}
+	c, srv := newTestClient(t, m)
+	defer srv.Close()
+
+	cfg := Config{
+		Zone:            "example.com",
+		WorkerName:      "w",
+		Routes:          []string{"example.com/*"},
+		RouteExclusions: []string{"example.com/transmit*", "example.com/broadcast*"},
+	}
+	if err := c.Enable(context.Background(), cfg); err != nil {
+		t.Fatalf("Enable: %v", err)
+	}
+	// The worker route already exists → not recreated. The already-present exclusion is
+	// left as-is; only the missing exclusion (broadcast) is created.
+	if n := m.count(http.MethodPost, "/workers/routes"); n != 1 {
+		t.Fatalf("expected exactly one route create (the missing exclusion), got %d", n)
+	}
+	created := lastRouteCreate(t, m)
+	if created["pattern"] != "example.com/broadcast*" {
+		t.Errorf("created route pattern = %q, want example.com/broadcast*", created["pattern"])
+	}
+	// A no-worker route must NOT carry a script field.
+	if _, ok := created["script"]; ok {
+		t.Errorf("an exclusion route must omit the script field, got %v", created)
+	}
+}
+
+// TestDisableRemovesNoScriptExclusionRoutes proves Disable removes both the worker's
+// routes and the no-script exclusion routes it created, but leaves an unrelated
+// no-script route untouched. Idempotent.
+func TestDisableRemovesNoScriptExclusionRoutes(t *testing.T) {
+	m := &mockCF{t: t, routes: []workerRoute{
+		{ID: "r1", Pattern: "example.com/*", Script: "w"},
+		{ID: "x1", Pattern: "example.com/transmit*", Script: ""},  // ours (in RouteExclusions)
+		{ID: "x2", Pattern: "example.com/unrelated*", Script: ""}, // someone else's no-script route
+	}}
+	c, srv := newTestClient(t, m)
+	defer srv.Close()
+
+	cfg := Config{
+		Zone:            "0123456789abcdef0123456789abcdef",
+		WorkerName:      "w",
+		RouteExclusions: []string{"example.com/transmit*"},
+	}
+	if err := c.Disable(context.Background(), cfg); err != nil {
+		t.Fatalf("Disable: %v", err)
+	}
+	if m.count(http.MethodDelete, "/workers/routes/r1") != 1 {
+		t.Error("worker route r1 should be deleted")
+	}
+	if m.count(http.MethodDelete, "/workers/routes/x1") != 1 {
+		t.Error("our exclusion route x1 should be deleted")
+	}
+	if m.count(http.MethodDelete, "/workers/routes/x2") != 0 {
+		t.Error("an unrelated no-script route x2 must not be touched")
+	}
+
+	// Idempotent: with the routes already gone, a second Disable deletes nothing.
+	m2 := &mockCF{t: t} // empty routes list
+	c2, srv2 := newTestClient(t, m2)
+	defer srv2.Close()
+	if err := c2.Disable(context.Background(), cfg); err != nil {
+		t.Fatalf("Disable (idempotent): %v", err)
+	}
+	if m2.count(http.MethodDelete, "/workers/routes/") != 0 {
+		t.Error("second Disable with no routes must delete nothing")
+	}
+}
+
+// lastRouteCreate returns the decoded body of the last POST /workers/routes request.
+func lastRouteCreate(t *testing.T, m *mockCF) map[string]any {
+	t.Helper()
+	for i := len(m.requests) - 1; i >= 0; i-- {
+		r := m.requests[i]
+		if r.method == http.MethodPost && strings.HasSuffix(strings.Split(r.path, "?")[0], "/workers/routes") {
+			var body map[string]any
+			if err := json.Unmarshal(r.body, &body); err != nil {
+				t.Fatalf("route create body JSON: %v", err)
+			}
+			return body
+		}
+	}
+	t.Fatal("no POST /workers/routes recorded")
+	return nil
+}
+
 func TestDeploySurfacesAPIError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(apiResponse{Success: false, Errors: []apiError{{Code: 10001, Message: "bad token"}}})

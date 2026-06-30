@@ -1395,6 +1395,13 @@ func hasNativeScopedPass(ir EdgeIR, name string) bool {
 // is skipped → the classifier returns its default → `@gated` never fires → the edge would
 // CACHE a path the Go server passes. The projector must treat the classify matcher as
 // fail-closed (via the classifiersFailClosed fixpoint) and fail OPEN — a site-wide pass.
+//
+// P2 carved out a NARROW exception — a CONSTANT-FALSE-at-edge row (a positively-required `ip`
+// matcher ONLY) is instead DROPPED, since it is false for ~all real traffic on the server too,
+// so the classifier degrades to its surviving rows rather than fail-opening the whole site
+// (TestClassifyIPRowDropped). `upstream_healthy` is NOT in that exception — it fires whenever
+// the pool is healthy (the common server case), so it KEEPS the conservative fail-open here
+// (subtest b).
 func TestPassScopeViaFailClosedClassifierFailsOpen(t *testing.T) {
 	// (a) classifier row uses an untranslatable `(?U)` path_regex.
 	t.Run("untranslatable-regex-row", func(t *testing.T) {
@@ -1430,7 +1437,10 @@ func TestPassScopeViaFailClosedClassifierFailsOpen(t *testing.T) {
 		}
 	})
 
-	// (b) classifier row uses a server-only `upstream_healthy` matcher.
+	// (b) classifier row uses a server-only `upstream_healthy` matcher. No classifier row is ever
+	// dropped at the edge (the unsound `ip`-row drop was reverted) — an `ip`/`upstream_healthy`
+	// matcher in a row fail-closes the classifier, which keeps the CONSERVATIVE fail-closed →
+	// fail-open (delegate to the server) behavior, never a silent over-cache.
 	t.Run("server-only-row", func(t *testing.T) {
 		src := `example.com {
     @live upstream_healthy pool
@@ -1453,6 +1463,10 @@ func TestPassScopeViaFailClosedClassifierFailsOpen(t *testing.T) {
 		}
 		if !hasAlwaysPass(ir) {
 			t.Errorf("want a site-wide Always pass (fail-open) for a server-only-row classifier; recv.pass = %+v", ir.Recv.Pass)
+		}
+		// No classifier row is dropped at the edge — the row stays in the projected classifier.
+		if len(ir.Classifiers["health"].Rows) != 1 {
+			t.Errorf("the upstream_healthy row must NOT be dropped (no classifier row is dropped; ip/upstream_healthy fail-close the classifier); rows = %+v", ir.Classifiers["health"].Rows)
 		}
 	})
 
@@ -1993,5 +2007,43 @@ func TestUpgradeScopeFailClosedFailsOpen(t *testing.T) {
 	}
 	if !hasWarn(rep, "UPGRADE-FAIL-OPEN") {
 		t.Errorf("want an UPGRADE-FAIL-OPEN warning; warnings = %v", rep.Warnings)
+	}
+}
+
+// TestEdgeBuildRejectsOpenRedirectAuthorityToken (Fix B, edge parity): `cadish edge
+// build` compiles the SAME Cadishfile through pipeline.Compile before projecting the
+// EdgeIR, so the open-redirect authority guard runs at COMPILE and the unsafe redirect
+// never reaches the worker. A request-sourced token ({query.NAME}) in the Location
+// AUTHORITY must therefore fail the edge build at the Compile step (before Project),
+// exactly as it fails `cadish run`. The same expansion runs in the JS interpreter, so
+// blocking the IR is what keeps the edge from open-redirecting.
+func TestEdgeBuildRejectsOpenRedirectAuthorityToken(t *testing.T) {
+	const src = `example.com {
+	upstream b { to http://x:80 }
+	redirect ^/go$ 302 https://{query.next}/login
+	cache_ttl default ttl 5m
+}
+`
+	f, err := cadishfile.Parse("test.cadish", []byte(src))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	// The edge build's compile step (the guard) must reject the unsafe redirect, so
+	// Project is never reached and no unsafe IR can ship to the worker.
+	if _, err := pipeline.Compile(f.Sites[0]); err == nil {
+		t.Fatal("edge build must reject an open-redirect authority token at compile, got nil")
+	}
+
+	// Sentinel: the safe path-reflected variant compiles AND projects to an EdgeIR (the
+	// edge can still ship the safe redirect).
+	const safe = `example.com {
+	upstream b { to http://x:80 }
+	redirect ^/go$ 302 https://{host}/next/{query.next}
+	cache_ttl default ttl 5m
+}
+`
+	p := compile(t, safe)
+	if _, _, err := Project(p); err != nil {
+		t.Fatalf("safe path-reflected redirect must project to EdgeIR: %v", err)
 	}
 }

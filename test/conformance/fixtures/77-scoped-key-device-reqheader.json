@@ -1,0 +1,16 @@
+{
+  "name": "77-scoped-key-device-reqheader",
+  "cadishfile": "x.example.com {\n    @ssr header X-Is-Ssr true\n    device_detect { mobile ua_contains iPhone\n default desktop }\n    header X-Device {device}\n    cache_key @ssr host path {device}\n    cache_key default host path\n    cache_ttl default ttl 60s\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "x.example.com", "path": "/p", "device": "mobile" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "x.example.com", "path": "/p", "device": "mobile", "header": { "X-Is-Ssr": ["true"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

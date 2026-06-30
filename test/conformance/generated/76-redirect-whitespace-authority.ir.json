@@ -1,0 +1,50 @@
+{
+  "irVersion": 9,
+  "site": {
+    "hosts": [
+      "brand-a.example"
+    ],
+    "redirectHosts": [
+      "brand-a.example"
+    ],
+    "canonicalHost": "brand-a.example"
+  },
+  "upstream": {},
+  "matchers": {},
+  "recv": {
+    "redirect": [
+      {
+        "regex": "^/n$",
+        "status": 302,
+        "target": "{query.next}"
+      }
+    ]
+  },
+  "key": {
+    "tokens": [
+      {
+        "kind": "method"
+      },
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s"
+      }
+    ]
+  },
+  "deliver": {},
+  "usesGeo": false,
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

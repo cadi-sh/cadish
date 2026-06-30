@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"net/http"
+	"net/url"
 	"testing"
 )
 
@@ -99,5 +100,58 @@ func TestExpandTemplateRequestTokensNilHeader(t *testing.T) {
 	env := &TemplateEnv{Host: "h"}
 	if got := expandTemplate("a{http.Origin}b{client_ip}c", env, classifyResolver{}); got != "abc" {
 		t.Fatalf("got %q, want %q", got, "abc")
+	}
+}
+
+// TestExpandTemplateQueryParam covers {query.NAME}: resolves the first decoded value
+// of the named query param, or "" when absent.
+func TestExpandTemplateQueryParam(t *testing.T) {
+	q := url.Values{}
+	q.Set("genre", "comedy")
+	q.Add("genre", "drama") // multi-value: only first is used
+	q.Set("age", "25")
+	// URL-encoded value: url.Values stores already-decoded values
+	q.Set("cam_lang", "en-US")
+	env := &TemplateEnv{
+		Host:        "example.com",
+		Path:        "/page",
+		QueryParams: q,
+	}
+	tests := []struct {
+		name string
+		tmpl string
+		want string
+	}{
+		{"present-first", "{query.genre}", "comedy"},    // first value only
+		{"present-second-ignored", "{query.age}", "25"}, // single value
+		{"cam-lang", "{query.cam_lang}", "en-US"},       // hyphenated key
+		{"absent", "{query.missing}", ""},               // absent -> ""
+		{"embedded", "x={query.genre}&y={query.age}", "x=comedy&y=25"},
+		{"nil-params", "{query.x}", ""}, // nil QueryParams -> ""
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := *env // copy
+			if tc.name == "nil-params" {
+				e.QueryParams = nil
+			}
+			got := expandTemplate(tc.tmpl, &e, classifyResolver{})
+			if got != tc.want {
+				t.Fatalf("expandTemplate(%q) = %q, want %q", tc.tmpl, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestExpandTemplateDeviceToken covers {device}: resolves to the pre-pass device bucket.
+func TestExpandTemplateDeviceToken(t *testing.T) {
+	env := &TemplateEnv{Host: "example.com", Device: "mobile"}
+	if got := expandTemplate("d={device}", env, classifyResolver{}); got != "d=mobile" {
+		t.Fatalf("got %q, want %q", got, "d=mobile")
+	}
+	// empty Device expands to "" (consumed, not kept verbatim)
+	env2 := &TemplateEnv{Host: "example.com"}
+	if got := expandTemplate("[{device}]", env2, classifyResolver{}); got != "[]" {
+		t.Fatalf("empty device: got %q, want %q", got, "[]")
 	}
 }

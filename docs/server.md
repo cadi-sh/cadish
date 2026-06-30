@@ -348,6 +348,9 @@ The trace hooks live at each decision point in `internal/server/handler.go`
   response is never stored or served (no key poisoning). It does **not** suppress
   the origin re-fetch and does **not** coalesce concurrent error fetches — every
   request re-fetches from origin while the decision holds.
-- **Query-string forwarding.** `origin.Request` fetches by path/key; the query is
-  part of the cache key (via `cache_key`) but is not forwarded to the origin in M5b.
+- **Query-string forwarding.** The original encoded query string **is** forwarded to
+  HTTP origins (`origin.Request.RawQuery`, set from `r.URL.RawQuery` — or from the
+  `rewrite` result when a `rewrite` rule fires), so a query-varying origin gets the
+  right response. The query is independently part of the cache key per the site's
+  `cache_key` recipe. (`s3origin` ignores the query — object keys are path-only.)
 ```

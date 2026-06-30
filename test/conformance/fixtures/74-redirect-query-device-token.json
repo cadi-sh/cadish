@@ -1,0 +1,26 @@
+{
+  "name": "74-redirect-query-device-token",
+  "cadishfile": "media.example.com {\n    redirect ^/goto$ 302 https://media.example.com/browse/{query.genre}\n    redirect ^/m/(.*)$ 302 https://media.example.com/{device}/$1\n    cache_ttl default ttl 60s\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "media.example.com", "path": "/goto", "query": { "genre": ["comedy"] } },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "media.example.com", "path": "/goto", "query": {} },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "media.example.com", "path": "/m/page1", "device": "mobile" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "media.example.com", "path": "/m/page1", "device": "desktop" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "name": "66-all-composite",
+  "cadishfile": "example.com, adult.example.com {\n    @host_x host adult.example.com\n    @path_y path /cams\n    @exempt cookie vip\n    @prem   cookie premium\n    classify {tier} {\n        when @prem -> gold\n        default    -> free\n    }\n    @isgold classify {tier}==gold\n    @a all @host_x @path_y !@exempt @isgold\n    pass @a\n    cache_key method host path\n    cache_ttl default ttl 1m\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "adult.example.com", "path": "/cams", "header": { "Cookie": ["premium=1"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/cams", "header": { "Cookie": ["premium=1"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "adult.example.com", "path": "/cams", "header": { "Cookie": ["premium=1; vip=1"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "adult.example.com", "path": "/cams" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

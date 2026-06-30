@@ -1,0 +1,16 @@
+{
+  "name": "78-classify-geo-reqheader",
+  "cadishfile": "x.example.com {\n    @de geo country DE\n    classify {tier} {\n        when @de -> eu\n        default -> row\n    }\n    header X-Tier {classify.tier}\n    cache_key host path\n    cache_ttl default ttl 60s\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "x.example.com", "path": "/p", "geo": "DE" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "x.example.com", "path": "/p", "geo": "US" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

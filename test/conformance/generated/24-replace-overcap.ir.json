@@ -1,5 +1,5 @@
 {
-  "irVersion": 6,
+  "irVersion": 9,
   "site": {
     "hosts": [
       "big.example.com"
@@ -54,6 +54,7 @@
     "transformMaxBytes": 1048576
   },
   "deliver": {},
+  "usesGeo": false,
   "edge": {
     "default": "local",
     "kvMaxBytes": 1048576

@@ -27,6 +27,15 @@ const (
 	// sets the header from the key it already holds. Value carries "raw" for the raw
 	// form and is empty for the hash form.
 	OpCacheKey
+	// OpCacheAge is the `header +cache_age NAME` special: a delivery-only debug
+	// header that emits the object's age in whole seconds (e.g. "45") under header
+	// NAME on a cache HIT (fresh or stale). It is OMITTED on MISS and bypass (no
+	// stored age). Like OpCacheKey the age is NOT in the deliver-phase matchContext
+	// — it is derived from the freshness index / storedAt timestamp — so this op is
+	// not materialized by applyHeaderRules; instead EvalDeliver surfaces the target
+	// name on the DeliverDecision (CacheAgeHeader) and the server + edge worker
+	// materialize the integer age from the object's storedAt time.
+	OpCacheAge
 )
 
 // String renders the op kind (for debugging/tests).
@@ -42,6 +51,8 @@ func (k HeaderOpKind) String() string {
 		return "cache_status"
 	case OpCacheKey:
 		return "cache_key"
+	case OpCacheAge:
+		return "cache_age"
 	default:
 		return "unknown"
 	}
@@ -100,6 +111,14 @@ func parseHeaderOps(args []cadishfile.Arg, pos cadishfile.Pos) ([]HeaderOp, erro
 					return nil, &CompileError{Pos: pos, Msg: "header +cache_status needs a target header name"}
 				}
 				ops = append(ops, HeaderOp{Op: OpCacheStatus, Name: args[i+1].Raw})
+				i += 2
+				continue
+			}
+			if name == "cache_age" {
+				if i+1 >= len(args) {
+					return nil, &CompileError{Pos: pos, Msg: "header +cache_age needs a target header name"}
+				}
+				ops = append(ops, HeaderOp{Op: OpCacheAge, Name: args[i+1].Raw})
 				i += 2
 				continue
 			}

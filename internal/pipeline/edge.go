@@ -40,6 +40,22 @@ type edgeConfig struct {
 	// kvMaxBytes is the hard size bound for the KV (L2) tier: a response body larger
 	// than this is written to L1 only, never KV. Defaults to defaultKVMaxBytes (1 MiB).
 	kvMaxBytes int64
+
+	// bypassPasses opts the site into projecting the route-EXCLUSION set (D105): the
+	// path patterns the worker would ONLY ever `pass` become Cloudflare routes that run
+	// no worker (CF proxies them straight to origin). Default off — turning it on changes
+	// production routing, so the operator opts in after reviewing the reported excludable
+	// set (`cadish edge build` always prints it).
+	bypassPasses bool
+
+	// bypassPatterns are the operator-DECLARED route exclusions (`edge { bypass PATTERN… }`,
+	// D105 explicit companion): path patterns the operator asserts are pure pass-through and
+	// wants carved out of the worker (the HAProxy `acl … path_beg /prefix` bypass analog).
+	// Each is a leading-`/` literal prefix (`/transmit`), a trailing-`*` prefix glob
+	// (`/transmit*`), or an exact path; they go into EdgeIR.RouteExclusions IN ADDITION to
+	// any auto-derived (`bypass_passes`) set. Declaring `bypass …` is itself the opt-in —
+	// it does NOT require `bypass_passes`.
+	bypassPatterns []string
 }
 
 // edgeTierRule is one per-scope edge cache-tier policy.
@@ -132,6 +148,21 @@ func compileEdgeBlock(d *cadishfile.Directive, matchers map[string]*matcher) (*e
 				return nil, &CompileError{Pos: bd.Pos, Msg: "edge: kv_max_bytes must be positive, got " + quote(v)}
 			}
 			ec.kvMaxBytes = n
+		case "bypass_passes":
+			if len(bd.Args) != 0 {
+				return nil, &CompileError{Pos: bd.Pos, Msg: "edge: `bypass_passes` is a bare toggle and takes no arguments"}
+			}
+			ec.bypassPasses = true
+		case "bypass":
+			if len(bd.Args) == 0 {
+				return nil, &CompileError{Pos: bd.Pos, Msg: "edge: `bypass PATTERN…` needs at least one path pattern (e.g. `bypass /transmit* /v2/*`)"}
+			}
+			for _, a := range bd.Args {
+				if err := validateBypassPattern(a.Raw); err != nil {
+					return nil, &CompileError{Pos: bd.Pos, Msg: "edge: `bypass` " + err.Error()}
+				}
+				ec.bypassPatterns = append(ec.bypassPatterns, a.Raw)
+			}
 		case "distribute", "local", "skip":
 			sc, err := parseScopeAll(bd.Args, matchers, bd.Pos)
 			if err != nil {
@@ -142,7 +173,7 @@ func compileEdgeBlock(d *cadishfile.Directive, matchers map[string]*matcher) (*e
 			}
 			ec.policies = append(ec.policies, edgeTierRule{scope: sc, tier: bd.Name})
 		default:
-			return nil, &CompileError{Pos: bd.Pos, Msg: "edge: unknown setting " + quote(bd.Name) + " (want account/zone/worker/route/kv/default/distribute/local/skip/kv_ttl/kv_max_bytes)"}
+			return nil, &CompileError{Pos: bd.Pos, Msg: "edge: unknown setting " + quote(bd.Name) + " (want account/zone/worker/route/kv/default/distribute/local/skip/kv_ttl/kv_max_bytes/bypass_passes/bypass)"}
 		}
 	}
 	if ec.defaultTier == "" {
@@ -152,6 +183,38 @@ func compileEdgeBlock(d *cadishfile.Directive, matchers map[string]*matcher) (*e
 		ec.kvMaxBytes = defaultKVMaxBytes
 	}
 	return ec, nil
+}
+
+// validateBypassPattern rejects an operator-declared `edge { bypass … }` pattern that is
+// not reducible to a Cloudflare worker-route glob. A valid pattern starts with '/' and is
+// either an exact path (no '*') or a pure trailing-'*' prefix glob (`/transmit*`); a bare
+// '*', a missing leading '/', or any leading/interior '*' (CF routes are prefix globs, not
+// arbitrary patterns) is rejected with a clear message. Mirrors edgeir.literalPathGlob.
+func validateBypassPattern(p string) error {
+	if p == "" {
+		return fmt.Errorf("pattern is empty")
+	}
+	if !strings.HasPrefix(p, "/") {
+		return fmt.Errorf("pattern %q must start with '/' (a path prefix like /transmit or /transmit*)", p)
+	}
+	// A bare catch-all ("/" or "/*") reduces to the worker's own host/* route, so it
+	// would carve out (or negate) the entire worker route instead of a sub-path — a CF
+	// duplicate/negation, never the operator's intent (F next#4). Reject it: to take a
+	// whole site off the edge, disable the worker, don't bypass everything.
+	if p == "/" || p == "/*" {
+		return fmt.Errorf("pattern %q is a catch-all that matches the whole site — it reduces to the worker's own route and cannot be a sub-path exclusion; remove the edge worker (or `edge disable`) to take the whole site origin-direct", p)
+	}
+	switch strings.Count(p, "*") {
+	case 0:
+		return nil // exact path
+	case 1:
+		if !strings.HasSuffix(p, "*") {
+			return fmt.Errorf("pattern %q may only use '*' as a trailing prefix glob (e.g. /transmit*), not a leading/interior wildcard", p)
+		}
+		return nil
+	default:
+		return fmt.Errorf("pattern %q has more than one '*' (CF routes are <prefix>* globs, not arbitrary patterns)", p)
+	}
 }
 
 // parseSize parses a byte-size literal (e.g. "1MB", "512KiB", "1048576") for the
@@ -257,6 +320,26 @@ func (p *Pipeline) EdgeKVMaxBytes() int64 {
 		return defaultKVMaxBytes
 	}
 	return p.edge.kvMaxBytes
+}
+
+// EdgeBypassPasses reports whether the site opted into route-exclusion projection
+// (`edge { bypass_passes }`, D105). When true the projector populates
+// EdgeIR.RouteExclusions with the path-only-pass patterns so the deploy plane carves
+// them out of the worker route (run no worker → origin direct). Default false.
+func (p *Pipeline) EdgeBypassPasses() bool {
+	return p.edge != nil && p.edge.bypassPasses
+}
+
+// EdgeBypassPatterns returns the operator-declared explicit route-exclusion patterns
+// (`edge { bypass PATTERN… }`, D105 explicit companion). Each is a leading-`/` literal
+// prefix, a trailing-`*` prefix glob, or an exact path. The projector crosses them with
+// the worker route host(s) and adds them to EdgeIR.RouteExclusions IN ADDITION to any
+// auto-derived set — declaring `bypass …` is itself the opt-in. Nil when none declared.
+func (p *Pipeline) EdgeBypassPatterns() []string {
+	if p.edge == nil {
+		return nil
+	}
+	return append([]string(nil), p.edge.bypassPatterns...)
 }
 
 // EdgeTierPolicy is the neutral view of one per-scope edge cache-tier policy.

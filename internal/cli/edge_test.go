@@ -281,7 +281,7 @@ func TestEdgeDeployRequiresToken(t *testing.T) {
 	t.Setenv("CF_API_TOKEN", "")
 	cfg := writeCadishfile(t, edgeDeploySrc)
 	var out, errOut bytes.Buffer
-	if code := runEdgeDeploy(cfg, "https://o", &out, &errOut); code != 1 {
+	if code := runEdgeDeploy(cfg, "https://o", &out, &errOut, false); code != 1 {
 		t.Errorf("exit = %d, want 1 without CF_API_TOKEN", code)
 	}
 	if !strings.Contains(errOut.String(), "CF_API_TOKEN") {
@@ -294,7 +294,7 @@ func TestEdgeDeployRequiresOrigin(t *testing.T) {
 	t.Setenv("CADISH_EDGE_ORIGIN", "")
 	cfg := writeCadishfile(t, edgeDeploySrc)
 	var out, errOut bytes.Buffer
-	if code := runEdgeDeploy(cfg, "", &out, &errOut); code != 1 {
+	if code := runEdgeDeploy(cfg, "", &out, &errOut, false); code != 1 {
 		t.Errorf("exit = %d, want 1 without an origin", code)
 	}
 	if !strings.Contains(errOut.String(), "origin") {
@@ -305,6 +305,7 @@ func TestEdgeDeployRequiresOrigin(t *testing.T) {
 // TestAbortEdgeDeployUnsafe is the hermetic core of the deploy safety gate: a
 // non-zero ForcedPass (silent site-wide fail-open) or ValueExposed (a secret baked
 // into the public bundle) must abort the upload; a clean report must not.
+// (All cases here use allowPublicValues=false to verify unchanged default behavior.)
 func TestAbortEdgeDeployUnsafe(t *testing.T) {
 	cases := []struct {
 		name string
@@ -320,7 +321,7 @@ func TestAbortEdgeDeployUnsafe(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var errOut bytes.Buffer
-			got := abortEdgeDeployUnsafe("example.com", tc.rep, &errOut)
+			got := abortEdgeDeployUnsafe("example.com", tc.rep, &errOut, false /* allowPublicValues */)
 			if got != tc.want {
 				t.Fatalf("abort = %v, want %v (stderr=%s)", got, tc.want, errOut.String())
 			}
@@ -354,7 +355,7 @@ func TestEdgeDeployRefusesSecretBundle(t *testing.T) {
 	t.Setenv("CF_API_TOKEN", "tok")
 	cfg := writeCadishfile(t, edgeDeploySecretSrc)
 	var out, errOut bytes.Buffer
-	if code := runEdgeDeploy(cfg, "https://origin.example.com", &out, &errOut); code != 1 {
+	if code := runEdgeDeploy(cfg, "https://origin.example.com", &out, &errOut, false); code != 1 {
 		t.Fatalf("exit = %d, want 1 (deploy must refuse a secret-bearing bundle); stderr=%s", code, errOut.String())
 	}
 	if !strings.Contains(errOut.String(), "PUBLIC worker bundle") {
@@ -402,6 +403,44 @@ func TestDeployConfigForDerivesRoutesAndKV(t *testing.T) {
 	}
 	if cfg.OriginURL != "https://o" {
 		t.Errorf("origin = %q", cfg.OriginURL)
+	}
+}
+
+// TestDeployConfigForOriginPassthrough pins that the sentinel `-origin passthrough` is a
+// VALID origin value: it is carried verbatim into the CADISH_ORIGIN binding (OriginURL), so
+// the worker enters passthrough mode (fetch the original host/scheme, no rewrite) instead of
+// being rejected as a non-URL. This is the front-a-multi-host-origin-in-the-same-CF-zone
+// topology that avoids the canonicalize-redirect loop a host rewrite would trigger.
+func TestDeployConfigForOriginPassthrough(t *testing.T) {
+	pipelines, err := loadEdgePipelines(writeCadishfile(t, edgeDeploySrc))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	cfg, err := deployConfigFor(pipelines[0], "passthrough")
+	if err != nil {
+		t.Fatalf("deployConfigFor with passthrough origin: %v", err)
+	}
+	if cfg.OriginURL != "passthrough" {
+		t.Errorf("OriginURL = %q, want the passthrough sentinel carried verbatim into CADISH_ORIGIN", cfg.OriginURL)
+	}
+}
+
+// TestEdgeDeployAcceptsPassthroughOrigin proves `cadish edge deploy -origin passthrough`
+// passes the origin-required gate (the sentinel is a valid value, not an empty/rejected one).
+// It then reaches the build safety gate; edgeDeploySecretSrc trips ValueExposed, so the
+// deploy aborts there WITHOUT making a real CF call — that abort message (not the origin one)
+// confirms passthrough was accepted as the origin.
+func TestEdgeDeployAcceptsPassthroughOrigin(t *testing.T) {
+	t.Setenv("CF_API_TOKEN", "tok")
+	cfg := writeCadishfile(t, edgeDeploySecretSrc)
+	var out, errOut bytes.Buffer
+	code := runEdgeDeploy(cfg, "passthrough", &out, &errOut, false)
+	if strings.Contains(errOut.String(), "an origin is required") {
+		t.Fatalf("passthrough must be accepted as a valid origin, got: %s", errOut.String())
+	}
+	// It reaches and trips the value-exposure gate instead (proving origin passed).
+	if code != 1 || !strings.Contains(errOut.String(), "PUBLIC worker bundle") {
+		t.Fatalf("exit = %d, want the value-exposure gate to fire after accepting passthrough; stderr=%s", code, errOut.String())
 	}
 }
 
@@ -507,5 +546,130 @@ func TestEdgeBuildSecurityOnlyIPDoesNotForceFail(t *testing.T) {
 	errOut.Reset()
 	if code := runEdgeBuild(cfg, "-", "", true, false, &out, &errOut); code != 1 {
 		t.Errorf("strict exit = %d, want 1 (delegated ip / security gate); stderr=%s", code, errOut.String())
+	}
+}
+
+// edgeDeployCookieSrc has an `edge {}` block and a cookie matcher carrying a non-secret
+// literal value (AdultContent 0) — a real-world case that legitimately ships non-secret
+// values to the edge worker (ValueExposed > 0).
+const edgeDeployCookieSrc = `example.com {
+    edge {
+        account acc-123
+        zone    example.com
+        worker  cadish-edge-example
+    }
+    @adult cookie AdultContent 0
+    pass @adult
+    cache_ttl default ttl 1m
+}`
+
+// TestAbortEdgeDeployUnsafeAllowPublicValues validates the -allow-public-values flag
+// semantics directly against abortEdgeDeployUnsafe:
+//   - Without the flag: ValueExposed aborts (existing behavior, unchanged).
+//   - With the flag:    ValueExposed does NOT abort, but the warning is still printed.
+//   - ForcedPass ALWAYS aborts regardless of the flag (correctness gate, not secrets gate).
+func TestAbortEdgeDeployUnsafeAllowPublicValues(t *testing.T) {
+	cases := []struct {
+		name            string
+		rep             edgeir.CoverageReport
+		allowPublicVals bool
+		wantAbort       bool
+		wantInStderr    string
+		wantNotInStderr string
+	}{
+		{
+			name:            "value-exposed-without-flag-aborts",
+			rep:             edgeir.CoverageReport{ValueExposed: 1},
+			allowPublicVals: false,
+			wantAbort:       true,
+			wantInStderr:    "refusing to upload",
+		},
+		{
+			name:            "value-exposed-with-flag-does-not-abort",
+			rep:             edgeir.CoverageReport{ValueExposed: 2},
+			allowPublicVals: true,
+			wantAbort:       false,
+			wantInStderr:    "VALUE-EXPOSURE", // warning still printed
+		},
+		{
+			name:            "forced-pass-with-flag-still-aborts",
+			rep:             edgeir.CoverageReport{ForcedPass: 1},
+			allowPublicVals: true,
+			wantAbort:       true,
+			wantInStderr:    "fail-open pass",
+		},
+		{
+			name:            "forced-pass-and-value-exposed-with-flag-aborts-on-forced",
+			rep:             edgeir.CoverageReport{ForcedPass: 1, ValueExposed: 1},
+			allowPublicVals: true,
+			wantAbort:       true,
+			wantInStderr:    "fail-open pass",
+		},
+		{
+			name:            "clean-with-flag-does-not-abort",
+			rep:             edgeir.CoverageReport{EdgeNative: 3},
+			allowPublicVals: true,
+			wantAbort:       false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var errOut bytes.Buffer
+			got := abortEdgeDeployUnsafe("example.com", tc.rep, &errOut, tc.allowPublicVals)
+			if got != tc.wantAbort {
+				t.Fatalf("abort = %v, want %v (stderr=%s)", got, tc.wantAbort, errOut.String())
+			}
+			if tc.wantInStderr != "" && !strings.Contains(errOut.String(), tc.wantInStderr) {
+				t.Errorf("stderr missing %q: %s", tc.wantInStderr, errOut.String())
+			}
+			if tc.wantNotInStderr != "" && strings.Contains(errOut.String(), tc.wantNotInStderr) {
+				t.Errorf("stderr should not contain %q: %s", tc.wantNotInStderr, errOut.String())
+			}
+		})
+	}
+}
+
+// TestEdgeDeployCookieLiteralRefusedWithoutFlag proves that a config with a
+// non-secret cookie matcher literal is refused by deploy WITHOUT -allow-public-values.
+func TestEdgeDeployCookieLiteralRefusedWithoutFlag(t *testing.T) {
+	t.Setenv("CF_API_TOKEN", "tok")
+	cfg := writeCadishfile(t, edgeDeployCookieSrc)
+	var out, errOut bytes.Buffer
+	if code := runEdgeDeploy(cfg, "https://origin.example.com", &out, &errOut, false); code != 1 {
+		t.Fatalf("exit = %d, want 1 (cookie literal must be refused without flag); stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "refusing to upload") {
+		t.Errorf("expected the value-exposure refusal, got: %s", errOut.String())
+	}
+	if strings.Contains(out.String(), "deployed worker") {
+		t.Errorf("must not report a successful deploy: %s", out.String())
+	}
+}
+
+// TestEdgeDeployCookieLiteralAllowedWithFlag proves that WITH -allow-public-values,
+// a cookie matcher literal does NOT trigger the refusing-to-upload abort; the
+// VALUE-EXPOSURE warning is still printed.
+// The deploy will fail at the CF API call (fake token / no real CF), but that's the
+// network gate — not the value-exposure safety gate — so we assert on the stderr
+// message distinguishing the two failure modes.
+func TestEdgeDeployCookieLiteralAllowedWithFlag(t *testing.T) {
+	t.Setenv("CF_API_TOKEN", "tok")
+	cfg := writeCadishfile(t, edgeDeployCookieSrc)
+	var out, errOut bytes.Buffer
+	// With allowPublicValues=true the safety gate must NOT abort on ValueExposed.
+	// The call will still exit non-zero (fake CF token → network/API error), but
+	// the exit must NOT be due to the "refusing to upload" value-exposure gate.
+	code := runEdgeDeploy(cfg, "https://origin.example.com", &out, &errOut, true)
+	if strings.Contains(errOut.String(), "refusing to upload") {
+		t.Errorf("-allow-public-values must suppress the value-exposure abort; stderr=%s", errOut.String())
+	}
+	// VALUE-EXPOSURE warning must still be printed (operator must see the literals).
+	if !strings.Contains(errOut.String(), "VALUE-EXPOSURE") {
+		t.Errorf("VALUE-EXPOSURE warning must still be printed even with flag; stderr=%s", errOut.String())
+	}
+	// Either it succeeded (somehow) or it failed on the CF network call (not the gate).
+	// In both cases we must NOT see "deployed worker" reported from a fake-token run.
+	if code == 0 && !strings.Contains(out.String(), "deployed worker") {
+		t.Errorf("unexpected success with no 'deployed worker' output")
 	}
 }

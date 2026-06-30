@@ -1,0 +1,21 @@
+{
+  "name": "70-redirect-no-store",
+  "cadishfile": "example.com {\n    @lang cookie lang es\n    redirect @lang 302 https://es.example.com{uri} no_store\n    redirect ^/p/(\\d+)$ 301 https://example.com/product/$1\n    cache_ttl default ttl 1m\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/news", "header": { "Cookie": ["lang=es"] } },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/p/42" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "example.com", "path": "/about" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "HIT"
+    }
+  ]
+}

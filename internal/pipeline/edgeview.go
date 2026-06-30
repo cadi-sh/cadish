@@ -51,6 +51,11 @@ type EdgeMatcher struct {
 
 	// query_present.
 	QueryNames []string // param-name patterns (exact + `*` globs)
+	// QueryNamesNonEmpty is the subset of QueryNames that carry the `+` modifier
+	// (e.g. `query_present adult_content+ ff-*+`): a matched param must have at
+	// least one non-empty value to fire. Absent => all names are presence-only.
+	// v7 (additive).
+	QueryNamesNonEmpty []string
 
 	// cookie_json / header_json (D54): a bounded dotted field test inside a JSON
 	// cookie/header value. Name carries the cookie/header name; JSONPath is the
@@ -61,6 +66,18 @@ type EdgeMatcher struct {
 
 	// ResponsePhase is true for content_type/set_cookie (needs the origin response).
 	ResponsePhase bool
+
+	// Subs is the AND-conjunction of an `all` matcher: each term references a named
+	// sub-matcher (Ref) with an optional per-term Negate (`!@x`). Request-phase, depth-1
+	// (compile forbids all-of-all and response-phase subs). Populated only for kindAll.
+	Subs []EdgeSubMatcher
+}
+
+// EdgeSubMatcher is the neutral view of one `all` sub-term: a named-matcher reference
+// XOR'd with an optional negate (the secTerm{m, negate} pair).
+type EdgeSubMatcher struct {
+	Ref    string
+	Negate bool
 }
 
 // EdgeClassifier is the neutral view of a classify table: ordered rows (each an
@@ -181,6 +198,7 @@ type EdgeRedirect struct {
 	Scope    EdgeScope // the selecting scope (valid only when HasScope)
 	Status   int
 	Target   string // template: {host}/{path}/{query}/{uri} (+ $0..$9 when Regex is set)
+	NoStore  bool   // true when the directive carried a trailing `no_store` modifier
 }
 
 // EdgePurge is a compiled purge guard.
@@ -507,13 +525,15 @@ type EdgeDeviceClassifier struct {
 }
 
 // EdgeDeviceClassifier returns the projected device classifier and ok=false when the
-// site does NOT use the {device} cache-key token (zero-cost-when-unused: a site that
-// never keys on device ships no UA ruleset to the worker). When the {device} token is
-// present the FULL ruleset is projected (even the built-in default) so the worker
-// classifies from an explicit IR and never relies on a JS-side default that could
-// drift from Go.
+// site does NOT use {device} at all (zero-cost-when-unused: a site that never keys on
+// OR reflects device ships no UA ruleset to the worker). The gate is the broad
+// UsesDeviceClassification — matching the server pre-pass gate — so a {device} token
+// reflected in a header/redirect (but absent from the cache key) still ships the
+// classifier and the worker resolves the token instead of emitting "". When present
+// the FULL ruleset is projected (even the built-in default) so the worker classifies
+// from an explicit IR and never relies on a JS-side default that could drift from Go.
 func (p *Pipeline) EdgeDeviceClassifier() (EdgeDeviceClassifier, bool) {
-	if !p.UsesDeviceToken() || p.deviceClassifier == nil {
+	if !p.UsesDeviceClassification() || p.deviceClassifier == nil {
 		return EdgeDeviceClassifier{}, false
 	}
 	c := p.deviceClassifier
@@ -596,7 +616,7 @@ func (p *Pipeline) EdgeRedirectRules() []EdgeRedirect {
 	out := make([]EdgeRedirect, 0, len(p.redirectRules))
 	for i := range p.redirectRules {
 		r := &p.redirectRules[i]
-		er := EdgeRedirect{Status: r.status, Target: r.target}
+		er := EdgeRedirect{Status: r.status, Target: r.target, NoStore: r.noStore}
 		if r.re != nil {
 			er.Regex = r.re.String()
 		}
@@ -902,11 +922,10 @@ func edgeKindName(k matcherKind) string {
 	case kindQuery:
 		return "query"
 	case kindAll:
-		// `all` (AND-composite) and `query` are slice-2 server-side Gateway matchers
-		// with no JavaScript runtime case yet; the edge projector (edgeir.Project)
-		// detects these kinds and DELEGATES any site that uses them to the Cadish server
-		// behind (fail-closed), so they never silently mis-project. Naming the kind
-		// explicitly (not "unknown") keeps that detection precise.
+		// `all` (AND-composite) is edge-native as of IR v7: projected via Matcher.Subs
+		// (AND-conjunction of (Ref, Negate) sub-terms; the worker recurses matchOne).
+		// Naming the kind explicitly (not "unknown") keeps edgeir projection and the
+		// conformance suite precise.
 		return "all"
 	case kindIP:
 		// SERVER-ONLY: the `ip` ACL resolves the trusted-proxy real client IP, which the edge
@@ -1033,13 +1052,24 @@ func (m *matcher) edgeView() EdgeMatcher {
 		em.GeoValues = sortedSetKeys(m.geoValues)
 	case kindQueryPresent:
 		em.QueryNames = nameGlobPatterns(m.queryNames)
+		if m.queryNamesNonEmpty != nil {
+			em.QueryNamesNonEmpty = nameGlobPatterns(m.queryNamesNonEmpty)
+		}
 	case kindQuery:
-		// One named query param tested against an OR set of exact values (server-side
-		// Gateway routing). Reuse Name + Values (no new IR field); an edge site that uses
-		// it would need a JS `query` case, but Gateway routing is server-only so this is
-		// projected for completeness only.
+		// One named query param tested against an OR set of exact values. Reuse Name +
+		// Values (no new IR field); the edge `query` matchOne case reads the same parsed
+		// query multimap (empty Values ⇒ presence; else OR over ALL occurrences). v7.
 		em.Name = m.queryName
 		em.Values = append([]string(nil), m.queryValues...)
+	case kindAll:
+		// AND-conjunction of named sub-matchers, each with an optional `!` negate. The subs
+		// are ALWAYS named refs (parseSecRef requires `@name`; no inline subs) and every
+		// named matcher is projected, so the edge ir.matchers[ref] lookup always resolves.
+		// Depth-1 by construction (compile forbids all-of-all and response-phase subs).
+		em.Subs = make([]EdgeSubMatcher, 0, len(m.subTerms))
+		for _, t := range m.subTerms {
+			em.Subs = append(em.Subs, EdgeSubMatcher{Ref: t.m.name, Negate: t.negate})
+		}
 	}
 	return em
 }

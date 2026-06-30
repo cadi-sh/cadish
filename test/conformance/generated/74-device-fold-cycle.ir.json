@@ -1,0 +1,102 @@
+{
+  "irVersion": 9,
+  "site": {
+    "hosts": [
+      "fold.example.com"
+    ],
+    "redirectHosts": [
+      "fold.example.com"
+    ],
+    "canonicalHost": "fold.example.com"
+  },
+  "upstream": {},
+  "matchers": {},
+  "device": {
+    "rules": [
+      {
+        "class": "aa",
+        "substrings": [
+          "tokenaa"
+        ]
+      },
+      {
+        "class": "bb",
+        "substrings": [
+          "tokenbb"
+        ]
+      }
+    ],
+    "default": "desktop",
+    "folds": [
+      {
+        "from": "aa",
+        "into": "bb"
+      },
+      {
+        "from": "bb",
+        "into": "aa"
+      }
+    ]
+  },
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      },
+      {
+        "kind": "device"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          },
+          {
+            "kind": "device"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "set",
+            "name": "X-Device-Class",
+            "value": "{device}",
+            "valueIsTmpl": true
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {},
+  "usesGeo": false,
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

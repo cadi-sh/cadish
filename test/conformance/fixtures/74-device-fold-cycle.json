@@ -1,0 +1,16 @@
+{
+  "name": "74-device-fold-cycle",
+  "cadishfile": "fold.example.com {\n    device_detect {\n        aa ua_contains tokenaa\n        bb ua_contains tokenbb\n        default desktop\n        fold aa bb\n        fold bb aa\n    }\n    cache_key host path {device}\n    cache_ttl default ttl 60s\n    header X-Device-Class {device}\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "fold.example.com", "path": "/p", "header": { "User-Agent": ["a device with tokenaa inside"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "fold.example.com", "path": "/p", "header": { "User-Agent": ["a device with tokenbb inside"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

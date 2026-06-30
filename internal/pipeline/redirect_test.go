@@ -3,6 +3,7 @@ package pipeline
 import (
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -100,8 +101,10 @@ func TestRedirectHostNotReflectedForUndeclaredHost(t *testing.T) {
 }
 
 // REDIRECT-TOKEN Part A: a derived {classify.NAME} token resolves in a redirect
-// Location (here a language table picks the target subdomain). With the zero
-// resolver it expanded to "", producing a broken "https://.example.com/...".
+// Location. With the zero resolver it expanded to "", producing a broken target. The
+// token sits in the PATH here: Fix B forbids a {classify.*} token in the AUTHORITY
+// (an open redirect — only the validated {host} family may sit in host position), so
+// language selection by subdomain must use {host.sub}/{host.base}, not {classify}.
 func TestRedirectClassifyTokenResolves(t *testing.T) {
 	src := `example.com {
 	upstream b { to http://x:80 }
@@ -109,7 +112,7 @@ func TestRedirectClassifyTokenResolves(t *testing.T) {
 		when header Accept-Language es -> es
 		default                        -> www
 	}
-	redirect ^/go(/.*)?$ 302 https://{classify.langredir}.example.com/go$1
+	redirect ^/go(/.*)?$ 302 https://{host}/{classify.langredir}/go$1
 	cache_ttl default ttl 5m
 }
 `
@@ -121,14 +124,14 @@ func TestRedirectClassifyTokenResolves(t *testing.T) {
 	if dec.Redirect == nil {
 		t.Fatalf("expected redirect, got nil")
 	}
-	if dec.Redirect.Location != "https://es.example.com/go/x" {
-		t.Fatalf("classify token not resolved in Location: got %q, want %q", dec.Redirect.Location, "https://es.example.com/go/x")
+	if dec.Redirect.Location != "https://example.com/es/go/x" {
+		t.Fatalf("classify token not resolved in Location: got %q, want %q", dec.Redirect.Location, "https://example.com/es/go/x")
 	}
 
 	reqEN := &Request{Method: "GET", Host: "example.com", Path: "/go", Query: url.Values{},
 		Header: http.Header{"Accept-Language": []string{"en"}}}
-	if d := p.EvalRequest(reqEN); d.Redirect == nil || d.Redirect.Location != "https://www.example.com/go" {
-		t.Fatalf("default classify token: got %+v, want https://www.example.com/go", d.Redirect)
+	if d := p.EvalRequest(reqEN); d.Redirect == nil || d.Redirect.Location != "https://example.com/www/go" {
+		t.Fatalf("default classify token: got %+v, want https://example.com/www/go", d.Redirect)
 	}
 }
 
@@ -215,11 +218,11 @@ func TestRedirectProtoTokenFromTLS(t *testing.T) {
 
 // {host.base}/{host.sub}: ONE brand-agnostic rule rewrites the subdomain of any
 // configured brand to www.<base>, replacing the per-brand literal targets. The base
-// is public-suffix aware (nudity.tv, amateur.tv, and the multi-label tech555.io), and
+// is public-suffix aware (brand-a.example, brand-b.example, and the multi-label tech555.io), and
 // it derives from the VALIDATED redirect host so the open-redirect defense (F12) still
 // applies to the COMPUTED host.
 func TestRedirectHostBaseSubdomainRewrite(t *testing.T) {
-	src := `es.nudity.tv, www.amateur.tv, nudity.tv, cam4you.tech555.io {
+	src := `es.brand-a.example, www.brand-b.example, brand-a.example, cam4you.tech555.io {
 	upstream b { to http://x:80 }
 	redirect ^/(.*)$ 302 https://www.{host.base}/$1
 	cache_ttl default ttl 5m
@@ -232,14 +235,14 @@ func TestRedirectHostBaseSubdomainRewrite(t *testing.T) {
 		wantLoc string
 	}{
 		// Single brand-agnostic rule collapses the per-brand literal targets:
-		{"es.nudity.tv -> www.nudity.tv", "es.nudity.tv", "https://www.nudity.tv/page"},
-		{"www.amateur.tv -> www.amateur.tv", "www.amateur.tv", "https://www.amateur.tv/page"},
-		{"bare nudity.tv -> www.nudity.tv", "nudity.tv", "https://www.nudity.tv/page"},
+		{"es.brand-a.example -> www.brand-a.example", "es.brand-a.example", "https://www.brand-a.example/page"},
+		{"www.brand-b.example -> www.brand-b.example", "www.brand-b.example", "https://www.brand-b.example/page"},
+		{"bare brand-a.example -> www.brand-a.example", "brand-a.example", "https://www.brand-a.example/page"},
 		// Multi-label public suffix: the whole host is the base (sub empty), NOT tech555.io.
 		{"multi-label suffix base", "cam4you.tech555.io", "https://www.cam4you.tech555.io/page"},
 		// SECURITY (F12): an attacker Host is NOT trusted, so {host.base} derives from the
-		// canonical configured host (es.nudity.tv -> base nudity.tv), never the attacker's.
-		{"attacker host falls back to canonical base", "evil.attacker.test", "https://www.nudity.tv/page"},
+		// canonical configured host (es.brand-a.example -> base brand-a.example), never the attacker's.
+		{"attacker host falls back to canonical base", "evil.attacker.test", "https://www.brand-a.example/page"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -261,20 +264,20 @@ func TestRedirectHostBaseSubdomainRewrite(t *testing.T) {
 // host. Here a request to the www host falls through (no rule matches the www host),
 // proving the family does not redirect a host to itself.
 func TestRedirectHostBaseNoSelfLoop(t *testing.T) {
-	src := `nudity.tv, www.nudity.tv {
+	src := `brand-a.example, www.brand-a.example {
 	upstream b { to http://x:80 }
-	@bare host nudity.tv
+	@bare host brand-a.example
 	redirect @bare ^/(.*)$ 302 https://www.{host.base}/$1
 	cache_ttl default ttl 5m
 }
 `
 	p := compileSrc(t, src)
 	// Bare host: the @bare scope fires, rewrite to the www host.
-	if d := p.EvalRequest(&Request{Method: "GET", Host: "nudity.tv", Path: "/x", Query: url.Values{}}); d.Redirect == nil || d.Redirect.Location != "https://www.nudity.tv/x" {
+	if d := p.EvalRequest(&Request{Method: "GET", Host: "brand-a.example", Path: "/x", Query: url.Values{}}); d.Redirect == nil || d.Redirect.Location != "https://www.brand-a.example/x" {
 		t.Fatalf("bare host should redirect to www: %+v", d.Redirect)
 	}
 	// Already on www: @bare does not match, so no redirect — no self-loop.
-	if d := p.EvalRequest(&Request{Method: "GET", Host: "www.nudity.tv", Path: "/x", Query: url.Values{}}); d.Redirect != nil {
+	if d := p.EvalRequest(&Request{Method: "GET", Host: "www.brand-a.example", Path: "/x", Query: url.Values{}}); d.Redirect != nil {
 		t.Fatalf("www host must not redirect to itself (loop), got %+v", d.Redirect)
 	}
 }
@@ -490,7 +493,9 @@ func TestRedirectScopedRegexCombined(t *testing.T) {
 
 // REDIRECT-TOKEN Part B: in the combined form a derived {classify.NAME} token AND a
 // $N capture resolve together in the Location (Part A still works under a scope),
-// and {host} stays the VALIDATED redirect host (F12), never the raw request Host.
+// and {host} stays the VALIDATED redirect host (F12), never the raw request Host. The
+// {classify.*} token sits in the PATH (Fix B forbids it in the AUTHORITY), while the
+// validated {host} family carries the authority.
 func TestRedirectScopedRegexTokenAndCapture(t *testing.T) {
 	src := `www.example.com, example.com {
 	upstream b { to http://x:80 }
@@ -499,7 +504,7 @@ func TestRedirectScopedRegexTokenAndCapture(t *testing.T) {
 		default                        -> www
 	}
 	@active classify {langredir}==es
-	redirect @active (?i)^/go(/.*)?$ 302 https://{classify.langredir}.example.com{host}$1
+	redirect @active (?i)^/go(/.*)?$ 302 https://{host}/{classify.langredir}$1
 	cache_ttl default ttl 5m
 }
 `
@@ -512,7 +517,7 @@ func TestRedirectScopedRegexTokenAndCapture(t *testing.T) {
 	if dec.Redirect == nil {
 		t.Fatalf("expected combined redirect to fire, got nil")
 	}
-	want := "https://es.example.comwww.example.com/x"
+	want := "https://www.example.com/es/x"
 	if dec.Redirect.Location != want {
 		t.Fatalf("combined token+capture = %q, want %q", dec.Redirect.Location, want)
 	}
@@ -639,5 +644,561 @@ func TestRedirectOpenRedirectHostToken(t *testing.T) {
 		t.Run("allow", func(t *testing.T) {
 			_ = compileSrc(t, src) // Fatals if the safe target is wrongly rejected
 		})
+	}
+}
+
+// TestRedirectOpenRedirectAuthorityWhitelist (Fix B / R26 follow-up): the redirect
+// Location AUTHORITY (scheme://AUTHORITY/…) may carry ONLY the validated host family
+// ({host}/{host.base}/{host.sub}) plus literal text and $N backrefs. ANY other
+// request-sourced template token in host position — {query.*}, {http.*}, {client_ip},
+// {geo*}, {classify.*}, {device}, {currency}, … — is an open redirect and must hard-fail
+// at COMPILE (the same gate that protects both `cadish run` AND `cadish edge build`,
+// since edge build compiles the same Cadishfile before projecting the IR). Tokens in the
+// PATH/query portion (after the authority) stay unrestricted — path reflection is not an
+// open redirect.
+func TestRedirectOpenRedirectAuthorityWhitelist(t *testing.T) {
+	// Each of these places a request-sourced token in the Location AUTHORITY → reject.
+	reject := []string{
+		// The reviewer's confirmed probe: {query.NAME} as the whole authority.
+		"example.com {\n\tupstream b { to http://x:80 }\n\tredirect ^/go$ 302 https://{query.next}/login\n}\n",
+		// {client_ip} as the authority.
+		"example.com {\n\tupstream b { to http://x:80 }\n\tredirect ^/.*$ 302 https://{client_ip}/x\n}\n",
+		// {geo} as the authority.
+		"example.com {\n\tupstream b { to http://x:80 }\n\tredirect ^/.*$ 302 https://{geo}.evil.test/x\n}\n",
+		// {classify.NAME} in the authority (subdomain selection) — no longer allowed.
+		"example.com {\n\tupstream b { to http://x:80 }\n\tclassify {lr} {\n\t\twhen header Accept-Language es -> es\n\t\tdefault -> www\n\t}\n\tredirect ^/.*$ 302 https://{classify.lr}.example.com/x\n}\n",
+		// {device} in the authority.
+		"example.com {\n\tupstream b { to http://x:80 }\n\tredirect ^/.*$ 302 https://{device}.evil.test/x\n}\n",
+		// Embedded (not equal to) the authority — still attacker-influenced host.
+		"example.com {\n\tupstream b { to http://x:80 }\n\tredirect ^/.*$ 302 https://pre-{query.next}.evil/x\n}\n",
+		// Scoped form, authority position.
+		"example.com {\n\t@all path /*\n\tupstream b { to http://x:80 }\n\tredirect @all 302 https://{query.next}/\n}\n",
+		// Protocol-relative authority.
+		"example.com {\n\tupstream b { to http://x:80 }\n\tredirect ^/.*$ 301 //{query.next}/x\n}\n",
+		// Scheme-relative bypass variants (browsers fold to an authority after the ':').
+		"example.com {\n\tupstream b { to http://x:80 }\n\tredirect ^/.*$ 302 https:/{query.next}/x\n}\n",
+		"example.com {\n\tupstream b { to http://x:80 }\n\tredirect ^/.*$ 302 https:{query.next}/x\n}\n",
+		// userinfo: an attacker token as the host AFTER the '@' (the real authority).
+		"example.com {\n\tupstream b { to http://x:80 }\n\tredirect ^/.*$ 302 https://static.example.net@{query.next}/x\n}\n",
+		// F-D2: an UNANCHORED $N capture forming the host — compiles today but the runtime
+		// guard suppresses it on every request (permanently dead). Reject loudly instead.
+		"example.com {\n\tupstream b { to http://x:80 }\n\tredirect ^/(\\w+)\\.cdn$ 301 https://$1.example.com/\n}\n",
+		// Protocol-relative unanchored capture host.
+		"example.com {\n\tupstream b { to http://x:80 }\n\tredirect ^/(\\w+)$ 302 //$1.evil.test/x\n}\n",
+	}
+	for i, src := range reject {
+		t.Run("reject", func(t *testing.T) {
+			if ce := compileErr(t, src); ce == nil {
+				t.Fatalf("case %d: want open-redirect compile error, got nil", i)
+			}
+		})
+	}
+
+	// Safe targets must STILL compile: the validated host family in the authority, and
+	// any request-sourced token in the PATH/query portion.
+	allow := []string{
+		// Validated host tokens in the authority.
+		"example.com {\n\tupstream b { to http://x:80 }\n\tredirect ^/.*$ 302 https://{host}/x\n}\n",
+		"example.com {\n\tupstream b { to http://x:80 }\n\tredirect ^/.*$ 302 https://{host.base}/x\n}\n",
+		"example.com {\n\tupstream b { to http://x:80 }\n\tredirect ^/.*$ 302 https://{host.sub}.{host.base}/x\n}\n",
+		// {uri} immediately after the host terminates the authority (it expands rooted at '/').
+		"example.com {\n\tupstream b { to http://x:80 }\n\tredirect ^/.*$ 302 https://es.{host.base}{uri}\n}\n",
+		// {query.NAME} in the PATH — harmless, allowed.
+		"example.com {\n\tupstream b { to http://x:80 }\n\tredirect ^/.*$ 302 https://{host}/go/{query.next}\n}\n",
+		// {classify.NAME} in the PATH — allowed.
+		"example.com {\n\tupstream b { to http://x:80 }\n\tclassify {lr} {\n\t\twhen header Accept-Language es -> es\n\t\tdefault -> www\n\t}\n\tredirect ^/.*$ 302 https://{host}/{classify.lr}/x\n}\n",
+		// Static literal external authority (operator's deliberate choice) — allowed.
+		"example.com {\n\tupstream b { to http://x:80 }\n\tredirect ^/.*$ 302 https://partner.example.net/\n}\n",
+		// F-D2: a $N capture ANCHORED by a preceding validated {host} token (rebuilding a
+		// path from captures, e.g. the index.php strip) is allowed — the runtime guard
+		// fires it when the capture is a rooted path and suppresses an escape.
+		"example.com {\n\tupstream b { to http://x:80 }\n\tredirect (?i)^(/.*?)?/index\\.php(/.*)?$ 301 https://{host}$1$2\n}\n",
+	}
+	for _, src := range allow {
+		t.Run("allow", func(t *testing.T) {
+			_ = compileSrc(t, src) // Fatals if a safe target is wrongly rejected.
+		})
+	}
+}
+
+// TestRedirectOpenRedirectProbe (Fix B): the reviewer's runtime probe. A redirect that
+// reflects {query.next} in the PATH compiles and, at runtime, the Location AUTHORITY
+// stays the VALIDATED host — never the attacker's. (The unsafe authority variant cannot
+// even compile, proved above; here we prove the safe path-reflection cannot be coerced
+// into an attacker host.)
+func TestRedirectOpenRedirectProbe(t *testing.T) {
+	src := `example.com {
+	upstream b { to http://x:80 }
+	redirect ^/go$ 302 https://{host}/next/{query.next}
+	cache_ttl default ttl 5m
+}
+`
+	p := compileSrc(t, src)
+	req := &Request{Method: "GET", Host: "example.com", Path: "/go", Query: url.Values{"next": {"evil.attacker.example"}}}
+	dec := p.EvalRequest(req)
+	if dec.Redirect == nil {
+		t.Fatalf("expected redirect, got nil")
+	}
+	// The authority must be example.com, NOT the attacker value reflected from ?next=.
+	if got := dec.Redirect.Location; !strings.HasPrefix(got, "https://example.com/") {
+		t.Fatalf("open redirect: Location %q must keep the validated host authority", got)
+	}
+}
+
+// TestRedirectRuntimeAuthorityInjection is the open-redirect RUNTIME backstop: a target
+// whose authority is built from a regex capture ($N) or a request-sourced token passes the
+// compile-time guard (the authority span holds only literal text + $N backrefs + {host}),
+// yet at RUNTIME the expansion can inject an off-origin authority — the classic index.php
+// userinfo trick `/index.php@evil.example.com/` makes the validated host the USERINFO and
+// the attacker host the real navigation origin. The runtime post-expansion authority
+// assertion must SUPPRESS such redirects (fall through, Redirect==nil) while leaving every
+// legitimate redirect — including capture-bearing path rewrites, the language-redirect
+// {host.base} family, and operator-declared literal external targets — firing as before.
+func TestRedirectRuntimeAuthorityInjection(t *testing.T) {
+	// The live exploit config: a capture lands immediately in the authority position.
+	src := `brand-a.example {
+	upstream b { to http://x:80 }
+	redirect (?i)^(/.*?)?/index\.php(.*)$ 301 https://{host}$1$2?{query}
+	cache_ttl default ttl 5m
+}
+`
+	p := compileSrc(t, src)
+
+	t.Run("exploit suppressed", func(t *testing.T) {
+		// $1="", $2="@evil.example.com/" → https://brand-a.example@evil.example.com/?
+		// brand-a.example becomes userinfo, evil.example.com the real host → SUPPRESS.
+		req := &Request{Method: "GET", Host: "brand-a.example", Path: "/index.php@evil.example.com/", Query: url.Values{}}
+		dec := p.EvalRequest(req)
+		if dec.Redirect != nil {
+			t.Fatalf("open-redirect must be suppressed, got Location %q", dec.Redirect.Location)
+		}
+	})
+
+	t.Run("legit index.php strip still redirects", func(t *testing.T) {
+		// $1="/foo", $2="/bar" → https://brand-a.example/foo/bar?x=1 (authority unchanged) → ALLOW.
+		req := &Request{Method: "GET", Host: "brand-a.example", Path: "/foo/index.php/bar", Query: url.Values{"x": {"1"}}}
+		dec := p.EvalRequest(req)
+		if dec.Redirect == nil {
+			t.Fatalf("legit index.php strip must still redirect, got nil")
+		}
+		if want := "https://brand-a.example/foo/bar?x=1"; dec.Redirect.Location != want {
+			t.Fatalf("location = %q, want %q", dec.Redirect.Location, want)
+		}
+	})
+
+	// The language-redirect {host.base} family resolves the host identically with the
+	// request inputs neutralized (host kept), so it must STILL fire.
+	t.Run("language redirect allowed", func(t *testing.T) {
+		src := `es.brand-a.example, brand-a.example {
+	upstream b { to http://x:80 }
+	redirect ^/(.*)$ 302 https://es.{host.base}{uri}
+	cache_ttl default ttl 5m
+}
+`
+		p := compileSrc(t, src)
+		req := &Request{Method: "GET", Host: "brand-a.example", Path: "/page", Query: url.Values{"q": {"1"}}}
+		dec := p.EvalRequest(req)
+		if dec.Redirect == nil {
+			t.Fatalf("language redirect must still fire, got nil")
+		}
+		if want := "https://es.brand-a.example/page?q=1"; dec.Redirect.Location != want {
+			t.Fatalf("location = %q, want %q", dec.Redirect.Location, want)
+		}
+	})
+
+	// An operator-declared literal external authority (no request input in the host) must
+	// STILL fire: ref and got authorities are the same literal, so it is allowed.
+	t.Run("literal off-site redirect allowed", func(t *testing.T) {
+		src := `brand-a.example {
+	upstream b { to http://x:80 }
+	redirect ^/partner(/.*)?$ 302 https://provider.example.net/landing$1
+	cache_ttl default ttl 5m
+}
+`
+		p := compileSrc(t, src)
+		req := &Request{Method: "GET", Host: "brand-a.example", Path: "/partner/x", Query: url.Values{}}
+		dec := p.EvalRequest(req)
+		if dec.Redirect == nil {
+			t.Fatalf("literal off-site redirect must still fire, got nil")
+		}
+		if want := "https://provider.example.net/landing/x"; dec.Redirect.Location != want {
+			t.Fatalf("location = %q, want %q", dec.Redirect.Location, want)
+		}
+	})
+
+	// Latent variant #2: a RELATIVE target whose leading token is request-sourced expands to
+	// an ABSOLUTE off-origin Location. The compile-time guard sees a relative target (no
+	// authority) and allows it; the runtime check sees a got-authority where ref has none →
+	// SUPPRESS.
+	t.Run("relative query-token target suppressed", func(t *testing.T) {
+		src := `brand-a.example {
+	upstream b { to http://x:80 }
+	redirect ^/r$ 302 {query.next}
+	cache_ttl default ttl 5m
+}
+`
+		p := compileSrc(t, src)
+		req := &Request{Method: "GET", Host: "brand-a.example", Path: "/r", Query: url.Values{"next": {"https://evil.com/x"}}}
+		dec := p.EvalRequest(req)
+		if dec.Redirect != nil {
+			t.Fatalf("relative request-sourced absolute redirect must be suppressed, got Location %q", dec.Redirect.Location)
+		}
+		// A SAFE relative next (still relative after expansion) must STILL redirect.
+		req2 := &Request{Method: "GET", Host: "brand-a.example", Path: "/r", Query: url.Values{"next": {"/account"}}}
+		dec2 := p.EvalRequest(req2)
+		if dec2.Redirect == nil || dec2.Redirect.Location != "/account" {
+			t.Fatalf("safe relative next must redirect to /account, got %+v", dec2.Redirect)
+		}
+	})
+}
+
+// TestLocationAuthority unit-tests the concrete-string authority extractor that backs the
+// runtime open-redirect defense.
+func TestLocationAuthority(t *testing.T) {
+	tests := []struct {
+		in      string
+		wantA   string
+		wantHas bool
+	}{
+		{"https://brand-a.example@evil.example.com/?", "brand-a.example@evil.example.com", true},
+		{"https://brand-a.example/foo/bar?x=1", "brand-a.example", true},
+		{"https://brand-a.example?", "brand-a.example", true},
+		{"https://es.brand-a.example/page", "es.brand-a.example", true},
+		{"//evil.com/x", "evil.com", true},
+		{"https://evil.com/x", "evil.com", true},
+		{"https:/evil.com/x", "evil.com", true},  // scheme-relative bypass folds to authority
+		{`https:\\evil.com/x`, "evil.com", true}, // backslash fold
+		{"/account", "", false},                  // path-absolute relative: no authority
+		{"relative/path", "", false},             // path-relative: no authority
+		{"", "", false},                          // empty: no authority
+	}
+	for _, tc := range tests {
+		gotA, gotHas := locationAuthority(tc.in)
+		if gotA != tc.wantA || gotHas != tc.wantHas {
+			t.Errorf("locationAuthority(%q) = (%q, %v), want (%q, %v)", tc.in, gotA, gotHas, tc.wantA, tc.wantHas)
+		}
+	}
+}
+
+// TestRedirectWhitespaceAuthorityBypass is the open-redirect RUNTIME backstop's
+// whitespace/control-char hardening: a Location whose expansion begins with leading OWS
+// (e.g. "  //evil/") or carries an embedded TAB/CR/LF reports NO authority to a naive
+// inspector, yet net/http's Header.Set strips leading/trailing OWS (and a UA ignores
+// embedded control bytes) before the value hits the wire — restoring a live off-origin
+// authority. normalizeRedirectLocation collapses the Location to the on-the-wire bytes
+// BEFORE the authority check, so these all SUPPRESS while legit redirects are untouched.
+func TestRedirectWhitespaceAuthorityBypass(t *testing.T) {
+	// A bare `{query.next}` target (relative at compile time) and a `https://{host}{query.next}`
+	// style guard are both exercised; here a `{query.next}`-only rule is the cleanest probe.
+	bypasses := []struct {
+		name string
+		next string
+	}{
+		{"leading double-space protocol-relative", "  //evil.example.com/"},
+		{"leading tab protocol-relative", "\t//evil.example.com/"},
+		{"leading space then https", " https://evil.example.com/"},
+		{"leading double-space then https", "  https://evil.example.com/"},
+		{"embedded CRLF in protocol-relative", "//evil.example\r\n.com/"},
+		{"embedded tab hides authority", "//evil.\texample.com/"},
+		// Leading C0 control bytes (0x01-0x08, 0x0B, 0x0E-0x1F): a UA strips ALL
+		// leading C0-control-or-space before parsing, so these resolve off-origin even
+		// though only space+tab were trimmed before. normalizeRedirectLocation now trims
+		// every leading byte <= 0x20, so they must SUPPRESS too.
+		{"leading vertical-tab protocol-relative", "\v//evil.example.com/"},
+		{"leading 0x01 protocol-relative", "\x01//evil.example.com/"},
+		{"leading vertical-tab then https", "\vhttps://evil.example.com/"},
+		{"trailing-only ows safe path stays", "  /clean/path  "}, // normalizes to "/clean/path" (relative → fires)
+	}
+	srcNext := `brand-a.example {
+	upstream b { to http://x:80 }
+	redirect ^/n$ 302 {query.next}
+	cache_ttl default ttl 5m
+}
+`
+	pNext := compileSrc(t, srcNext)
+	for _, tc := range bypasses {
+		t.Run("query.next/"+tc.name, func(t *testing.T) {
+			req := &Request{Method: "GET", Host: "brand-a.example", Path: "/n", Query: url.Values{"next": {tc.next}}}
+			dec := pNext.EvalRequest(req)
+			if tc.name == "trailing-only ows safe path stays" {
+				// "  /clean/path  " → "/clean/path": relative, no authority → ALLOW.
+				if dec.Redirect == nil || dec.Redirect.Location != "/clean/path" {
+					t.Fatalf("safe relative path must redirect to /clean/path, got %+v", dec.Redirect)
+				}
+				return
+			}
+			if dec.Redirect != nil {
+				t.Fatalf("whitespace/control bypass must be suppressed, got Location %q", dec.Redirect.Location)
+			}
+		})
+	}
+
+	// A `{http.NAME}`-only target: same bypass surface via an attacker-influenced header.
+	srcHdr := `brand-a.example {
+	upstream b { to http://x:80 }
+	redirect ^/h$ 302 {http.X-Next}
+	cache_ttl default ttl 5m
+}
+`
+	pHdr := compileSrc(t, srcHdr)
+	for _, tc := range bypasses {
+		if tc.name == "trailing-only ows safe path stays" {
+			continue
+		}
+		t.Run("http.X-Next/"+tc.name, func(t *testing.T) {
+			req := &Request{Method: "GET", Host: "brand-a.example", Path: "/h", Query: url.Values{}, Header: http.Header{"X-Next": {tc.next}}}
+			dec := pHdr.EvalRequest(req)
+			if dec.Redirect != nil {
+				t.Fatalf("whitespace/control bypass via header must be suppressed, got Location %q", dec.Redirect.Location)
+			}
+		})
+	}
+
+	// Regression: the live index.php-strip pattern, the language redirect, a literal off-site
+	// target, and a plain relative target must all STILL fire after normalization.
+	t.Run("legit index.php strip still fires", func(t *testing.T) {
+		src := `brand-a.example {
+	upstream b { to http://x:80 }
+	redirect (?i)^(/.*?)?/index\.php(/.*)?$ 301 https://{host}$1$2?{query}
+	cache_ttl default ttl 5m
+}
+`
+		p := compileSrc(t, src)
+		req := &Request{Method: "GET", Host: "brand-a.example", Path: "/foo/index.php/bar", Query: url.Values{"x": {"1"}}}
+		dec := p.EvalRequest(req)
+		if dec.Redirect == nil || dec.Redirect.Location != "https://brand-a.example/foo/bar?x=1" {
+			t.Fatalf("legit index.php strip must redirect to https://brand-a.example/foo/bar?x=1, got %+v", dec.Redirect)
+		}
+	})
+	t.Run("language redirect still fires", func(t *testing.T) {
+		src := `es.brand-a.example, brand-a.example {
+	upstream b { to http://x:80 }
+	redirect ^/(.*)$ 302 https://es.{host.base}{uri}
+	cache_ttl default ttl 5m
+}
+`
+		p := compileSrc(t, src)
+		req := &Request{Method: "GET", Host: "brand-a.example", Path: "/page", Query: url.Values{"q": {"1"}}}
+		dec := p.EvalRequest(req)
+		if dec.Redirect == nil || dec.Redirect.Location != "https://es.brand-a.example/page?q=1" {
+			t.Fatalf("language redirect must fire to https://es.brand-a.example/page?q=1, got %+v", dec.Redirect)
+		}
+	})
+	t.Run("literal off-site redirect still fires", func(t *testing.T) {
+		src := `brand-a.example {
+	upstream b { to http://x:80 }
+	redirect ^/go$ 302 https://provider.example.com/x
+	cache_ttl default ttl 5m
+}
+`
+		p := compileSrc(t, src)
+		req := &Request{Method: "GET", Host: "brand-a.example", Path: "/go", Query: url.Values{}}
+		dec := p.EvalRequest(req)
+		if dec.Redirect == nil || dec.Redirect.Location != "https://provider.example.com/x" {
+			t.Fatalf("literal off-site redirect must fire, got %+v", dec.Redirect)
+		}
+	})
+	t.Run("plain relative redirect still fires", func(t *testing.T) {
+		src := `brand-a.example {
+	upstream b { to http://x:80 }
+	redirect ^/old$ 302 /clean/path
+	cache_ttl default ttl 5m
+}
+`
+		p := compileSrc(t, src)
+		req := &Request{Method: "GET", Host: "brand-a.example", Path: "/old", Query: url.Values{}}
+		dec := p.EvalRequest(req)
+		if dec.Redirect == nil || dec.Redirect.Location != "/clean/path" {
+			t.Fatalf("relative redirect must fire to /clean/path, got %+v", dec.Redirect)
+		}
+	})
+}
+
+// TestNormalizeRedirectLocation unit-tests the on-the-wire normalization (control-char strip
+// + leading/trailing OWS trim) that the runtime open-redirect defense relies on.
+func TestNormalizeRedirectLocation(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"//evil.example.com/", "//evil.example.com/"},
+		{"  //evil.example.com/", "//evil.example.com/"},
+		{"\t//evil.example.com/", "//evil.example.com/"},
+		{" https://evil.example.com/ ", "https://evil.example.com/"},
+		{"//evil.example\r\n.com/", "//evil.example.com/"},
+		{"//evil.\texample.com/", "//evil.example.com/"},
+		{"https://a\fb\x00c/", "https://abc/"},
+		{"\v//evil.example.com/", "//evil.example.com/"},   // leading C0 vertical tab trimmed
+		{"\x01//evil.example.com/", "//evil.example.com/"}, // leading C0 0x01 trimmed
+		{"//evil.example.com/\x1f", "//evil.example.com/"}, // trailing C0 trimmed
+		{"  /clean/path  ", "/clean/path"},
+		{"/already/clean", "/already/clean"},
+		{"", ""},
+		{"   ", ""},
+	}
+	for _, tc := range tests {
+		if got := normalizeRedirectLocation(tc.in); got != tc.want {
+			t.Errorf("normalizeRedirectLocation(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestRedirectScopedCombinedAllDigitRegex (Fix D): the scoped combined form
+// (`@scope REGEX CODE TARGET`) whose PATH_REGEX first token is all-digits must parse as
+// the COMBINED form (regex applied to the path), not be misread as the scope-only
+// `@scope CODE TARGET` form. Disambiguation is on a VALID 3xx redirect code, not
+// "all digits".
+func TestRedirectScopedCombinedAllDigitRegex(t *testing.T) {
+	// `12` is an all-digit PATH_REGEX (matches a path containing "12"), NOT a redirect code.
+	src := `example.com {
+	upstream b { to http://x:80 }
+	@m method GET
+	redirect @m 12 301 https://{host}/hit
+	cache_ttl default ttl 5m
+}
+`
+	p := compileSrc(t, src)
+	// A path containing "12" matches the regex -> redirect fires.
+	if d := p.EvalRequest(&Request{Method: "GET", Host: "example.com", Path: "/a12b", Query: url.Values{}}); d.Redirect == nil || d.Redirect.Status != 301 || d.Redirect.Location != "https://example.com/hit" {
+		t.Fatalf("all-digit regex combined form should fire on a matching path: %+v", d.Redirect)
+	}
+	// A path NOT containing "12" must NOT match -> proves "12" is a REGEX, not a no-op.
+	if d := p.EvalRequest(&Request{Method: "GET", Host: "example.com", Path: "/abc", Query: url.Values{}}); d.Redirect != nil {
+		t.Fatalf("all-digit regex must not match a non-matching path: %+v", d.Redirect)
+	}
+
+	// Anchored all-digit regex variant: `^/0+$`.
+	src2 := `example.com {
+	upstream b { to http://x:80 }
+	@m method GET
+	redirect @m ^/0+$ 302 https://{host}/zeros
+	cache_ttl default ttl 5m
+}
+`
+	p2 := compileSrc(t, src2)
+	if d := p2.EvalRequest(&Request{Method: "GET", Host: "example.com", Path: "/000", Query: url.Values{}}); d.Redirect == nil || d.Redirect.Location != "https://example.com/zeros" {
+		t.Fatalf("anchored all-digit regex combined form should fire: %+v", d.Redirect)
+	}
+
+	// Sentinel: the scope-only form with a trailing no_store (`@scope CODE TARGET no_store`)
+	// must STILL parse as scope-only (CODE=302), not misread the code as a regex.
+	src3 := `example.com {
+	upstream b { to http://x:80 }
+	@m method GET
+	redirect @m 302 https://{host}/scoped no_store
+	cache_ttl default ttl 5m
+}
+`
+	p3 := compileSrc(t, src3)
+	if d := p3.EvalRequest(&Request{Method: "GET", Host: "example.com", Path: "/anything", Query: url.Values{}}); d.Redirect == nil || d.Redirect.Status != 302 || d.Redirect.Location != "https://example.com/scoped" || !d.Redirect.NoStore {
+		t.Fatalf("scope-only CODE TARGET no_store must stay scope-only: %+v", d.Redirect)
+	}
+}
+
+// TestRedirectNoStore verifies that the `no_store` trailing modifier is accepted on
+// all three non-map redirect forms (regex, scoped-only, combined scope+regex), sets
+// NoStore on the resulting decision, and that a plain redirect without no_store does
+// NOT set NoStore (so a redirect without no_store is unchanged — no regression).
+func TestRedirectNoStore(t *testing.T) {
+	src := `example.com {
+	upstream b { to http://x:80 }
+	@lang cookie lang es
+	redirect @lang 302 https://es.example.com{uri} no_store
+	redirect ^/about 301 https://example.com/about-us
+	cache_ttl default ttl 5m
+}
+`
+	p := compileSrc(t, src)
+
+	// Scoped form with no_store — should set NoStore true.
+	decNoStore := p.EvalRequest(&Request{
+		Method: "GET", Host: "example.com", Path: "/news",
+		Query:  url.Values{},
+		Header: http.Header{"Cookie": []string{"lang=es"}},
+	})
+	if decNoStore.Redirect == nil {
+		t.Fatal("expected redirect for lang=es request, got nil")
+	}
+	if !decNoStore.Redirect.NoStore {
+		t.Errorf("redirect with no_store modifier: NoStore = false, want true")
+	}
+
+	// Plain regex redirect without no_store — should NOT set NoStore.
+	decPlain := p.EvalRequest(&Request{
+		Method: "GET", Host: "example.com", Path: "/about",
+		Query: url.Values{},
+	})
+	if decPlain.Redirect == nil {
+		t.Fatal("expected redirect for /about request, got nil")
+	}
+	if decPlain.Redirect.NoStore {
+		t.Errorf("redirect without no_store modifier: NoStore = true, want false")
+	}
+}
+
+// TestRedirectNoStoreRegexForm verifies the regex form (`redirect PATH_REGEX CODE TARGET no_store`).
+func TestRedirectNoStoreRegexForm(t *testing.T) {
+	src := `example.com {
+	upstream b { to http://x:80 }
+	redirect ^/promo(/.*)?$ 302 https://example.com/sale$1 no_store
+	redirect ^/old(/.*)?$ 301 https://example.com/new$1
+	cache_ttl default ttl 5m
+}
+`
+	p := compileSrc(t, src)
+	dec := p.EvalRequest(&Request{
+		Method: "GET", Host: "example.com", Path: "/promo/deal",
+		Query: url.Values{},
+	})
+	if dec.Redirect == nil {
+		t.Fatal("expected redirect, got nil")
+	}
+	if !dec.Redirect.NoStore {
+		t.Errorf("regex redirect with no_store: NoStore = false, want true")
+	}
+	// Sentinel: a PLAIN regex redirect (no no_store) in the same pipeline must NOT set NoStore.
+	decPlain := p.EvalRequest(&Request{
+		Method: "GET", Host: "example.com", Path: "/old/page",
+		Query: url.Values{},
+	})
+	if decPlain.Redirect == nil {
+		t.Fatal("expected redirect for /old/page, got nil")
+	}
+	if decPlain.Redirect.NoStore {
+		t.Errorf("plain regex redirect: NoStore = true, want false")
+	}
+}
+
+// TestRedirectNoStoreCombinedForm verifies the combined form
+// (`redirect @scope PATH_REGEX CODE TARGET no_store`).
+func TestRedirectNoStoreCombinedForm(t *testing.T) {
+	src := `example.com {
+	upstream b { to http://x:80 }
+	@mobile method GET
+	redirect @mobile ^/shop(/.*)?$ 302 https://m.example.com/shop$1 no_store
+	redirect @mobile ^/legacy(/.*)?$ 301 https://m.example.com/v2$1
+	cache_ttl default ttl 5m
+}
+`
+	p := compileSrc(t, src)
+	dec := p.EvalRequest(&Request{
+		Method: "GET", Host: "example.com", Path: "/shop/deals",
+		Query: url.Values{},
+	})
+	if dec.Redirect == nil {
+		t.Fatal("expected redirect, got nil")
+	}
+	if !dec.Redirect.NoStore {
+		t.Errorf("combined redirect with no_store: NoStore = false, want true")
+	}
+	// Sentinel: a PLAIN combined redirect (no no_store) in the same pipeline must NOT set NoStore.
+	decPlain := p.EvalRequest(&Request{
+		Method: "GET", Host: "example.com", Path: "/legacy/x",
+		Query: url.Values{},
+	})
+	if decPlain.Redirect == nil {
+		t.Fatal("expected redirect for /legacy/x, got nil")
+	}
+	if decPlain.Redirect.NoStore {
+		t.Errorf("plain combined redirect: NoStore = true, want false")
 	}
 }

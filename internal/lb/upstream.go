@@ -571,7 +571,11 @@ func (u *Upstream) pick(ctx context.Context, req *origin.Request, tried map[stri
 		return nil
 	}
 	now := u.now()
+	excl := excludedBaseURL(ctx)
 	ok := func(b *backend) bool {
+		if excl != "" && b.baseURL == excl {
+			return false // WithExcludeBaseURL: never route here (e.g. self in a peer pool)
+		}
 		return !tried[b.id] && b.eligible(now) && b.underCap(u.cfg.MaxConns)
 	}
 

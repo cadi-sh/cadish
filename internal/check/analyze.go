@@ -1146,6 +1146,7 @@ func analyzeSite(addrs []string, pos cadishfile.Pos, body []cadishfile.Node, bas
 	detectCacheCredentialed(body, sr)
 	detectUnusedNormalizeToken(body, sr)
 	detectUnusedDeviceDetect(body, sr)
+	detectForwardedClassTokenUnkeyed(body, sr)
 	sr.Suggestions = suggest(body, defs)
 
 	return sr
@@ -1241,44 +1242,108 @@ func detectUnusedNormalizeToken(body []cadishfile.Node, sr *SiteReport) {
 	}
 }
 
-// detectUnusedDeviceDetect warns when a site configures `device_detect { … }` but no
-// cache_key recipe keys on the {device} token. Like a normalizer, a device_detect block's
-// ONLY effect is to shape the {device} cache-key token — {device} is not a header/redirect
-// template placeholder (see pipeline.TemplateEnv.named) and there is no `device` matcher
-// type, so it is referenced nowhere else. A device_detect that is never keyed is therefore
-// dead config: the operator customized the device buckets but, having forgotten the
-// {device} token, the cache silently does NOT segment by device class with no signal. The
-// fix is to add {device} to a cache_key recipe, or remove the device_detect block. The
-// synthetic top-level (bare imported fragment) is skipped.
+// detectUnusedDeviceDetect warns when a site configures `device_detect { … }` but the
+// {device} token is referenced NOWHERE — not in a cache_key recipe AND not reflected in
+// any header value or redirect target. {device} IS a header/redirect template placeholder
+// (see pipeline.TemplateEnv.named, "device"), so reflecting it (`header X-Device {device}`)
+// is a legitimate use even without keying. A device_detect referenced nowhere is dead
+// config: the operator customized the device buckets but left the token unused, so the
+// classifier is computed for nothing. The fix is to reference {device} (in a cache_key
+// recipe or a header/redirect), or remove the device_detect block. The synthetic top-level
+// (bare imported fragment) is skipped.
 func detectUnusedDeviceDetect(body []cadishfile.Node, sr *SiteReport) {
 	if len(sr.Addresses) == 1 && sr.Addresses[0] == "(top-level)" {
 		return
 	}
 	var deviceDetect *cadishfile.Directive
-	keyed := false
+	referenced := false
 	for _, n := range body {
 		d, ok := n.(*cadishfile.Directive)
 		if !ok {
 			continue
 		}
-		switch d.Name {
-		case "device_detect":
+		if d.Name == "device_detect" {
 			if deviceDetect == nil {
 				deviceDetect = d
 			}
-		case "cache_key":
-			for _, a := range d.Args {
-				if a.Raw == "{device}" {
-					keyed = true
-				}
+			continue
+		}
+		// Only the directives that actually EXPAND the {device} template token count as a
+		// reference (F-E1): cache_key (exact token), and header/redirect values
+		// (`header X-Device {device}`, `redirect ^/x$ 302 /d/{device}`). A literal
+		// "{device}" in a respond body or a set_query value is emitted verbatim / via a
+		// Device-less env — it never resolves — so it must NOT suppress the warning.
+		if d.Name != "cache_key" && d.Name != "header" && d.Name != "redirect" {
+			continue
+		}
+		for _, a := range d.Args {
+			if strings.Contains(a.Raw, "{device}") {
+				referenced = true
 			}
 		}
 	}
-	if deviceDetect == nil || keyed {
+	if deviceDetect == nil || referenced {
 		return
 	}
 	sr.add(SevWarning, deviceDetect.Pos, "unused-device-detect",
-		"device_detect is configured but no cache_key recipe keys on the {device} token — the device classifier is computed for nothing, so the cache silently does NOT segment by device class. Add {device} to a `cache_key` recipe (e.g. `cache_key host path {device}`), or remove the `device_detect` block")
+		"device_detect is configured but the {device} token is referenced nowhere — not in a cache_key recipe nor any header/redirect value — so the device classifier is computed for nothing. Reference {device} (e.g. `cache_key host path {device}` or `header X-Device-Class {device}`), or remove the `device_detect` block")
+}
+
+// phaseBoundaryDirectives are the directives that move a site body PAST the
+// request/cache-key phase (mirrors pipeline.Compile's pastKey set). A `header`
+// directive BEFORE any of these is REQUEST-phase (forwarded to origin); after, it is
+// RESPONSE-phase (applied at delivery).
+var phaseBoundaryDirectives = map[string]bool{
+	"cache_key": true, "cache_ttl": true, "storage": true,
+	"strip_cookies": true, "cors": true, "replace": true, "encode": true,
+}
+
+// detectForwardedClassTokenUnkeyed warns when a {device} or {geo*} token is reflected
+// in a REQUEST-phase header (a `header` directive BEFORE the cache-key phase boundary,
+// so it is forwarded to origin) while the cache key does NOT vary on that token.
+// Forwarding the resolved class to origin lets the origin vary content the cache key
+// does not segment on → a cross-device / cross-region cache leak. cadish renders such
+// an unkeyed forwarded token EMPTY at runtime (fail-safe — see
+// pipeline.UsesDeviceClassification / computeUsesGeo), so this warning explains why the
+// header is empty and how to forward it safely. F-A1.
+func detectForwardedClassTokenUnkeyed(body []cadishfile.Node, sr *SiteReport) {
+	if len(sr.Addresses) == 1 && sr.Addresses[0] == "(top-level)" {
+		return
+	}
+	keyed := map[string]bool{}
+	for _, n := range body {
+		if d, ok := n.(*cadishfile.Directive); ok && d.Name == "cache_key" {
+			for _, a := range d.Args {
+				keyed[a.Raw] = true
+			}
+		}
+	}
+	tokens := []string{"{device}", "{geo}", "{geo.continent}", "{geo.region}"}
+	pastKey := false
+	for _, n := range body {
+		d, ok := n.(*cadishfile.Directive)
+		if !ok {
+			continue
+		}
+		if d.Name == "header" && !pastKey {
+			for _, tok := range tokens {
+				if keyed[tok] {
+					continue
+				}
+				for _, a := range d.Args {
+					if strings.Contains(a.Raw, tok) {
+						sr.add(SevWarning, d.Pos, "class-token-forwarded-unkeyed",
+							"a request-phase `header` forwards %s to origin but the cache_key does not vary on it — the origin could return %s-specific content cached under a %s-independent key (cross-class cache leak), so cadish sends %s EMPTY (fail-safe). Add %s to a `cache_key` recipe to forward it safely, or place the `header` AFTER `cache_key` if it is a response header for the client",
+							tok, tok, tok, tok, tok)
+						break
+					}
+				}
+			}
+		}
+		if phaseBoundaryDirectives[d.Name] {
+			pastKey = true
+		}
+	}
 }
 
 // reservedSpecialUseTLDs is the set of final-label TLDs a public ACME CA will never
@@ -1916,16 +1981,30 @@ func detectGeoUnconfigured(body []cadishfile.Node, sr *SiteReport, baseDir strin
 					regionPos = d.Pos
 				}
 			}
+		case "header", "redirect":
+			// F-E2: a {geo*} token reflected in a header value or redirect target also
+			// needs a geo source — the run side resolves it (computeUsesGeo), so with no
+			// source it renders empty. Mirror the device check, which counts reflection.
+			for _, a := range d.Args {
+				if strings.Contains(a.Raw, "{geo}") || strings.Contains(a.Raw, "{geo.continent}") || strings.Contains(a.Raw, "{geo.region}") {
+					usesGeo = true
+					keyPos = d.Pos
+				}
+				if strings.Contains(a.Raw, "{geo.region}") {
+					usesRegion = true
+					regionPos = d.Pos
+				}
+			}
 		}
 	}
 	if usesGeo && !hasGeo {
 		sr.add(SevWarning, keyPos, "geo-unconfigured",
-			"cache_key uses a {geo*} token but no `geo { … }` source is configured; it will key on \"\" (no variation)")
+			"a {geo*} token is used (cache_key, header, or redirect) but no `geo { … }` source is configured; it will resolve to \"\" (no variation)")
 		return
 	}
 	if usesRegion && hasGeo && !hasRegionHeader && !maxmindProvidesRegion {
 		sr.add(SevWarning, regionPos, "geo-region-unconfigured",
-			"cache_key uses {geo.region} but the `geo { … }` block supplies no region source (no `region_header NAME` and no maxmind City-edition `source`); {geo.region} will key on \"\" (region needs an upstream geo header or a MaxMind City database)")
+			"{geo.region} is used (cache_key, header, or redirect) but the `geo { … }` block supplies no region source (no `region_header NAME` and no maxmind City-edition `source`); {geo.region} will resolve to \"\" (region needs an upstream geo header or a MaxMind City database)")
 	}
 }
 

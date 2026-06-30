@@ -170,6 +170,70 @@ func TestCacheCredentialedGuardBCacheUnsafeCannotThin(t *testing.T) {
 	}
 }
 
+// liveCredSrc is the REAL brand-a.example config shape (D101 live-exploit repro): a scoped
+// `from_header X-Cache-Ttl` per-response signal rule co-existing with a STATIC
+// `cache_ttl default ttl 60s grace 10m`. The static default is the trap: it sets
+// Cacheable=true for an in-scope response that carries NO X-Cache-Ttl, which (before the
+// fail-closed fix) leaked the credentialed body under the shared key.
+const liveCredSrc = `example.com {
+    @rm path_regex ^/v3/readmodel/cache/
+    cache_credentialed @rm
+    cache_key path
+    cache_ttl @rm from_header X-Cache-Ttl
+    cache_ttl default ttl 60s grace 10m
+}`
+
+// TestCacheCredentialedStaticDefaultNoSignalNotStored is the cross-user-leak regression
+// (the failing-then-fixed test). A credentialed in-scope request whose origin 200 carries
+// NO X-Cache-Ttl, NO Set-Cookie, and NO uncacheable Cache-Control falls onto the static
+// `default ttl 60s` (Cacheable=true, perResponseSignal=false). The fail-closed gate MUST
+// refuse it: a static TTL is NOT authorization to share a credentialed response.
+func TestCacheCredentialedStaticDefaultNoSignalNotStored(t *testing.T) {
+	p := compileSrc(t, liveCredSrc)
+	req := credReq("/v3/readmodel/cache/favorites", "session=abc")
+	markCred(p, req)
+	d := p.EvalResponse(req, 200, http.Header{"Content-Type": {"application/json"}})
+	if d.Cacheable {
+		t.Fatalf("LEAK: in a cache_credentialed scope a static default ttl must NOT store a no-signal credentialed response (got cacheable=%v ttl=%v)", d.Cacheable, d.TTL)
+	}
+	if d.TTL != 0 || d.Grace != 0 || d.MaxStale != 0 {
+		t.Fatalf("fail-closed must zero the windows, got ttl=%v grace=%v maxStale=%v", d.TTL, d.Grace, d.MaxStale)
+	}
+}
+
+// TestCacheCredentialedStaticDefaultWithSignalStillStores is the legit-path regression
+// guard: with the SAME static-default config, an in-scope response that DOES carry
+// X-Cache-Ttl still fires the scoped from_header rule, stores under the shared key, and
+// strips Set-Cookie/weak controls (CredentialedStore). The fail-closed fix must not touch it.
+func TestCacheCredentialedStaticDefaultWithSignalStillStores(t *testing.T) {
+	p := compileSrc(t, liveCredSrc)
+	req := credReq("/v3/readmodel/cache/home", "session=abc")
+	markCred(p, req)
+	d := p.EvalResponse(req, 200, http.Header{"X-Cache-Ttl": {"60"}, "Set-Cookie": {"s=1"}})
+	if !d.Cacheable || d.TTL != 60*time.Second {
+		t.Fatalf("legit signal path must still store, got cacheable=%v ttl=%v", d.Cacheable, d.TTL)
+	}
+	if !d.CredentialedStore {
+		t.Error("CredentialedStore must remain set so the server strips Set-Cookie + weak headers")
+	}
+}
+
+// TestCacheCredentialedStaticDefaultOutOfScopeUnaffected: a request to a path OUTSIDE the
+// cache_credentialed scope under the SAME config still uses the normal path — the static
+// `default ttl 60s` caches a shareable response as before. The fail-closed gate is scoped, so
+// it must not regress ordinary caching of traffic the directive does not cover.
+func TestCacheCredentialedStaticDefaultOutOfScopeUnaffected(t *testing.T) {
+	p := compileSrc(t, liveCredSrc)
+	req := &Request{Path: "/static/banner.json", Header: http.Header{}}
+	if markCred(p, req) {
+		t.Fatal("an out-of-scope path must NOT match the cache_credentialed scope")
+	}
+	d := p.EvalResponse(req, 200, http.Header{"Content-Type": {"application/json"}})
+	if !d.Cacheable || d.TTL != 60*time.Second {
+		t.Fatalf("out-of-scope request must cache under the static default as before, got cacheable=%v ttl=%v", d.Cacheable, d.TTL)
+	}
+}
+
 // TestCacheCredentialedGuardACompileError: cache_credentialed and strip_cookies covering the
 // SAME scope is a positioned compile error (strip_cookies would disarm the Set-Cookie hard
 // refusal under the shared key).

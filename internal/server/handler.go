@@ -345,9 +345,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	// {device} pre-pass: classify the User-Agent into a bounded device class for
-	// the cache key, but only when the site's key actually varies on it.
-	if site.Device != nil && site.Pipeline.UsesDeviceToken() {
+	// {device} pre-pass: classify the User-Agent into a bounded device class,
+	// whenever the site uses {device} at all — in the cache key OR reflected in a
+	// header/redirect value (UsesDeviceClassification). Gating on the cache-key-only
+	// predicate would leave a `header X-Device {device}` rendering empty.
+	if site.Device != nil && site.Pipeline.UsesDeviceClassification() {
 		preq.Device = site.Device.Classify(r.UserAgent())
 	}
 	// cookie_allow: strip every request cookie not on the operator's allowlist, AFTER the
@@ -437,6 +439,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		info.cacheStatus = "REDIRECT"
 		rec.Header().Set("Location", rd.Redirect.Location)
 		rec.Header().Set("Content-Length", "0")
+		if rd.Redirect.NoStore {
+			// The `no_store` modifier marks a personalized (cookie/Accept-Language-driven)
+			// redirect uncacheable so no shared cache or browser serves one user's redirect
+			// to another. Mirrors the original Varnish worker's lang-redirects.js pattern.
+			rec.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, private")
+		}
 		rec.WriteHeader(rd.Redirect.Status)
 		return
 	}
@@ -520,7 +528,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// ONLY on this uncached branch; the cacheable path below keeps the stripped cookie so
 		// the key + COOKIE-NORM collapse stays intact. A cookieless client synthesizes none.
 		restoreClientCookie(r.Header, origClientCookie)
-		h.serveOrigin(rec, r, site, preq, rd, "", false, pipeline.CacheStatusMiss, info)
+		h.serveOrigin(rec, r, site, preq, rd, "", false, true /* bypassPeers: pass goes straight to origin */, pipeline.CacheStatusMiss, info)
 		return
 	}
 
@@ -571,7 +579,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// hit-for-miss window: bypass the cache entirely (fetch, never store).
 	if hfm {
 		info.tr.lookup("HIT-FOR-MISS (bypass cache)")
-		h.serveOrigin(rec, r, site, preq, rd, key, false, pipeline.CacheStatusMiss, info)
+		h.serveOrigin(rec, r, site, preq, rd, key, false, false, pipeline.CacheStatusMiss, info)
 		return
 	}
 
@@ -668,7 +676,7 @@ func (h *Handler) serveMiss(rec *statusRecorder, r *http.Request, site *boundSit
 	coalescable := r.Header.Get("Range") == "" &&
 		(r.Method == "" || r.Method == http.MethodGet)
 	if !coalescable {
-		h.serveOrigin(rec, r, site, preq, rd, key, true, pipeline.CacheStatusMiss, info)
+		h.serveOrigin(rec, r, site, preq, rd, key, true, false, pipeline.CacheStatusMiss, info)
 		return
 	}
 
@@ -685,7 +693,7 @@ func (h *Handler) serveMiss(rec *statusRecorder, r *http.Request, site *boundSit
 		// unwinds past it, so done is closed first.
 		ok := false
 		defer func() { h.coalesce.finish(key, call, ok) }()
-		ok = h.serveOrigin(rec, r, site, preq, rd, key, true, pipeline.CacheStatusMiss, info)
+		ok = h.serveOrigin(rec, r, site, preq, rd, key, true, false, pipeline.CacheStatusMiss, info)
 		return
 	}
 
@@ -702,7 +710,7 @@ func (h *Handler) serveMiss(rec *statusRecorder, r *http.Request, site *boundSit
 		}
 	}
 	// Winner failed or its object isn't cached: run our own (still-cacheable) fetch.
-	h.serveOrigin(rec, r, site, preq, rd, key, true, pipeline.CacheStatusMiss, info)
+	h.serveOrigin(rec, r, site, preq, rd, key, true, false, pipeline.CacheStatusMiss, info)
 }
 
 // serveFromCache serves a cached object (with Range support) and returns true on a
@@ -945,7 +953,7 @@ func (h *Handler) serveFromCache(rec *statusRecorder, r *http.Request, site *bou
 // into the cache when store is true and the response is positively cacheable. It
 // returns true when a cacheable body was fully committed to the cache (the signal
 // the coalescer uses to let waiters read from cache).
-func (h *Handler) serveOrigin(rec *statusRecorder, r *http.Request, site *boundSite, preq *pipeline.Request, rd pipeline.RequestDecision, key string, store bool, status pipeline.CacheStatus, info *reqInfo) bool {
+func (h *Handler) serveOrigin(rec *statusRecorder, r *http.Request, site *boundSite, preq *pipeline.Request, rd pipeline.RequestDecision, key string, store bool, bypassPeers bool, status pipeline.CacheStatus, info *reqInfo) bool {
 	if info.cacheStatus == "" {
 		info.cacheStatus = status.String()
 	}
@@ -968,6 +976,11 @@ func (h *Handler) serveOrigin(rec *statusRecorder, r *http.Request, site *boundS
 		RawQuery:   oQuery, // forward the query so query-varying origins get the right response
 		Header:     buildOriginHeader(r.Header, rd.ReqHeaderOps, &forwardCtx{remoteAddr: r.RemoteAddr, tls: r.TLS != nil, host: r.Host, trusted: site.TrustedProxies}),
 		ClientHost: pipeline.NormalizeHost(r.Host), // canonical host (matches the cache key) per host_header policy (#11)
+		// A cache-bypass (`pass`/credential bypass) must not read-through to a peer: the
+		// chained PeerOrigin honors Bypass by falling through to the real origin (#7),
+		// matching how owner mode skips the owner seam for a pass. False on the cacheable
+		// paths so a normal miss still consults the owning peer.
+		Bypass: bypassPeers,
 	}
 	// Forward the CLIENT request body to the origin for a write method (POST/PUT/…).
 	// Only write methods carry a body that must reach the upstream; GET/HEAD (the
@@ -1625,6 +1638,17 @@ func (h *Handler) applyDeliver(hdr http.Header, site *boundSite, preq *pipeline.
 	if dd.CacheKeyHeader != "" {
 		if v := pipeline.CacheKeyHeaderValue(key, dd.CacheKeyRaw); v != "" {
 			hdr.Set(dd.CacheKeyHeader, v)
+		}
+	}
+	// `header +cache_age NAME` (debug): emit the object's age in whole seconds
+	// on a cache HIT (fresh or stale). Omitted on MISS/bypass (no stored age).
+	// Reuses the freshness index storedAt so the value matches the standard Age
+	// header the server sets in serveFromCache — zero extra work when not configured.
+	if dd.CacheAgeHeader != "" && (status == pipeline.CacheStatusHit || status == pipeline.CacheStatusHitStale) {
+		if st, ok := h.fresh.storedAt(key); ok {
+			if age := int64(h.now().Sub(st).Seconds()); age >= 0 {
+				hdr.Set(dd.CacheAgeHeader, strconv.FormatInt(age, 10))
+			}
 		}
 	}
 	return dd.Transforms, dd.Encode

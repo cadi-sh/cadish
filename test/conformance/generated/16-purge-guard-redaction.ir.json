@@ -1,5 +1,5 @@
 {
-  "irVersion": 6,
+  "irVersion": 9,
   "site": {
     "hosts": [
       "purge.example.com"
@@ -67,6 +67,7 @@
   "deliver": {
     "cacheStatusHeader": "X-Cache"
   },
+  "usesGeo": false,
   "edge": {
     "default": "local",
     "kvMaxBytes": 1048576

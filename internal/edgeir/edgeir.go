@@ -74,7 +74,57 @@ const kvHardCapBytes int64 = 25 * 1000 * 1000
 // not stored (fail-closed). A stale runtime ignoring the field would credential-BYPASS those
 // requests (caching LESS, never wrong) — but to keep Go==JS exact it is a versioned contract,
 // so the runtime refuses a mismatch.
-const IRVersion = 6
+//
+// v7 (edge `all`+`query` matchers + `query_present` non-empty modifier) makes the last two
+// pure-request-data Gateway matchers edge-native (they were serverOnly => forced-pass before)
+// and adds the `+` non-empty-value modifier to `query_present`:
+//   - `query` reuses the already-projected Name/Values (one named param vs an OR set of exact
+//     values; empty set => presence) — only the serverOnly suppression is lifted and a JS
+//     `query` matchOne case added.
+//   - `all` adds Matcher.Subs: the AND-conjunction of (Ref, Negate) sub-terms. Each term
+//     references a named matcher XOR'd with Negate; request-phase, depth-1 (the compiler
+//     forbids all-of-all and response-phase subs). The worker recurses through matchOne over
+//     ir.matchers[ref], mirroring the Go `got == negate` short-circuit.
+//   - `query_present` adds Matcher.QueryNamesNonEmpty: the subset of QueryNames whose `+`
+//     modifier requires the matched param to have ≥1 non-empty value (`?t=` empty does NOT
+//     match `t+`, `?t=abc` does — Varnish `=[^&]+` parity for the "publi" marketing-param
+//     flag). Additive: a stale runtime ignoring it falls back to pure presence (strictly
+//     more permissive — may pass one fewer request than intended, never caches one that should
+//     be passed), so the version is NOT bumped solely for this field.
+//   - Redirect.NoStore is an additive v7 field (json:"noStore,omitempty"): when the
+//     `redirect … no_store` modifier is present the worker attaches Cache-Control:
+//     no-store, no-cache, must-revalidate, private to the short-circuit Response so no
+//     shared cache or browser caches a personalized (cookie/Accept-Language-driven) redirect.
+//     A stale runtime that misses it simply omits the header (the pre-modifier behavior —
+//     strictly less safe but not wrong), so the version is NOT bumped for this field.
+//   - Deliver.CacheAgeHeader is an additive v7 field (json:"cacheAgeHeader,omitempty"):
+//     the target header name for `header +cache_age NAME`; the worker emits the object's
+//     age in whole seconds on a cache HIT (Math.floor((now − storedAt) / 1000)), omitted
+//     on MISS/bypass. A stale runtime ignoring it simply omits the header (observability
+//     gap, not a correctness regression), so the version is NOT bumped for this field.
+//
+// A stale runtime would mis-evaluate `all`/`query` (silent wrong cache/route decision), so
+// the version was bumped to 7 and the runtime refuses a mismatch.
+//
+// v8 (D105, edge pass-route exclusion) adds RouteExclusions: the host+prefix CF route
+// globs the worker would ONLY ever `pass` (a path-only unconditional pass with NO other
+// edge directive touching the path), populated ONLY when the site opts in with
+// `edge { bypass_passes }`. The deploy plane turns each into a Cloudflare route that
+// matches but runs no worker (script omitted) so CF proxies it straight to origin,
+// skipping a wasted worker invocation. This is purely a DEPLOY-PLANE concern — the
+// worker RUNTIME never reads RouteExclusions (a request that reaches the worker is
+// still passed correctly), so a stale runtime ignoring the field is unaffected. The
+// version is bumped (not silently batched) so the management plane treats the field as
+// a versioned contract; the runtime mismatch check is unchanged in behaviour for it.
+//
+// v9 (F-A1/F-B) adds UsesGeo and SECURITY-relevant request-phase neutralization: the
+// worker must blank an UNKEYED {device}/{geo*} (raw OR class-derived {classify.NAME})
+// reflected in a REQUEST-phase header (forwarded to origin) so it never forwards a class
+// the SELECTED cache-key recipe does not segment on (cross-class cache leak) — the worker
+// derives the keyed set from the recipe it selects per request — and it injects the CF geo
+// headers ONLY when UsesGeo. The version bump ensures a stale runtime (which would not
+// neutralize) is refused.
+const IRVersion = 9
 
 // EdgeIR is the versioned, serializable projection of one compiled site. The JSON
 // field names are the contract; the JS interpreter is a faithful port of the
@@ -98,6 +148,13 @@ type EdgeIR struct {
 	Key      Key      `json:"key"`
 	Response Response `json:"response"`
 	Deliver  Deliver  `json:"deliver"`
+
+	// UsesGeo mirrors pipeline.UsesGeoToken (v9): the site varies on or reflects geo. The
+	// worker injects the CF geo headers to origin (applyGeoHeaders) ONLY when true, so a
+	// site that does not use geo never forwards an unkeyed geo signal an origin could
+	// vary on under a geo-independent edge key (F-B compounding path). NOT omitempty:
+	// the worker reads usesGeo===false to SUPPRESS injection, so false must be emitted.
+	UsesGeo bool `json:"usesGeo"`
 
 	// CacheUnsafe mirrors the site-level `cache_unsafe` opt-out flag. When true the
 	// edge interpreter skips the safe-by-default downgrade (Set-Cookie / private
@@ -142,6 +199,19 @@ type EdgeIR struct {
 	// Delegate lists every non-edge-capable directive, with a reason, that the
 	// worker must `pass` to the Cadish server behind. Materializes policy C.
 	Delegate []Delegated `json:"delegate,omitempty"`
+
+	// RouteExclusions is the set of host+prefix CF route globs the edge worker would
+	// ONLY ever `pass` (D105): a path covered by an unconditional path-only `pass` with
+	// NO other edge-emitted directive touching it, reducible to a `<host>/<prefix>*`
+	// glob. Populated ONLY when the site sets `edge { bypass_passes }`; the deploy plane
+	// (edgedeploy.Enable) creates a no-script Cloudflare route per pattern so CF proxies
+	// those paths straight to origin, skipping a wasted worker invocation. A DEPLOY-PLANE
+	// concern only — the worker runtime never reads it (a request that still reaches the
+	// worker is passed correctly), so a stale runtime ignoring it is unaffected. Omitted
+	// when empty / when the toggle is off. The coverage report ALWAYS lists the excludable
+	// set (CoverageReport.RouteExcludable) even when the toggle is off, so the operator can
+	// review it before opting in.
+	RouteExclusions []string `json:"routeExclusions,omitempty"`
 }
 
 // Site is the host set the worker routes for.
@@ -206,6 +276,20 @@ type Matcher struct {
 
 	QueryNames []string `json:"queryNames,omitempty"`
 
+	// QueryNamesNonEmpty is the subset of QueryNames that carry the `+` modifier
+	// (`query_present adult_content+ ff-*+`): a matched param must have ≥1 non-empty
+	// value. Absent/empty => all names are presence-only (the previous behavior).
+	// Additive under v7: a v7 runtime that does not read it falls back to pure
+	// presence, which is strictly more permissive than the intended behavior but never
+	// caches something a correct runtime would pass — fail-safe rather than fail-closed.
+	QueryNamesNonEmpty []string `json:"queryNamesNonEmpty,omitempty"`
+
+	// Subs is the AND-conjunction of an `all` matcher: each entry references a named
+	// matcher (Ref) XOR'd with Negate. Edge-evaluated request-phase; depth-1 (the compiler
+	// forbids all-of-all and response-phase subs), so the worker walks ir.matchers[ref] with
+	// no cycle guard. Empty slice ⇒ matches (mirrors the Go empty-conjunction). v7.
+	Subs []SubMatcher `json:"subs,omitempty"`
+
 	// JSONPath is the dotted PATH of a cookie_json/header_json matcher (D54), e.g.
 	// "user.verified" / "flags.0.kind". Name carries the cookie/header name and
 	// Values the OR set of accepted scalar string forms (empty => presence). The JS
@@ -230,12 +314,14 @@ type Matcher struct {
 	// the values do not. See DECISIONS.md D34.
 	Redacted bool `json:"redacted,omitempty"`
 
-	// ServerOnly marks a matcher kind that has no JavaScript runtime case yet — the
-	// slice-2 Gateway matchers `all` (AND-composite) and `query` (named query-param
-	// value test). The projector delegates every directive that references such a
-	// matcher to the Cadish server behind (Fix #4); the runtime treats the matcher as a
-	// non-match (fail-closed) so a site that slipped one through never silently
-	// mis-projects. Distinct from RegexUntranslatable (which is regex-specific).
+	// ServerOnly marks a matcher kind that has no JavaScript runtime case — currently
+	// `ip` (trusted-proxy real-IP ACL, no edge analogue, D.R02) and `upstream_healthy`
+	// (live lb-pool liveness, no edge analogue, D49). The projector delegates every
+	// directive that references such a matcher to the Cadish server behind (Fix #4);
+	// the runtime treats it as a non-match (fail-closed) so a site that slipped one
+	// through never silently mis-projects. Distinct from RegexUntranslatable (which is
+	// regex-specific). `all` and `query` were server-only before IR v7; they became
+	// edge-native in v7 (pure functions of request data the worker already parses).
 	ServerOnly bool `json:"serverOnly,omitempty"`
 
 	// failsClosed is a DERIVED, projection-only flag (deliberately unexported so it never
@@ -253,16 +339,44 @@ type Matcher struct {
 	failsClosed bool `json:"-"`
 }
 
+// SubMatcher is one term of an `all` AND-conjunction: a reference to a named matcher
+// (Ref, always resolvable — EdgeMatchers projects every named matcher) XOR'd with Negate
+// (`!@x`). The worker evaluates matchOne(ir.matchers[Ref]) and compares it to Negate
+// (`got == negate ⇒ fail`), the same per-term semantics the server's secTerm uses.
+type SubMatcher struct {
+	Ref    string `json:"ref"`
+	Negate bool   `json:"negate,omitempty"`
+}
+
 // serverOnlyEdgeKinds is the set of matcher kinds with no edge JavaScript runtime case:
-// the slice-2 Gateway matchers (`all`/`query`) plus `upstream_healthy` (live lb-pool
-// liveness has no edge analogue, D49). A site using one is delegated to the Cadish server
-// behind (Fix #4) rather than silently mis-projected.
+// `upstream_healthy` (live lb-pool liveness has no edge analogue, D49) and `ip` (resolves
+// the trusted-proxy real client IP, no edge analogue, R02). A site using one is delegated
+// to the Cadish server behind (Fix #4) rather than silently mis-projected. The slice-2
+// Gateway matchers `all` (AND-composite) and `query` (named query-param value test) are NO
+// LONGER here — they became edge-native in v7 (both are pure functions of request data the
+// worker already parses), so they project + evaluate at the edge.
 var serverOnlyEdgeKinds = map[string]bool{
-	"all":              true, // AND-composite (route @gw_match -> u) — Gateway match conjunction
-	"query":            true, // named query-param value test — Gateway queryParams Exact
 	"upstream_healthy": true, // live upstream-pool liveness probe — lb state has no edge analogue (D49)
 	"ip":               true, // IP/CIDR ACL — resolves the trusted-proxy real client IP, no edge analogue (R02)
 }
+
+// NOTE — withdrawn "drop unsatisfiable-at-edge classify row" optimization (P2).
+// A previous (pre-release) version treated an `ip` matcher in a classify `when` row as
+// constant-false-at-the-edge and DROPPED the row from the projected classifier, keeping the
+// rest of the classifier edge-native. That was UNSOUND: the `ip` matcher resolves the REAL
+// client IP (CF-Connecting-IP via trust_proxy) — a public visitor presents the SAME IP to the
+// Cadish server AND to the edge worker. Dropping a row keyed on a public `ip` CIDR makes the
+// edge classify that visitor DIFFERENTLY than the server, computing a different cache key and
+// serving a variant the server would never produce (the cardinal "edge serves what the server
+// wouldn't" over-cache). So no row is dropped: an `ip` (and `upstream_healthy`) matcher in a
+// `when` row fails CLOSED the whole classifier (it is in serverOnlyEdgeKinds → ServerOnly, seen
+// by classifierRowsFailClosed/classifiersFailClosed), and a recipe reading a fail-closed
+// classifier fail-opens → delegates to the Cadish server behind, which CAN evaluate `ip` and
+// computes the correct variant. Safe, no silent drop, no over-cache.
+//
+// A FUTURE sound version could drop ONLY a row whose `ip` matcher is provably NON-routable /
+// private (RFC1918/loopback/link-local) CIDRs that no public visitor can present AND that do
+// not feed the cache key — but none of that is implemented here.
 
 // ServerOnlyEdgeKinds returns a COPY of the set of matcher kinds that have no edge
 // JavaScript runtime case (the projector marks them serverOnly + delegates; the worker
@@ -359,6 +473,12 @@ type Redirect struct {
 	Scope      *Scope `json:"scope,omitempty"`
 	Status     int    `json:"status"`
 	Target     string `json:"target"`
+	// NoStore, when true, means the directive carried a trailing `no_store` modifier.
+	// The worker attaches Cache-Control: no-store, no-cache, must-revalidate, private
+	// to the redirect Response so no shared cache or browser caches the redirect.
+	// Additive v7 field (omitted when false — a stale runtime that misses it simply
+	// sends no Cache-Control header, which is the pre-modifier behavior).
+	NoStore bool `json:"noStore,omitempty"`
 }
 
 // Purge is a purge guard scope. NOTE: as of D34 every `purge` directive is
@@ -583,6 +703,13 @@ type Deliver struct {
 	// CacheKeyRaw selects the raw projected key string (the `raw` modifier) instead
 	// of its hash for CacheKeyHeader.
 	CacheKeyRaw bool `json:"cacheKeyRaw,omitempty"`
+	// CacheAgeHeader is the `header +cache_age NAME` target header name (""=none).
+	// The worker emits the object's age in whole seconds on a cache HIT (fresh or
+	// stale), computed as Math.floor((now − storedAt) / 1000). OMITTED on MISS/bypass.
+	// Additive v7 field (omitempty): a stale runtime ignoring it simply omits the
+	// header (the pre-directive behavior — observability gap, not a correctness
+	// regression), so IRVersion stays 7.
+	CacheAgeHeader string `json:"cacheAgeHeader,omitempty"`
 }
 
 // Edge is the edge cache policy block: per-scope tier policies + a default tier
@@ -654,6 +781,61 @@ type CoverageReport struct {
 	// at runtime that their whole site is being passed. Distinct from Delegated (server-only
 	// directives like rewrite/encode/purge/security that have no SELECTING/cache effect).
 	ForcedPass int `json:"forcedPass,omitempty"`
+	// RouteExcludable is the host+prefix CF route globs the edge worker would ONLY ever
+	// `pass` and that no other edge directive touches (D105) — the set the deploy plane
+	// would carve out of the worker route as origin-direct (no-worker) routes. It is
+	// ALWAYS computed and reported (even when `edge { bypass_passes }` is off) so the
+	// operator can review the opportunity; it is only PROJECTED into the IR (and turned
+	// into real CF routes) when the toggle is on. Never a gate — exclusions are an
+	// optimization, not a coverage gap, so they do not affect `-strict`.
+	RouteExcludable []string `json:"routeExcludable,omitempty"`
+	// RouteExcludableExplicit is the operator-DECLARED `edge { bypass PATTERN… }` set
+	// (D105 explicit companion), host-crossed into CF route globs. Distinct from
+	// RouteExcludable (the auto-derived set): these are taken at the operator's word (no
+	// excludability gate) and are ALWAYS projected into the IR (declaring `bypass …` is
+	// itself the opt-in). The coverage report prints them under the route-excludable
+	// section marked `bypass` (vs `~` for auto-derived). Omitted when none are declared.
+	RouteExcludableExplicit []string `json:"routeExcludableExplicit,omitempty"`
+	// BypassOverlapWarnings are the loud advisories for an explicit `bypass` pattern that
+	// OVERLAPS a path the edge would CACHE (a scoped cache_ttl/cache_key/storage rule): the
+	// bypass forgoes POP caching for that path. Operator-declared ⇒ a WARNING, never a gate;
+	// the pattern is still projected. Printed in the route-excludable section. Omitted when
+	// no explicit bypass shadows a cached path.
+	BypassOverlapWarnings []string `json:"bypassOverlapWarnings,omitempty"`
+}
+
+// AllRouteExcludable returns the EXACT-deduped union of EVERY no-script route the deploy
+// plane could have created for this site under any `bypass_passes` toggle state — the
+// auto-derived excludable set (RouteExcludable) AND the operator-declared
+// `edge { bypass … }` set (RouteExcludableExplicit). `cadish edge disable` tears down
+// this union so the kill switch fully reverts (F-D4).
+//
+// It deliberately does NOT cross-collapse the two sources (no coversGlob merge): `enable`
+// projects ir.RouteExclusions = mergeRouteExclusions(auto, explicit), and with
+// `bypass_passes` OFF the auto input is nil — so enable can create the NARROW explicit
+// `/api/v2*` while disable's always-computed auto set contains the BROADER `/api/*`.
+// A cross-collapse would drop `/api/v2*` under `/api/*` and leave the created route
+// orphaned (F-D1-r2). Every pattern enable could emit is one of these exact strings
+// (merge only ever substitutes a broader INPUT pattern), so the exact union is a
+// superset of what was created; deploy.Disable matches by exact pattern, so any pattern
+// here that was never created is a harmless no-op.
+func (r CoverageReport) AllRouteExcludable() []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(r.RouteExcludable)+len(r.RouteExcludableExplicit))
+	for _, s := range r.RouteExcludable {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	for _, s := range r.RouteExcludableExplicit {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // DelegatedItem is one entry in the coverage report's delegate list.
@@ -674,6 +856,7 @@ func Project(p *pipeline.Pipeline) (EdgeIR, CoverageReport, error) {
 		Edge:           projectEdge(p),
 		CacheUnsafe:    p.EdgeCacheUnsafe(),
 		KeyHeaderNames: p.EdgeKeyHeaderNames(),
+		UsesGeo:        p.UsesGeoToken(),
 	}
 	if patterns, ok := p.EdgeCookieAllow(); ok {
 		ir.CookieAllow, ir.CookieAllowSet = patterns, true
@@ -683,19 +866,29 @@ func Project(p *pipeline.Pipeline) (EdgeIR, CoverageReport, error) {
 	// classifiers / normalizers / tenant.
 	if cls := p.EdgeClassifiers(); len(cls) > 0 {
 		ir.Classifiers = make(map[string]Classifier, len(cls))
+		// BUG-2: merge the matchers synthesized for inline (unnamed) matchers in `when` rows
+		// into the matcher map FIRST, under the synthetic names already placed in the rows'
+		// Conj. Without this an inline classify matcher projects to an empty conj entry the
+		// runtime can never satisfy (a silent no-op).
+		for _, c := range cls {
+			for sn, sm := range c.Synthetic {
+				ir.Matchers[sn] = projectMatcher(sm)
+			}
+		}
+		// Project each classifier's rows FAITHFULLY — EVERY row is kept (no row is ever
+		// dropped). A row that requires a matcher the edge cannot evaluate (a ServerOnly
+		// `ip`/`upstream_healthy` matcher, or an untranslatable RE2 regex) makes the WHOLE
+		// classifier fail-closed via classifierRowsFailClosed/classifiersFailClosed (below), so
+		// any recipe reading it fail-opens → delegates to the Cadish server behind. See the
+		// withdrawn-P2 note above constantFalseAtEdgeKinds's removal: dropping an `ip` row was
+		// unsound (the worker DOES see the real client IP, so a dropped public-CIDR row diverges
+		// the edge from the server). Surviving rows' order + the default are preserved.
 		for name, c := range cls {
 			rows := make([]ClassifyRow, 0, len(c.Rows))
 			for _, r := range c.Rows {
 				rows = append(rows, ClassifyRow{Conj: r.Conj, Value: r.Value})
 			}
 			ir.Classifiers[name] = Classifier{Rows: rows, Default: c.Default, DerivesFrom: c.DerivesFrom, DerivesForward: c.DerivesForward}
-			// BUG-2: merge the matchers synthesized for inline (unnamed) matchers in
-			// `when` rows into the matcher map, under the synthetic names already placed in
-			// the rows' Conj. Without this an inline classify matcher projects to an empty
-			// conj entry the runtime can never satisfy (a silent no-op).
-			for sn, sm := range c.Synthetic {
-				ir.Matchers[sn] = projectMatcher(sm)
-			}
 		}
 	}
 	if norms := p.EdgeNormalizers(); len(norms) > 0 {
@@ -871,7 +1064,7 @@ func Project(p *pipeline.Pipeline) (EdgeIR, CoverageReport, error) {
 			addDelegate(&rep, d)
 			continue
 		}
-		er := Redirect{Status: r.Status, Target: r.Target}
+		er := Redirect{Status: r.Status, Target: r.Target, NoStore: r.NoStore}
 		// Scope selector (scope-only or the combined scope+regex form).
 		if r.HasScope {
 			s := projectScope(r.Scope)
@@ -1144,6 +1337,9 @@ func Project(p *pipeline.Pipeline) (EdgeIR, CoverageReport, error) {
 				ir.Deliver.CacheKeyHeader = op.Name
 				ir.Deliver.CacheKeyRaw = op.Value == "raw"
 			}
+			if op.Op == "cache_age" {
+				ir.Deliver.CacheAgeHeader = op.Name
+			}
 		}
 	}
 
@@ -1260,6 +1456,35 @@ func Project(p *pipeline.Pipeline) (EdgeIR, CoverageReport, error) {
 			"edge kv_max_bytes (%d bytes) exceeds the Workers KV 25 MB hard cap — objects that large can never enter KV; lower it",
 			ir.Edge.KVMaxBytes))
 	}
+
+	// ROUTE EXCLUSIONS (D105): derive the host+prefix CF route globs the worker would
+	// ONLY ever `pass` (a path-only unconditional pass with NO other edge directive
+	// touching the path). Always report the excludable set so the operator can review it;
+	// only project it into the IR (→ real no-worker CF routes on Enable) when the site
+	// opted in with `edge { bypass_passes }`. Strict + fail-safe (computeRouteExclusions):
+	// when in doubt it excludes nothing — a wrong exclusion would silently strip edge
+	// behaviour from a path that needed it.
+	routes := edgeDeployRoutes(p)
+	excludable := computeRouteExclusions(ir, routes)
+	rep.RouteExcludable = excludable
+
+	// EXPLICIT route exclusions (D105 companion): the operator-declared `edge { bypass
+	// PATTERN… }` set. Taken at the operator's word (no excludability gate), host-crossed,
+	// and ALWAYS projected into the IR — declaring `bypass …` is itself the opt-in (it does
+	// NOT require `bypass_passes`). The overlap WARNING (a bypass shadowing a cached path)
+	// is advisory only; the pattern is still included.
+	explicit, overlapWarn := computeExplicitExclusions(p, ir, routes)
+	rep.RouteExcludableExplicit = explicit
+	rep.BypassOverlapWarnings = overlapWarn
+
+	// IR projection: the auto-derived set only under the `bypass_passes` toggle, the
+	// explicit set always; dedup/collapse the union (an explicit `/v3*` subsumes an auto
+	// `/v3/x*` and vice-versa) so the deploy plane gets one clean carve-out set.
+	var auto []string
+	if p.EdgeBypassPasses() {
+		auto = excludable
+	}
+	ir.RouteExclusions = mergeRouteExclusions(auto, explicit)
 
 	return ir, rep, nil
 }
@@ -1468,24 +1693,33 @@ func projectMatchers(in map[string]pipeline.EdgeMatcher) map[string]Matcher {
 
 func projectMatcher(m pipeline.EdgeMatcher) Matcher {
 	out := Matcher{
-		Kind:           m.Kind,
-		Patterns:       m.Patterns,
-		Regex:          m.Regex,
-		Name:           m.Name,
-		Values:         m.Values,
-		Glob:           m.Glob,
-		Methods:        m.Methods,
-		Upstreams:      m.Upstreams,
-		ContentTypes:   m.ContentTypes,
-		CookieNames:    m.CookieNames,
-		ClassifyToken:  m.ClassifyToken,
-		ClassifyValue:  m.ClassifyValue,
-		ClassifyNegate: m.ClassifyNegate,
-		GeoGranularity: m.GeoGranularity,
-		GeoValues:      m.GeoValues,
-		QueryNames:     m.QueryNames,
-		JSONPath:       m.JSONPath,
-		ResponsePhase:  m.ResponsePhase,
+		Kind:               m.Kind,
+		Patterns:           m.Patterns,
+		Regex:              m.Regex,
+		Name:               m.Name,
+		Values:             m.Values,
+		Glob:               m.Glob,
+		Methods:            m.Methods,
+		Upstreams:          m.Upstreams,
+		ContentTypes:       m.ContentTypes,
+		CookieNames:        m.CookieNames,
+		ClassifyToken:      m.ClassifyToken,
+		ClassifyValue:      m.ClassifyValue,
+		ClassifyNegate:     m.ClassifyNegate,
+		GeoGranularity:     m.GeoGranularity,
+		GeoValues:          m.GeoValues,
+		QueryNames:         m.QueryNames,
+		QueryNamesNonEmpty: m.QueryNamesNonEmpty,
+		JSONPath:           m.JSONPath,
+		ResponsePhase:      m.ResponsePhase,
+	}
+	// `all` AND-conjunction: copy the (Ref, Negate) sub-terms through to the wire IR so the
+	// worker can recurse over ir.matchers[ref]. v7.
+	if len(m.Subs) > 0 {
+		out.Subs = make([]SubMatcher, 0, len(m.Subs))
+		for _, s := range m.Subs {
+			out.Subs = append(out.Subs, SubMatcher{Ref: s.Ref, Negate: s.Negate})
+		}
 	}
 	// BUG-1: lift RE2 inline flags off a path_regex/host_regex/header_regex source so
 	// the worker compiles a JS-valid `new RegExp(regex, flags)`. An untranslatable
@@ -1501,9 +1735,9 @@ func projectMatcher(m pipeline.EdgeMatcher) Matcher {
 			out.RegexUntranslatable = true
 		}
 	}
-	// Slice-2 Gateway matchers (`all`/`query`) have no JS runtime case: mark them
-	// server-only so the runtime fails them closed and Project delegates the referencing
-	// site (Fix #4). Strip any carried args so nothing meaningful ships to the edge.
+	// `ip` and `upstream_healthy` have no JS runtime case: mark them server-only so
+	// the runtime fails them closed and Project delegates the referencing site (Fix #4).
+	// (`all` and `query` were server-only before IR v7; they are edge-native since v7.)
 	if serverOnlyEdgeKinds[m.Kind] {
 		out.ServerOnly = true
 	}
@@ -1537,12 +1771,12 @@ func scopeFailsClosed(s Scope, matchers map[string]Matcher) bool {
 		return false
 	}
 	for _, name := range s.Names {
-		if m, ok := matchers[name]; ok && matcherFailsClosed(m) {
+		if m, ok := matchers[name]; ok && matcherFailsClosed(m, matchers) {
 			return true
 		}
 	}
 	for _, m := range s.Inline {
-		if matcherFailsClosed(m) {
+		if matcherFailsClosed(m, matchers) {
 			return true
 		}
 	}
@@ -1556,8 +1790,34 @@ func scopeFailsClosed(s Scope, matchers map[string]Matcher) bool {
 // classifiersFailClosed fixpoint — Finding 1). The single predicate shared by
 // scopeFailsClosed so the redirect/pass/cache_ttl/storage/upgrade fail-open + delegation
 // all account for classify indirection identically.
-func matcherFailsClosed(m Matcher) bool {
-	return m.ServerOnly || m.RegexUntranslatable || m.failsClosed
+//
+// For an `all` AND-composite (v7) it RECURSES: an `all` fails closed iff ANY sub's
+// referenced matcher fails closed — NEGATE-AGNOSTIC. At runtime a fail-closed sub returns
+// false, so a negated term `!@b` flips to TRUE and the whole `all` could MATCH where the
+// server (with @b truly matching) would not — a silent wrong route/pass/cache decision. The
+// closure flag is binary (it cannot express "evaluate the good subs, delegate the bad one"),
+// so any fail-closed sub poisons the whole `all`. No cycle guard / visited-set: depth is ≤1
+// by construction (compile forbids all-of-all; a classify row can never reference an `all`,
+// so the recursion never re-enters an `all`).
+//
+// ORDERING INVARIANT (load-bearing): recursing into a `classify` sub reads that sub's
+// (unexported) failsClosed, which Project sets AFTER the classifiersFailClosed fixpoint but
+// BEFORE every RECV/cache_key projection that calls scopeFailsClosed. Every scopeFailsClosed
+// caller therefore sits later in Project, so the classify sub's flag is already final here. A
+// future reorder that moves a scopeFailsClosed call ahead of the fixpoint would silently ship
+// an `all->classify(fail-closed)` scope native — keep this ordering.
+func matcherFailsClosed(m Matcher, matchers map[string]Matcher) bool {
+	if m.ServerOnly || m.RegexUntranslatable || m.failsClosed {
+		return true
+	}
+	if m.Kind == "all" {
+		for _, sub := range m.Subs {
+			if sm, ok := matchers[sub.Ref]; ok && matcherFailsClosed(sm, matchers) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // directiveScopeOrTokensFailClosed is the SINGLE fail-closed guard EVERY scoped or
@@ -1603,6 +1863,12 @@ func directiveScopeOrTokensFailClosed(s Scope, tokens []KeyToken, matchers map[s
 // nested classify indirection (a classifier whose row reads another classifier) is covered.
 // A classifier whose rows are ALL edge-translatable is never marked, so legit configs still
 // project native (Finding 1 — no over-reaction).
+//
+// This runs over ir.Classifiers with EVERY row intact (no row is dropped — the unsound P2
+// "drop unsatisfiable `ip` row" optimization was withdrawn). So a row requiring a ServerOnly
+// `ip`/`upstream_healthy` matcher, or an UNKNOWABLE untranslatable regex / fail-closed classify
+// sub, fail-closes its classifier — exactly the safe pre-P2 behavior. The transitive `fc`
+// fixpoint is unchanged.
 func classifiersFailClosed(classifiers map[string]Classifier, matchers map[string]Matcher) map[string]bool {
 	fc := make(map[string]bool, len(classifiers))
 	for {

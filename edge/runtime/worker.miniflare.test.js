@@ -7,11 +7,12 @@
 import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { handle } from "./entry.js";
+import { IR_VERSION } from "./interpreter.js";
 
 // Minimal storefront-ish IR: cache_key = url, default ttl 60s/grace 1h, a
 // +cache_status X-Cache header. edge default "local" (L1 only).
 const IR_LOCAL = {
-  irVersion: 5,
+  irVersion: IR_VERSION,
   site: { hosts: ["example.com"] },
   upstream: {},
   matchers: {},

@@ -49,6 +49,13 @@ type Config struct {
 	KVNamespace string            // "" => no L2, no namespace bound
 	OriginURL   string            // CADISH_ORIGIN binding (the cadish server behind)
 	Upstreams   map[string]string // optional CADISH_UPSTREAMS binding (name -> url)
+
+	// RouteExclusions are host+prefix CF route globs the worker should NOT run on (D105):
+	// paths the worker would only ever `pass`. Enable creates one no-script route per
+	// pattern (a route with the `script` field omitted matches but runs no worker, so CF
+	// proxies it straight to origin and the more-specific pattern wins over the worker's
+	// `<host>/*` route); Disable removes them. Empty (the default) → no exclusion routes.
+	RouteExclusions []string
 }
 
 // Client talks to the Cloudflare API. BaseURL and HTTP are overridable for tests.
@@ -361,10 +368,14 @@ func (c *Client) Enable(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	have := map[string]bool{}
+	have := map[string]bool{}         // patterns already pointing at our worker
+	haveNoScript := map[string]bool{} // patterns that already run no worker (exclusions)
 	for _, r := range existing {
-		if r.Script == cfg.WorkerName {
+		switch {
+		case r.Script == cfg.WorkerName:
 			have[r.Pattern] = true
+		case r.Script == "":
+			haveNoScript[r.Pattern] = true
 		}
 	}
 	for _, pattern := range cfg.Routes {
@@ -372,6 +383,22 @@ func (c *Client) Enable(ctx context.Context, cfg Config) error {
 			continue
 		}
 		bodyJSON, _ := json.Marshal(map[string]string{"pattern": pattern, "script": cfg.WorkerName})
+		if _, err := c.do(ctx, http.MethodPost, fmt.Sprintf("/zones/%s/workers/routes", zoneID), bytes.NewReader(bodyJSON), "application/json"); err != nil {
+			return err
+		}
+	}
+	// Route EXCLUSIONS (D105): after the worker routes, create a no-script route for each
+	// exclusion pattern. A Workers route whose `script` is OMITTED matches the pattern but
+	// runs NO worker — "a route can be specified without being associated with a Worker;
+	// this will act to negate any less specific patterns" (Cloudflare Workers routing
+	// docs) — so CF serves it via the normal proxy (origin direct) and the more-specific
+	// pattern wins over the worker's `<host>/*`. Idempotent: a pattern already present as a
+	// no-script route is left as-is.
+	for _, pattern := range cfg.RouteExclusions {
+		if haveNoScript[pattern] {
+			continue
+		}
+		bodyJSON, _ := json.Marshal(map[string]string{"pattern": pattern})
 		if _, err := c.do(ctx, http.MethodPost, fmt.Sprintf("/zones/%s/workers/routes", zoneID), bytes.NewReader(bodyJSON), "application/json"); err != nil {
 			return err
 		}
@@ -393,8 +420,18 @@ func (c *Client) Disable(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
+	exclusion := map[string]bool{}
+	for _, p := range cfg.RouteExclusions {
+		exclusion[p] = true
+	}
 	for _, r := range existing {
-		if r.Script != cfg.WorkerName {
+		// Detach our worker's routes AND the no-script exclusion routes we created (D105):
+		// a full revert to "everything through the worker". An exclusion route runs no
+		// worker (Script == ""), so it is matched by pattern against cfg.RouteExclusions —
+		// never by Script — so an unrelated no-script route is left untouched.
+		mine := r.Script == cfg.WorkerName
+		ourExclusion := r.Script == "" && exclusion[r.Pattern]
+		if !mine && !ourExclusion {
 			continue
 		}
 		if _, err := c.do(ctx, http.MethodDelete, fmt.Sprintf("/zones/%s/workers/routes/%s", zoneID, r.ID), nil, ""); err != nil {

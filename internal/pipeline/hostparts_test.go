@@ -14,21 +14,21 @@ func TestHostParts(t *testing.T) {
 		wantSub  string
 	}{
 		// Single-label TLD (default rule): base = last two labels.
-		{"es.nudity.tv", "nudity.tv", "es"},
-		{"www.amateur.tv", "amateur.tv", "www"},
-		{"pt.amateur.tv", "amateur.tv", "pt"},
-		{"nudity.tv", "nudity.tv", ""},              // bare registrable host: empty sub
-		{"amateur.tv", "amateur.tv", ""},            // bare registrable host
-		{"a.b.es.nudity.tv", "nudity.tv", "a.b.es"}, // multi-level subdomain
+		{"es.brand-a.example", "brand-a.example", "es"},
+		{"www.brand-b.example", "brand-b.example", "www"},
+		{"pt.brand-b.example", "brand-b.example", "pt"},
+		{"brand-a.example", "brand-a.example", ""},              // bare registrable host: empty sub
+		{"brand-b.example", "brand-b.example", ""},              // bare registrable host
+		{"a.b.es.brand-a.example", "brand-a.example", "a.b.es"}, // multi-level subdomain
 		// Multi-label public suffix: tech555.io behaves like co.uk.
 		{"cam4you.tech555.io", "cam4you.tech555.io", ""},      // bare registrable on a 2-label suffix
 		{"es.cam4you.tech555.io", "cam4you.tech555.io", "es"}, // subdomain over a 2-label suffix
 		{"shop.example.co.uk", "example.co.uk", "shop"},
 		{"example.co.uk", "example.co.uk", ""},
 		// Normalization: case + :port + trailing dot are stripped before splitting.
-		{"WWW.Amateur.TV", "amateur.tv", "www"},
-		{"es.nudity.tv:8443", "nudity.tv", "es"},
-		{"es.nudity.tv.", "nudity.tv", "es"},
+		{"WWW.Brand-B.Example", "brand-b.example", "www"},
+		{"es.brand-a.example:8443", "brand-a.example", "es"},
+		{"es.brand-a.example.", "brand-a.example", "es"},
 		// Degenerate hosts.
 		{"localhost", "localhost", ""},
 		{"", "", ""},
@@ -52,13 +52,13 @@ func TestExpandTemplateHostParts(t *testing.T) {
 		tmpl string
 		want string
 	}{
-		{"es.nudity.tv", "https://www.{host.base}/x", "https://www.nudity.tv/x"},
-		{"es.nudity.tv", "{host.sub}", "es"},
-		{"www.amateur.tv", "https://www.{host.base}", "https://www.amateur.tv"},
-		{"nudity.tv", "https://www.{host.base}", "https://www.nudity.tv"},
-		{"nudity.tv", "[{host.sub}]", "[]"}, // bare base -> empty sub
+		{"es.brand-a.example", "https://www.{host.base}/x", "https://www.brand-a.example/x"},
+		{"es.brand-a.example", "{host.sub}", "es"},
+		{"www.brand-b.example", "https://www.{host.base}", "https://www.brand-b.example"},
+		{"brand-a.example", "https://www.{host.base}", "https://www.brand-a.example"},
+		{"brand-a.example", "[{host.sub}]", "[]"}, // bare base -> empty sub
 		{"cam4you.tech555.io", "https://www.{host.base}", "https://www.cam4you.tech555.io"},
-		{"es.nudity.tv", "https://www.{host.base}/lang/{host.sub}", "https://www.nudity.tv/lang/es"},
+		{"es.brand-a.example", "https://www.{host.base}/lang/{host.sub}", "https://www.brand-a.example/lang/es"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.tmpl+"@"+tc.host, func(t *testing.T) {

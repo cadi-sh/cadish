@@ -1,0 +1,142 @@
+{
+  "irVersion": 9,
+  "site": {
+    "hosts": [
+      "example.com",
+      "adult.example.com"
+    ],
+    "redirectHosts": [
+      "adult.example.com",
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "a": {
+      "kind": "all",
+      "subs": [
+        {
+          "ref": "host_x"
+        },
+        {
+          "ref": "path_y"
+        },
+        {
+          "ref": "exempt",
+          "negate": true
+        },
+        {
+          "ref": "isgold"
+        }
+      ]
+    },
+    "exempt": {
+      "kind": "cookie",
+      "name": "vip"
+    },
+    "host_x": {
+      "kind": "host",
+      "patterns": [
+        "adult.example.com"
+      ]
+    },
+    "isgold": {
+      "kind": "classify",
+      "classifyToken": "tier",
+      "classifyValue": "gold"
+    },
+    "path_y": {
+      "kind": "path",
+      "patterns": [
+        "/cams"
+      ]
+    },
+    "prem": {
+      "kind": "cookie",
+      "name": "premium"
+    }
+  },
+  "classifiers": {
+    "tier": {
+      "rows": [
+        {
+          "conj": [
+            "prem"
+          ],
+          "value": "gold"
+        }
+      ],
+      "default": "free"
+    }
+  },
+  "recv": {
+    "pass": [
+      {
+        "names": [
+          "a"
+        ]
+      }
+    ]
+  },
+  "key": {
+    "tokens": [
+      {
+        "kind": "method"
+      },
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "method"
+          },
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache"
+  },
+  "usesGeo": false,
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

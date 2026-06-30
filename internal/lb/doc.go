@@ -65,3 +65,22 @@ func RoutingKey(ctx context.Context) (key string, ok bool) {
 	}
 	return v, true
 }
+
+const excludeBaseURLCtxKey ctxKey = 1
+
+// WithExcludeBaseURL marks one backend baseURL the pool must NEVER select for this
+// request, even when the ring/policy would otherwise land on it. PeerOrigin uses it so
+// a read-through is never dialed back to SELF: self stays in the ownership ring (so
+// ownership stays consistent cluster-wide) but is excluded from the actual routing
+// decision. This closes the health-flap race where pickRing walks clockwise onto self
+// between the peerorigin self-guard's point-in-time Owner() read and Fetch's pick — a
+// self-dial that would coalesce against the in-flight leader and stall (F-B2).
+func WithExcludeBaseURL(ctx context.Context, baseURL string) context.Context {
+	return context.WithValue(ctx, excludeBaseURLCtxKey, baseURL)
+}
+
+// excludedBaseURL reads the baseURL excluded by WithExcludeBaseURL ("" when none).
+func excludedBaseURL(ctx context.Context) string {
+	v, _ := ctx.Value(excludeBaseURLCtxKey).(string)
+	return v
+}

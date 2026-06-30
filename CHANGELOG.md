@@ -4,6 +4,144 @@ All notable changes to cadish are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and cadish follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] — 2026-06-30
+
+Clustering hardening for the single-location, multi-node "one sharded cache" use case
+(`cluster { } mode owner`). Surfaced by exercising a real 3-node cluster on staging: the
+in-process tests passed but the binary, behind a shared client hostname, fetched every
+object from origin twice. Two latent owner-mode bugs found and fixed, plus the read-through
+`pass` symmetry. All changes are gated by the `cluster` block — a non-clustered cadish is
+byte-for-byte unchanged.
+
+Also in 0.2.2: a **Cadish Edge** batch that lets the edge tier cache a real production
+workload it previously could not. On a high-cardinality media workload, `cadish edge build`
+went from **22 forced-pass directives** (a single forced-pass on a selecting directive
+fail-opens the whole site → the edge caches nothing) down to a small residual that **correctly
+delegates** to the Cadish server behind — chiefly an age-gate classifier keyed on an `ip`
+override, which the edge cannot evaluate and must (soundly) hand back to the server rather than
+cache a divergent variant. Every change is conformance-proven byte-identical between the Go
+pipeline and the JS worker; the IR contract moved `v6 → v9` (additive fields only).
+
+### Added
+- **`all` (AND-composite) and `query` (named-value) matchers are now edge-native.** Both were
+  previously server-only (`serverOnly`), so any config using `all @a @b` selectors or a
+  `query NAME VALUE` test fail-opened the edge to a site-wide pass. The projector now emits an
+  `all` matcher's sub-terms (`Matcher.subs`, with per-term negate) and the worker evaluates both;
+  an `all` whose sub is itself fail-closed (an `ip`/regex it cannot honor) still fails closed, so
+  the edge never silently mis-decides. (IR v7.)
+- **`query_present` gains a per-name non-empty-value modifier (`+`).** `query_present adult_content+ ff-*+`
+  matches only when the named/globbed param is present **with a non-empty value** (Varnish `=[^&]+`
+  parity), so a marketing/`publi` flag no longer over-fires on `?adult_content=`. Server + edge.
+- **`redirect … no_store` modifier.** Marks a personalized redirect uncacheable: the short-circuit
+  3xx response carries `Cache-Control: no-store, no-cache, must-revalidate, private`. Server + edge.
+- **`+cache_age` deliver special and `{device}` / `{geo*}` / `{query.NAME}` template tokens.** `header +cache_age NAME`
+  emits a cached object's age in whole seconds on a HIT (absent on MISS); `{device}`, `{geo}`/`{geo.continent}`/
+  `{geo.region}` and `{query.NAME}` are usable in `header`/`redirect` values. Reproduces the original worker's
+  `X-CF-Cache-Age` / `X-CF-Vary-*` debug headers. Server + edge. **Cache-safe by construction:** a class token
+  (`{device}`/`{geo*}`, or a `{classify.NAME}` that buckets on one) reflected in a **request-phase** header
+  (forwarded to origin) is rendered **empty unless the SELECTED `cache_key` recipe varies on that class** — so
+  the origin can never serve class-specific content that is then cached under a class-independent key (a cross-
+  device / cross-region cache leak). Response-phase headers and redirect targets always resolve (they are
+  applied per request at delivery and never poison a shared entry). `cadish check` warns when an unkeyed class
+  token is forwarded to origin. The edge worker derives the same per-request keyed-class set from the selected
+  recipe, so server and worker neutralize identically (IR v9).
+- **`cadish edge deploy -origin passthrough` (fetch-through mode).** Fronts a multi-host origin in
+  the **same Cloudflare zone**: the worker fetches the original request URL verbatim (host **and**
+  scheme preserved) and reaches the real origin via CF same-zone loop-prevention, instead of
+  rewriting the authority to a backend host. Rewriting the host (the default, for a *separate*
+  cadish server behind) makes a canonicalizing origin (apex→www, http→https) redirect-loop forever
+  because CF `fetch()` ignores a Host-header override — `passthrough` is the fix. An empty origin
+  binding now throws loudly rather than silently passing through; passthrough is opted into only by
+  the explicit sentinel.
+- **`cadish edge deploy -allow-public-values`.** Acknowledges that a config carries **non-secret**
+  literal cookie/header values (e.g. `userType`, `AdultContent`, `verified-prod`) so the deploy
+  safety gate does not reject them. Relaxes only the secret-looking-literal (`ValueExposed`) gate —
+  it does **not** relax `ForcedPass` (a forced-pass directive still fails the build).
+- **Edge worker-route exclusions — skip the worker for paths it only ever passes.** Two ways:
+  opt-in `edge { bypass_passes }` (cadish auto-derives the path-only-`pass` patterns) and
+  `edge { bypass PATTERN… }` (operator-declared, the HAProxy `path_beg`-bypass analog). Both
+  project the patterns as Cloudflare routes that match but run **no worker**, so those paths skip
+  the worker and CF proxies them straight to origin (no wasted invocation/hop). Because the edge is
+  **additive** — the cadish server behind reproduces request/response headers, routing, `cors`,
+  `replace`, `strip_cookies` — only a path the edge would **cache** (scoped) or **short-circuit**
+  (redirect/respond) is disqualified; a conditional or non-glob-reducible pass is too. `cadish edge
+  build` **always** reports the excludable set + warns if an explicit `bypass` shadows a cached path.
+  Routes are created on `enable`, removed on `disable` (default off). IR v7→v8.
+- **`X-Cadish-Edge` response marker.** The edge worker stamps `X-Cadish-Edge` (the CF colo) on every
+  response it serves, so its **absence** identifies a response served directly by the origin (a
+  `bypass`ed path) — the reliable "did the worker run?" signal the server's own `+cache_status`
+  header can't give. Edge-only, always on.
+
+### Security
+- **`cache_credentialed`: cross-user cache leak on a no-signal response — fixed (fail-closed).**
+  In a `cache_credentialed @scope` the per-response origin signal (`from_header X-Cache-Ttl`) is
+  by design the **sole** storage gate, but the response phase only enforced it on the positive
+  path. A credentialed in-scope response that carried **no** signal yet was made cacheable by a
+  co-existing `cache_ttl default ttl N` (and had no `Set-Cookie`/`Vary`) stayed cacheable and was
+  stored under the **shared**, credential-free key — serving one user's private body to the next.
+  The response phase now refuses unconditionally when a request is in a credentialed scope without
+  the per-response signal. Server **and** edge worker (both had the identical fail-open); the
+  conformance golden had encoded the leak, so the Go≡JS check passed while both engines leaked
+  (it was present since 0.2.1). Regenerated.
+- **Admin `/api/config`: absolute path disclosure in diagnostic messages — fixed.** The
+  config-redaction helper scrubbed a diagnostic's *position* but not its *message*, so a failed
+  `import`/`ca_file` (`open /abs/path/frag.cadi: …`) leaked the host directory layout to an admin
+  token holder. The message is now scrubbed too.
+- **Open redirect via a regex capture in a `redirect` target authority — fixed.** A `redirect`
+  whose TARGET placed a `$N` capture (or a request-sourced token) in the Location **authority**,
+  e.g. `redirect (?i)^(/.*?)?/index\.php(.*)$ 301 https://{host}$1$2?{query}`, could be driven to
+  an off-origin host: `GET /index.php@evil.example.com/` expanded to
+  `Location: https://{host}@evil.example.com/` — the validated `{host}` becomes mere *userinfo*
+  and the attacker string the real navigation origin. The compile-time guard validated only the
+  **static** template authority (treating `$N`/literals as inert), so it missed this. A new
+  **runtime post-expansion authority assertion** (server `redirectRule.eval` + edge `evalRedirect`,
+  byte-identical, conformance-proven) re-expands the target with every request-sourced input
+  neutralized (captures + request tokens → empty; the validated host family + scheme kept) and
+  **suppresses** the redirect if the resulting authority differs — closing this class generally,
+  including the latent relative-target variant (`redirect 302 {query.next}` + `?next=//evil`).
+  Hardened further (follow-up adversarial review): the guard now normalizes the expanded
+  Location to exactly the bytes the HTTP layer transmits — stripping embedded TAB/LF/CR/FF/NUL
+  and trimming **every** leading/trailing byte `<= 0x20` (ASCII space plus the whole C0 control
+  range, e.g. a leading vertical-tab `?next=%0b//evil`) — *before* the authority check and
+  emission, so a value the wire/UA strips can no longer hide an off-origin authority from the
+  inspector. Server + edge, byte-identical.
+
+### Fixed
+- **Clustering: objects are now cached *once* per region (store-once restored).** When a
+  non-owner reverse-proxied a request to the owning peer, the proxy dropped the original
+  client `Host` and client IP, so the owner computed a *different* cache key for a proxied
+  request than for a direct one — storing the object twice on the owner (once per host, and
+  again per client IP for `{geo}`/`{sticky}` keys) and doubling origin load. cadish now
+  forwards the client `Host` and the resolved client IP (`X-Forwarded-For`) on the peer hop
+  so proxied and direct requests hash to the same key. (Requires the peer subnet in
+  `trust_proxy` — already required for the hop guard — and isolated; the forward also
+  overwrites any client-forged `X-Forwarded-For`, closing a peer-hop spoof.) [D103]
+- **Clustering: correct client IP for owner-side ACL / rate-limit / geo decisions.** Same
+  root cause — the owner previously saw the *peer's* IP for a proxied request, so an `ip`/
+  `geo` ACL, a rate-limit bucket, or a `{geo}` lookup evaluated against the peer node rather
+  than the client. The forwarded client IP fixes this. [D103]
+- **Clustering: a `pass` request no longer hops to a peer in `read_through` mode.** It now
+  goes straight to origin in both modes (owner mode already did), matching the operator's
+  intent that only cacheable routes are sharded. A "possibly cacheable" request (including
+  `cache_credentialed`) still routes to the owner. [D102]
+- **Clustering: writes (POST/PUT/…) in `read_through` mode reach origin intact.** Only
+  cacheable GET/HEAD are peer-routed; a write now goes straight to the local origin instead of
+  being sharded to a peer (where a peer outage could surface as a 404 with the request body
+  already consumed). A peer/loop/self/bypass decline is signalled with a dedicated "skip"
+  sentinel so the origin chain falls through to the real origin even for a body-carrying request.
+- **Clustering: a read-through never dials itself under a flapping owner.** The self-fetch
+  guard now resolves the owner *health-aware* (matching where the request would actually
+  route) and self is excluded from the peer routing decision intrinsically, so a brief
+  owner health flap can no longer route an object back to the local node and stall on the
+  coalescer.
+
+### Notes
+- A new 3-node single-location **clustering deployment guide** (DNS round-robin entry +
+  `/.cadish/readyz` health, the two-health-layer model, trust+isolate requirement) is in
+  `deploy/README.md`; the `cluster { }` reference documents the pass behavior and store-once
+  trust requirement. Request **scheme** is not reconstructed across the plain-HTTP peer hop
+  (not a cache-key input) — prefer a uniform-scheme entry such as DNS round-robin.
+
 ## [0.2.1] — 2026-06-27
 
 A batch of capabilities surfaced by consolidating a real multi-tier caching, TLS, and
@@ -278,5 +416,6 @@ sweep hardened the surface:
 - Future module tracks (not in this release): an own-engine **WAF**, signed-URL inbound
   verification + HLS, and an eBPF/XDP L4 module.
 
+[0.2.2]: https://github.com/cadi-sh/cadish/releases/tag/v0.2.2
 [0.2.1]: https://github.com/cadi-sh/cadish/releases/tag/v0.2.1
 [0.2.0]: https://github.com/cadi-sh/cadish/releases/tag/v0.2.0

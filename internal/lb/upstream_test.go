@@ -88,6 +88,41 @@ func TestPickRoundRobin(t *testing.T) {
 	}
 }
 
+// TestPickExcludeBaseURL is the F-B2 backstop: WithExcludeBaseURL makes pick never
+// select the excluded backend, even when the shard ring would land on it — so a
+// peerorigin read-through can never be dialed back to self regardless of health-flap
+// timing between the self-guard and pick.
+func TestPickExcludeBaseURL(t *testing.T) {
+	factory, _ := fakeFactory()
+	cfg := staticCfg(t, Shard, "http://a:80", "http://b:80")
+	cfg.Shard = ShardKeyVal
+	u, err := New(cfg, WithOriginFactory(factory))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Find a key the ring assigns to a:80, then exclude it — pick must return b:80.
+	var key string
+	for i := 0; i < 500; i++ {
+		k := "k" + strings.Repeat("x", i%7) + string(rune('a'+i%26)) + strings.Repeat("y", i/26)
+		if owner, ok := u.Owner(k, false); ok && owner == "http://a:80" {
+			key = k
+			break
+		}
+	}
+	if key == "" {
+		t.Skip("no key mapped to a:80 in the sample")
+	}
+	base := WithRoutingKey(context.Background(), key)
+	if got := u.pick(base, &origin.Request{}, map[string]bool{}); got == nil || got.baseURL != "http://a:80" {
+		t.Fatalf("sanity: key should route to a:80, got %v", got)
+	}
+	excl := WithExcludeBaseURL(base, "http://a:80")
+	got := u.pick(excl, &origin.Request{}, map[string]bool{})
+	if got == nil || got.baseURL == "http://a:80" {
+		t.Fatalf("excluded backend was selected: %v (want b:80)", got)
+	}
+}
+
 func TestPickLeastConn(t *testing.T) {
 	factory, _ := fakeFactory()
 	cfg := staticCfg(t, LeastConn, "http://a:80", "http://b:80", "http://c:80")

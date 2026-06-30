@@ -23,7 +23,7 @@ const edgeUsage = `cadish edge — Cadish Edge management plane (Cloudflare Work
 
 Usage:
   cadish edge build   [-config Cadishfile] [-o FILE] [-bundle FILE] [-strict]
-  cadish edge deploy  [-config Cadishfile] [-origin URL]   # upload, NO routes (dark)
+  cadish edge deploy  [-config Cadishfile] [-origin URL] [-allow-public-values]
   cadish edge enable  [-config Cadishfile]                 # attach routes (go-live)
   cadish edge disable [-config Cadishfile]                 # detach routes (kill switch)
 
@@ -46,9 +46,21 @@ Flags (build):
   -json          print the coverage report as JSON instead of text
 
 Flags (deploy):
-  -config PATH   path to the Cadishfile (default Cadishfile)
-  -origin URL    the upstream the worker fetches (the cadish server behind); falls
-                 back to env CADISH_EDGE_ORIGIN. Required.
+  -config PATH             path to the Cadishfile (default Cadishfile)
+  -origin URL              the upstream the worker fetches (the cadish server behind); falls
+                           back to env CADISH_EDGE_ORIGIN. Required. The literal "passthrough"
+                           selects PASSTHROUGH mode: the worker fetches the ORIGINAL request
+                           URL unchanged (host + scheme preserved), relying on Cloudflare
+                           same-zone loop-prevention to reach the real origin — use this when
+                           fronting a multi-host origin in the SAME CF zone (a host rewrite to
+                           an apex/backend hostname would trigger the origin's canonicalize
+                           redirect loop).
+  -allow-public-values     acknowledge that the VALUE-EXPOSURE warnings printed above have been
+                           reviewed and none of the listed literals is a secret; allows the
+                           deploy to proceed past the value-exposure safety gate. The ForcedPass
+                           correctness gate (site-wide fail-open) is NOT bypassed by this flag.
+                           Only pass this after reviewing the printed VALUE-EXPOSURE warnings
+                           and confirming none is a secret.
 `
 
 // Edge dispatches the `cadish edge …` subcommands. It is the management plane for
@@ -379,20 +391,24 @@ func writeCoverageJSON(sites []edgeSite, w io.Writer) error {
 
 // EdgeDeploy builds each site's worker bundle and uploads it (script + bindings,
 // no routes) to Cloudflare. Auth: CF_API_TOKEN; origin: -origin or CADISH_EDGE_ORIGIN.
+// -allow-public-values acknowledges that the VALUE-EXPOSURE warnings have been reviewed
+// and none of the listed literals is a secret; the ForcedPass correctness gate is not
+// bypassed by this flag.
 func EdgeDeploy(args []string) int {
 	fs := flag.NewFlagSet("edge deploy", flag.ContinueOnError)
 	cfgPath := fs.String("config", defaultConfigPath, "path to the Cadishfile")
-	origin := fs.String("origin", "", "upstream URL the worker fetches (else env CADISH_EDGE_ORIGIN)")
+	origin := fs.String("origin", "", `upstream URL the worker fetches, or "passthrough" to fetch the original host/scheme via same-zone loop-prevention (else env CADISH_EDGE_ORIGIN)`)
+	allowPublicValues := fs.Bool("allow-public-values", false, "acknowledge VALUE-EXPOSURE warnings and allow deploy to proceed (only after confirming no listed literal is a secret)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if rejectStrayConfigArgs("edge deploy", fs.Args()) {
 		return 2
 	}
-	return runEdgeDeploy(*cfgPath, *origin, os.Stdout, os.Stderr)
+	return runEdgeDeploy(*cfgPath, *origin, os.Stdout, os.Stderr, *allowPublicValues)
 }
 
-func runEdgeDeploy(cfgPath, origin string, stdout, stderr io.Writer) int {
+func runEdgeDeploy(cfgPath, origin string, stdout, stderr io.Writer, allowPublicValues bool) int {
 	token := os.Getenv("CF_API_TOKEN")
 	if token == "" {
 		fmt.Fprintln(stderr, "cadish edge deploy: CF_API_TOKEN is required (a Cloudflare API token)")
@@ -428,7 +444,9 @@ func runEdgeDeploy(cfgPath, origin string, stdout, stderr io.Writer) int {
 		// them here would let `deploy` push a worker that `build` refuses: one that
 		// silently fails open site-wide (ForcedPass) or that bakes a secret into the
 		// PUBLIC bundle (ValueExposed). Refuse to upload such a bundle.
-		if abortEdgeDeployUnsafe(strings.Join(p.EdgeHosts(), ","), rep, stderr) {
+		// The ForcedPass gate is always enforced. The ValueExposed gate can be
+		// acknowledged with -allow-public-values (only after reviewing the warnings).
+		if abortEdgeDeployUnsafe(strings.Join(p.EdgeHosts(), ","), rep, stderr, allowPublicValues) {
 			return 1
 		}
 		src, berr := edgebundle.Bundle(ir)
@@ -449,20 +467,33 @@ func runEdgeDeploy(cfgPath, origin string, stdout, stderr io.Writer) int {
 // refuses to UPLOAD a bundle the build would have rejected. A non-zero ForcedPass
 // means a selecting directive was silently coarsened to a site-wide fail-open pass
 // (the edge would cache nothing) — `edge build` already fails non-zero on this even
-// without -strict. A non-zero ValueExposed means a matcher/header literal (a
-// potential baked-in secret) would ship in the PUBLIC worker bundle. Either is
-// unsafe to push live, so deploy fails CLOSED here. Returns true (and prints why) to
-// abort. (SecurityGate stays advisory, mirroring `build`: it is enforced on the
-// Cadish server behind the edge, so it is surfaced but not a deploy-blocking gate.)
-func abortEdgeDeployUnsafe(hosts string, rep edgeir.CoverageReport, stderr io.Writer) bool {
+// without -strict. ForcedPass ALWAYS aborts, regardless of allowPublicValues, because
+// it is a correctness gate (the edge would cache nothing), not a secrets gate.
+//
+// A non-zero ValueExposed means a matcher/header literal (a potential baked-in secret)
+// would ship in the PUBLIC worker bundle. By default this also aborts. When
+// allowPublicValues is true (the operator has passed -allow-public-values after
+// reviewing the VALUE-EXPOSURE warnings and confirming none is a secret), the
+// VALUE-EXPOSURE warning is still printed but the deploy is NOT aborted on this gate.
+//
+// Returns true (and prints why) to abort. (SecurityGate stays advisory, mirroring
+// `build`: it is enforced on the Cadish server behind the edge, so it is surfaced but
+// not a deploy-blocking gate.)
+func abortEdgeDeployUnsafe(hosts string, rep edgeir.CoverageReport, stderr io.Writer, allowPublicValues bool) bool {
 	abort := false
 	if rep.ForcedPass > 0 {
 		fmt.Fprintf(stderr, "cadish edge deploy: %s: refusing to upload — %d selecting directive(s) were forced to a site-wide fail-open pass or a delegated redirect (they reference a matcher the edge cannot evaluate); the edge cannot honor them, so keep those directives on the Cadish server behind (run `cadish edge build` for detail)\n", hosts, rep.ForcedPass)
 		abort = true
 	}
 	if rep.ValueExposed > 0 {
-		fmt.Fprintf(stderr, "cadish edge deploy: %s: refusing to upload — %d literal value(s) would be exposed in the PUBLIC worker bundle (a potential baked-in secret); remove the literal or quote the {$VAR} to keep it server-side (run `cadish edge build -strict` for detail)\n", hosts, rep.ValueExposed)
-		abort = true
+		if allowPublicValues {
+			// VALUE-EXPOSURE advisory — operator acknowledged via -allow-public-values.
+			// Still print the warning so the operator sees which literals are shipping.
+			fmt.Fprintf(stderr, "cadish edge deploy: %s: VALUE-EXPOSURE advisory — %d literal value(s) will be exposed in the PUBLIC worker bundle; proceeding because -allow-public-values was set (only pass this after confirming none is a secret)\n", hosts, rep.ValueExposed)
+		} else {
+			fmt.Fprintf(stderr, "cadish edge deploy: %s: refusing to upload — %d literal value(s) would be exposed in the PUBLIC worker bundle (a potential baked-in secret); remove the literal or quote the {$VAR} to keep it server-side, or pass -allow-public-values after reviewing these and confirming none is a secret (run `cadish edge build -strict` for detail)\n", hosts, rep.ValueExposed)
+			abort = true
+		}
 	}
 	return abort
 }
@@ -499,9 +530,23 @@ func runEdgeManageRoutes(cfgPath, action string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "cadish edge %s: %v\n", action, err)
 			return 1
 		}
+		// Route EXCLUSIONS (D105): the no-worker carve-outs to create on enable / remove on
+		// disable. Enable creates everything the site projects — ir.RouteExclusions =
+		// merge(auto, explicit): the auto-derived set (only under `edge { bypass_passes }`)
+		// PLUS every operator-declared `edge { bypass … }`. Disable removes the FULL union the
+		// tool could ever have created (rep.AllRouteExcludable = RouteExcludable ∪
+		// RouteExcludableExplicit) so the kill switch fully reverts even an explicit-only site
+		// and even if the toggle was flipped off since the routes were created (F-D4).
+		ir, rep, perr := edgeir.Project(p)
+		if perr != nil {
+			fmt.Fprintf(stderr, "cadish edge %s: %v\n", action, perr)
+			return 1
+		}
 		if action == "enable" {
+			cfg.RouteExclusions = ir.RouteExclusions
 			err = client.Enable(ctx, cfg)
 		} else {
+			cfg.RouteExclusions = rep.AllRouteExcludable()
 			err = client.Disable(ctx, cfg)
 		}
 		if err != nil {
@@ -570,6 +615,16 @@ func deriveRoutes(hosts []string) []string {
 	return out
 }
 
+// containsStr reports whether ss contains s (small set; linear is fine).
+func containsStr(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
 // writeCoverageText prints a human coverage report per site (to stderr, like
 // `cadish check`, so the IR on stdout stays pipeable).
 func writeCoverageText(sites []edgeSite, w io.Writer) {
@@ -594,6 +649,42 @@ func writeCoverageText(sites []edgeSite, w io.Writer) {
 		sort.Strings(dirs)
 		for _, d := range dirs {
 			fmt.Fprintf(w, "    - %s x%d → pass: %s\n", d, counts[d], reasons[d])
+		}
+		// Route-excludable (D105): the path patterns that would skip the worker → origin
+		// direct. Two sources, distinguished in the listing:
+		//   ~ auto-derived  — paths the worker would ONLY ever `pass` (a path-only
+		//                     unconditional pass with no edge-unique directive on it); ALWAYS
+		//                     shown, projected into the IR only under `edge { bypass_passes }`.
+		//   bypass operator-declared `edge { bypass PATTERN… }` carve-outs; taken at the
+		//                     operator's word and ALWAYS projected into the IR.
+		if len(s.rep.RouteExcludable) > 0 || len(s.rep.RouteExcludableExplicit) > 0 {
+			total := len(s.rep.RouteExcludable) + len(s.rep.RouteExcludableExplicit)
+			// The auto-derived set is in the IR only under `bypass_passes`; detect it by
+			// membership (an auto pattern present in the projected IR exclusions).
+			autoActive := false
+			for _, pat := range s.rep.RouteExcludable {
+				if containsStr(s.ir.RouteExclusions, pat) {
+					autoActive = true
+					break
+				}
+			}
+			state := "review the ~ set then enable `edge { bypass_passes }`; bypass entries are operator-declared and active"
+			switch {
+			case len(s.rep.RouteExcludable) == 0:
+				state = "operator-declared via `edge { bypass … }` — projected into the IR"
+			case autoActive:
+				state = "ACTIVE via `bypass_passes` + operator-declared — projected into the IR"
+			}
+			fmt.Fprintf(w, "  route-excludable: %d path pattern(s) would skip the worker → origin direct (%s)\n", total, state)
+			for _, pat := range s.rep.RouteExcludable {
+				fmt.Fprintf(w, "    ~ %s\n", pat)
+			}
+			for _, pat := range s.rep.RouteExcludableExplicit {
+				fmt.Fprintf(w, "    bypass %s\n", pat)
+			}
+			for _, warn := range s.rep.BypassOverlapWarnings {
+				fmt.Fprintf(w, "    ! WARNING: %s\n", warn)
+			}
 		}
 		if len(s.rep.Warnings) > 0 {
 			fmt.Fprintf(w, "  warnings:    %d\n", len(s.rep.Warnings))

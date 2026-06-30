@@ -1,0 +1,11 @@
+{
+  "name": "76-geo-reqheader-unkeyed",
+  "cadishfile": "geo.example.com {\n    header X-Geo {geo}\n    header X-Region {geo.region}\n    cache_key host path\n    cache_ttl default ttl 60s\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "geo.example.com", "path": "/p", "geo": "US", "geoRegion": "US-CA" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

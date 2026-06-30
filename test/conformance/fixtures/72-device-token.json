@@ -1,0 +1,21 @@
+{
+  "name": "72-device-token",
+  "cadishfile": "dev.example.com {\n    device_detect {\n        mobile ua_contains iPhone Android\n        tablet ua_contains iPad\n        bot    ua_contains bot Bot\n        default desktop\n    }\n    cache_key   host path {device}\n    cache_ttl   default ttl 60s\n    header      +cache_status X-Cache\n    header      X-Device-Class {device}\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "dev.example.com", "path": "/p", "header": { "User-Agent": ["Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "dev.example.com", "path": "/p", "header": { "User-Agent": ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "HIT"
+    },
+    {
+      "request": { "method": "GET", "host": "dev.example.com", "path": "/p", "device": "tablet" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

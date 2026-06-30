@@ -1,0 +1,52 @@
+name: helm-publish
+
+# Package the Helm chart and push it to GHCR as an OCI artifact, so users can
+# `helm install` WITHOUT cloning the repo:
+#
+#   helm install cadish oci://ghcr.io/cadi-sh/charts/cadish --version <chart-version> \
+#     --namespace cadish --create-namespace --set controller.enabled=true
+#
+# Triggers: every release tag (keeps the chart in lockstep with the app), and
+# manual dispatch for ad-hoc re-publishes.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout only
+      packages: write # push the chart to GHCR
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Package + push chart (OCI)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_ACTOR: ${{ github.actor }}
+        run: |
+          helm version
+          # On a release tag, fail loudly if the chart's appVersion has drifted from the
+          # tag being released — otherwise `helm install` of the "0.2.2" chart would
+          # silently deploy the appVersion-pinned (older) image, missing this release's
+          # fixes (F-R1). Manual dispatch (no tag) skips the check.
+          if [ -n "${GITHUB_REF_NAME:-}" ] && printf '%s' "$GITHUB_REF_NAME" | grep -q '^v'; then
+            tag_ver="${GITHUB_REF_NAME#v}"
+            app_ver="$(grep -E '^appVersion:' deploy/helm/cadish/Chart.yaml | sed -E 's/^appVersion:[[:space:]]*"?([^"]*)"?/\1/')"
+            if [ "$app_ver" != "$tag_ver" ]; then
+              echo "::error::Chart appVersion ($app_ver) != release tag ($tag_ver) — bump deploy/helm/cadish/Chart.yaml before tagging" >&2
+              exit 1
+            fi
+          fi
+          helm lint deploy/helm/cadish
+          helm package deploy/helm/cadish --destination "$RUNNER_TEMP/chart"
+          echo "$GH_TOKEN" | helm registry login ghcr.io -u "$GH_ACTOR" --password-stdin
+          chart="$(ls "$RUNNER_TEMP"/chart/cadish-*.tgz)"
+          echo "Pushing $chart -> oci://ghcr.io/cadi-sh/charts"
+          helm push "$chart" oci://ghcr.io/cadi-sh/charts

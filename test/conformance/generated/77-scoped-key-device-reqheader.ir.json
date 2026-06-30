@@ -1,0 +1,107 @@
+{
+  "irVersion": 9,
+  "site": {
+    "hosts": [
+      "x.example.com"
+    ],
+    "redirectHosts": [
+      "x.example.com"
+    ],
+    "canonicalHost": "x.example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "ssr": {
+      "kind": "header",
+      "name": "X-Is-Ssr",
+      "values": [
+        "true"
+      ]
+    }
+  },
+  "device": {
+    "rules": [
+      {
+        "class": "mobile",
+        "substrings": [
+          "iphone"
+        ]
+      }
+    ],
+    "default": "desktop"
+  },
+  "recv": {
+    "headerReq": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "set",
+            "name": "X-Device",
+            "value": "{device}",
+            "valueIsTmpl": true
+          }
+        ]
+      }
+    ]
+  },
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "names": [
+            "ssr"
+          ]
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          },
+          {
+            "kind": "device"
+          }
+        ]
+      },
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s"
+      }
+    ]
+  },
+  "deliver": {},
+  "usesGeo": false,
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

@@ -32,8 +32,8 @@ func TestFetch_SelfRouteServesLocal(t *testing.T) {
 	po := New(pool, hopHeader, "gra", owner)
 
 	_, err := po.Fetch(context.Background(), &origin.Request{Key: "/obj"})
-	if err != origin.ErrNotFound {
-		t.Fatalf("self-route Fetch err = %v, want ErrNotFound", err)
+	if err != origin.ErrSkip {
+		t.Fatalf("self-route Fetch err = %v, want ErrSkip", err)
 	}
 	if hit {
 		t.Error("self-route must not contact the peer over the network")
@@ -87,8 +87,8 @@ func TestFetch_HopGuardServesLocal(t *testing.T) {
 	po := New(peerPool(t, peer.URL), hopHeader, "gra", "")
 	req := &origin.Request{Key: "/obj", Header: http.Header{hopHeader: {"gra"}}}
 	_, err := po.Fetch(context.Background(), req)
-	if err != origin.ErrNotFound {
-		t.Fatalf("hop-guarded Fetch err = %v, want ErrNotFound", err)
+	if err != origin.ErrSkip {
+		t.Fatalf("hop-guarded Fetch err = %v, want ErrSkip", err)
 	}
 	if hit {
 		t.Error("a hop-guarded request must not be re-forwarded to a peer")

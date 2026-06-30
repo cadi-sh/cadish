@@ -1,0 +1,66 @@
+{
+  "name": "69-query-present-nonempty",
+  "cadishfile": "example.com {\n    @qne  query_present p+ q ff-*+\n    pass @qne\n    cache_key method host path\n    cache_ttl default ttl 1m\n    header +cache_status X-Cache\n}",
+  "cases": [
+    {
+      "comment": "p+ with non-empty value → match → pass",
+      "request": { "method": "GET", "host": "example.com", "path": "/", "query": { "p": ["x"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "comment": "p+ with empty value (?p=) → no match → cached",
+      "request": { "method": "GET", "host": "example.com", "path": "/", "query": { "p": [""] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "comment": "p+ with BARE param (?p, no =): both url.ParseQuery('p') and entry.js URLSearchParams yield p=[''] (present-but-empty) → no match → cached. DISTINCT in intent from ?p= (above) and from absent (below); the [''] representation is identical to ?p= ON PURPOSE — that is the proof that a bare ?p is treated as empty for the +modifier.",
+      "request": { "method": "GET", "host": "example.com", "path": "/", "query": { "p": [""] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "comment": "p absent entirely (no p key) → no match → cached",
+      "request": { "method": "GET", "host": "example.com", "path": "/" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "comment": "q with empty value → q is presence-only → match → pass",
+      "request": { "method": "GET", "host": "example.com", "path": "/", "query": { "q": [""] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "comment": "q with non-empty value → q is presence-only → match → pass",
+      "request": { "method": "GET", "host": "example.com", "path": "/", "query": { "q": ["y"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "comment": "ff-foo=bar → ff-*+ name matches and value non-empty → match → pass",
+      "request": { "method": "GET", "host": "example.com", "path": "/", "query": { "ff-foo": ["bar"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "comment": "ff-foo= → ff-*+ name matches but value empty → no match → cached",
+      "request": { "method": "GET", "host": "example.com", "path": "/", "query": { "ff-foo": [""] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "comment": "unrelated param → no match → cached",
+      "request": { "method": "GET", "host": "example.com", "path": "/", "query": { "other": ["val"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "comment": "p+ repeated param: one non-empty value → match → pass",
+      "request": { "method": "GET", "host": "example.com", "path": "/", "query": { "p": ["", "abc"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

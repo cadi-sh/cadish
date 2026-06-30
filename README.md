@@ -13,7 +13,7 @@ with one process and one config file:
 - **`cadish check`** — a config *complexity report*: regex-per-request, dead
   rules, estimated cost per request. Nothing else in the ecosystem has this.
 
-> 🚧 **Status: v0.2.0 BETA — ships v1 plus the full v2 directive set.** A single-binary
+> 🚧 **Status: BETA — ships v1 plus the full v2 directive set.** A single-binary
 > HTTPS caching reverse proxy that serves a full production config end-to-end, plus
 > the v2 normalizers (`{device}`/`{geo}`/`normalize`), multi-tenant `{tenant}` +
 > `group` inheritance, and `replace` body transforms. See [`CHANGELOG.md`](CHANGELOG.md)

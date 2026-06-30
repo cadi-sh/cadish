@@ -1,0 +1,21 @@
+{
+  "name": "73-cache-age-header",
+  "cadishfile": "age.example.com {\n    cache_key   host path\n    cache_ttl   default ttl 60s\n    header      +cache_status X-Cache\n    header      +cache_age   X-CF-Cache-Age\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "age.example.com", "path": "/v" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "age.example.com", "path": "/v" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "HIT"
+    },
+    {
+      "request": { "method": "GET", "host": "age.example.com", "path": "/v" },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "HIT-STALE"
+    }
+  ]
+}

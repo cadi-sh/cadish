@@ -85,6 +85,15 @@ import (
 // before returning it. A chain.Chain falls through to the next origin on it.
 var ErrNotFound = errors.New("origin: object not found")
 
+// ErrSkip is returned by an origin that DECLINED to handle a request WITHOUT reading
+// its body — a pure no-op skip (e.g. PeerOrigin's cache-bypass / write / loop / self
+// guards, which return before touching req.Body). A chain.Chain falls through to the
+// next origin on ErrSkip EVEN when req.Body != nil, because the body is provably still
+// intact and replayable. This is distinct from ErrNotFound (a real lookup miss that may
+// have consumed the body), which the chain treats as terminal for a body request to
+// avoid re-issuing a non-idempotent, non-replayable write to a second origin.
+var ErrSkip = errors.New("origin: skipped (request not handled, body untouched)")
+
 // StatusError reports that an origin received an HTTP response whose status is
 // neither a success (200/206) nor a plain not-found (which maps to ErrNotFound).
 // A chain.Chain consults its fall-through status set against StatusError.Status
@@ -223,6 +232,18 @@ type Request struct {
 	// when there is no body. HTTP origins set it on the upstream request so a known
 	// length is sent as Content-Length rather than chunked.
 	ContentLength int64
+
+	// Bypass marks a request that must NOT read-through to a peer cadish node: it is a
+	// cache-bypass (an explicit `pass`, or a credential bypass) whose response is never
+	// stored, so asking the owning peer is pure wasted latency — the peer would only
+	// pass to origin too. A read-through PeerOrigin honors this by surfacing
+	// origin.ErrNotFound so the chain falls through to the real origin, giving a `pass`
+	// the same straight-to-origin path in read_through mode that owner mode already
+	// gives it (owner mode skips the owner-route seam because a `pass` returns before
+	// it). It is set ONLY for a clear bypass — a "possibly cacheable" request (incl.
+	// cache_credentialed) leaves it false and follows the full path to the owner.
+	// Backends that are not a peer pool (httporigin, s3origin) ignore it.
+	Bypass bool
 }
 
 // RangeHeader returns the raw Range header value (e.g. "bytes=0-1023"), or "" if

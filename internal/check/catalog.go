@@ -1,6 +1,7 @@
 package check
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/cadi-sh/cadish/internal/cadishfile"
@@ -468,9 +469,16 @@ func directiveUsages(d *cadishfile.Directive) usages {
 				u.refs = append(u.refs, refUse{name: strings.TrimPrefix(d.Args[i].Raw, "@"), pos: d.Args[i].Pos})
 				i++
 			}
-			// Combined form: a path regex precedes `CODE TARGET` (≥3 trailing args), so
-			// it costs one regex eval/request like the bare regex form.
-			if rest := d.Args[i:]; len(rest) >= 3 {
+			// Combined form: a path regex precedes `CODE TARGET` (≥3 trailing args AND
+			// the first arg is NOT a valid 3xx redirect code), so it costs one regex
+			// eval/request like the bare regex form. The `!isRedirectCodeToken` guard
+			// mirrors the parser's disambiguation (compileRedirectScoped): the scope-only
+			// form with a trailing `no_store` modifier (`@scope CODE TARGET no_store`) also
+			// leaves 3 trailing args, but its first is the CODE — without this guard the
+			// catalog would wrongly register the status code as an inline path_regex cost.
+			// Keying on a valid code (not merely "all digits") keeps the catalog in lockstep
+			// with the parser for an all-digit PATH_REGEX combined form (e.g. `@scope 12 …`).
+			if rest := d.Args[i:]; len(rest) >= 3 && !isRedirectCodeToken(rest[0].Raw) {
 				u.inlines = append(u.inlines, inlineUse{typ: "path_regex", args: rest[:1], pos: rest[0].Pos})
 			}
 		case len(d.Args) >= 1 && !isAllDigits(d.Args[0].Raw):
@@ -724,6 +732,24 @@ func isAllDigits(s string) bool {
 		}
 	}
 	return true
+}
+
+// isRedirectCodeToken reports whether raw is a literal valid 3xx redirect code cadish
+// emits (301/302/303/307/308). It backs the scoped-redirect disambiguation in the cost
+// catalog, kept in lockstep with the pipeline parser (pipeline.isRedirectCodeToken): a
+// leading CODE marks the scope-only form, a non-code first arg marks the combined form's
+// PATH_REGEX — so an all-digit PATH_REGEX (e.g. "12") is not misread as a status code.
+func isRedirectCodeToken(raw string) bool {
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return false
+	}
+	switch n {
+	case 301, 302, 303, 307, 308:
+		return true
+	default:
+		return false
+	}
 }
 
 // hasArg reports whether any arg's raw text equals s.

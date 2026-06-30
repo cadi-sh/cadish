@@ -30,6 +30,7 @@ id_rsa*
 
 # Claude Code session/worktree scratch (never part of the project)
 /.claude/
+.superpowers/
 
 # OS / editor
 .DS_Store

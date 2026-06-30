@@ -151,6 +151,67 @@ only the cache *contents* differ per pod (each pod has its own RAM/NVMe tier), s
 more replicas trade cache hit-rate for capacity — front with a peer `cluster` if
 you want pods to share cache.
 
+## Clustered single-location cache (3 nodes, shared cache)
+
+To run N cadish nodes in one location as **one sharded cache** — each object stored
+**once** across the cluster instead of N times — use a `cluster { … }` membership
+block in `mode owner`. A request landing on any node is reverse-proxied to the node
+that owns that key on a consistent-hash ring; only the owner caches it. A `pass`
+route goes straight to origin (no detour). Nodes health-check each other and a failed
+node is dropped from the ring (its keys redistribute to a neighbor; they return when
+it recovers). Full semantics: the `cluster { … }` section in
+[`docs/cadishfile-reference.md`](../docs/cadishfile-reference.md).
+
+**Per-node config** (identical on all three — change only `self`):
+
+```
+cache.example.com {
+    cache { ram 4GiB disk /var/cache/cadish 50GiB }
+    upstream backend { to https://origin.internal }
+
+    # REQUIRED for clustering: trust + isolate the peer network (see below).
+    trust_proxy 10.0.0.0/24
+
+    cluster {
+        self     http://10.0.0.11:8080          # this node; the only line that differs
+        peers    http://10.0.0.11:8080 http://10.0.0.12:8080 http://10.0.0.13:8080
+        region   madrid
+        mode     owner
+        fallback degraded
+        health   GET /.cadish/readyz expect 200 interval 1s window 3 threshold 2
+    }
+    cache_ttl default ttl 60s
+}
+```
+
+**Entry layer — what lands a client on a node (cadish does not).** cadish routes
+*between* nodes but does not distribute the initial request; put one of these in
+front:
+
+- **DNS round-robin with health checks (recommended, provider-agnostic).** One
+  hostname (`cache.example.com`) with an A/AAAA record per node; the DNS provider
+  (Route 53 health checks, NS1, Cloudflare LB, …) probes each node's
+  **`/.cadish/readyz`** and withdraws a dead node's record. Because any live node
+  forwards a cacheable key to its owner, the entry layer only needs **liveness**, not
+  sharding awareness. Caveat: DNS reacts at TTL granularity — keep a **low record
+  TTL** so a dead node drains quickly.
+- **BGP/anycast or an L4 VIP** (MetalLB+BGP, keepalived) reacts in sub-second time
+  with no TTL lag, but couples you to the network/provider — a more advanced option,
+  not required.
+
+**Two independent health layers** (don't conflate them):
+1. **Entry health** — the DNS/L4 checker → `/.cadish/readyz`: does this node receive
+   client traffic at all.
+2. **Peer health** — the `cluster { health … }` block: peers probe each other to
+   decide ring ownership and ejection.
+
+**Trust + isolation (load-bearing).** The peer subnet **must** be in `trust_proxy`
+*and* reachable only by cadish nodes (firewall / security group / NetworkPolicy).
+The hop guard and the owner's client-IP/cache-key derivation both depend on the
+peers being trusted; isolation is what makes trusting them safe (no untrusted client
+can forge headers from the peer network). See the security notes in the
+`cluster { … }` reference section.
+
 ## Kubernetes-native upstreams (`k8s://` EndpointSlice resolution)
 
 Point `upstream`/`cluster` `to` at a **`k8s://service.namespace:port`** target and

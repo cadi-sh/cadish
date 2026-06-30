@@ -1,5 +1,5 @@
 {
-  "irVersion": 6,
+  "irVersion": 9,
   "site": {
     "hosts": [
       "example.com"
@@ -69,6 +69,7 @@
   "deliver": {
     "cacheStatusHeader": "X-Cache"
   },
+  "usesGeo": false,
   "cookieAllow": [
     "darkMode",
     "lang",

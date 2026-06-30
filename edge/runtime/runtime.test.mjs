@@ -15,7 +15,7 @@ import assert from "node:assert";
 import { handle, buildIReq } from "./entry.js";
 import { IR_VERSION, evalRequest, canonicalHeaderKey } from "./interpreter.js";
 import { EdgeCache, isCacheableResponse } from "./cache-tiers.js";
-import { fetchOrigin, EDGE_TRUST_HEADERS } from "./origin.js";
+import { fetchOrigin, EDGE_TRUST_HEADERS, PEER_HEADER } from "./origin.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const genDir = join(here, "..", "..", "test", "conformance", "generated");
@@ -1205,6 +1205,61 @@ await test("worker cache_credentialed: forwards cookie, shares HIT, refuses Set-
   assert.equal(noSig.calls, 2, "no-signal response refetched per request (never stored)");
 });
 
+// cache_credentialed (D101) FAIL-CLOSED with a co-existing STATIC `cache_ttl default ttl 60s`
+// — the LIVE brand-a.example config shape (fixture 64). The static default makes an in-scope response
+// dec.cacheable=true, but a static TTL is NOT a per-response origin signal, so it must NOT
+// authorize a shared credentialed store. Before the fix the edge stored a personalized in-scope
+// 200 (no X-Cache-Ttl) under the SHARED key and replayed it to the next user — a cross-user leak.
+await test("worker cache_credentialed: static default + NO signal must NOT shared-cache (D101 fail-closed)", async () => {
+  const ir = JSON.parse(readFileSync(join(genDir, "64-cache-credentialed-static-default.ir.json"), "utf8"));
+
+  // (a) THE LEAK: a credentialed in-scope request whose origin 200 carries NO X-Cache-Ttl and
+  // NO Set-Cookie. The static `default ttl 60s` would make it cacheable, but the fail-closed gate
+  // must refuse the shared store — so alice's private body is refetched for bob, never replayed.
+  let lastUser = null;
+  const leakFetch = async (_url, init) => {
+    leakFetch.calls++;
+    const cookie = new Headers(init.headers).get("Cookie");
+    lastUser = cookie;
+    // A PERSONALIZED body keyed to the caller's session — the thing that must never be shared.
+    return new Response(`private-for-${cookie}`, { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  leakFetch.calls = 0;
+  const cache = freshCache();
+  const mk = (cookie) => new Request("https://example.com/v3/readmodel/cache/communityconfiguser", { method: "GET", headers: { Cookie: cookie } });
+
+  const ctxA = mockCtx();
+  const rA = await handle(mk("session=alice"), {}, ctxA, { ir, cache, fetchImpl: leakFetch, originBase: "http://o" });
+  await ctxA.drain();
+  assert.equal(rA.headers.get("X-Cache"), "MISS", "first credentialed no-signal request is a MISS");
+  assert.equal(await rA.text(), "private-for-session=alice", "alice gets her own body");
+
+  const ctxB = mockCtx();
+  const rB = await handle(mk("session=bob"), {}, ctxB, { ir, cache, fetchImpl: leakFetch, originBase: "http://o" });
+  await ctxB.drain();
+  assert.notEqual(rB.headers.get("X-Cache"), "HIT", "bob must NOT HIT a shared entry (no-signal store refused — fail-closed)");
+  assert.equal(lastUser, "session=bob", "origin saw bob's own cookie (refetched, not served alice's cached body)");
+  assert.equal(await rB.text(), "private-for-session=bob", "bob gets HIS body, never alice's");
+  assert.equal(leakFetch.calls, 2, "each user refetched — nothing stored under the shared key");
+
+  // (b) REGRESSION GUARD — the legit signal path is unaffected: the SAME static-default config,
+  // an in-scope response that DOES carry X-Cache-Ttl, still stores shared (a 2nd user HITs once).
+  const sigFetch = async () => {
+    sigFetch.calls++;
+    return new Response("shared-readmodel", { status: 200, headers: { "Content-Type": "application/json", "X-Cache-Ttl": "60" } });
+  };
+  sigFetch.calls = 0;
+  const cache2 = freshCache();
+  const mkSig = (c) => new Request("https://example.com/v3/readmodel/cache/home", { method: "GET", headers: { Cookie: c } });
+  const ctxS = mockCtx();
+  const rS1 = await handle(mkSig("session=alice"), {}, ctxS, { ir, cache: cache2, fetchImpl: sigFetch, originBase: "http://o" });
+  await ctxS.drain();
+  assert.equal(rS1.headers.get("X-Cache"), "MISS", "with-signal first request is a MISS (then stored)");
+  const rS2 = await handle(mkSig("session=bob"), {}, mockCtx(), { ir, cache: cache2, fetchImpl: sigFetch, originBase: "http://o" });
+  assert.equal(rS2.headers.get("X-Cache"), "HIT", "with the per-response signal a 2nd user HITs the shared entry (legit path intact)");
+  assert.equal(sigFetch.calls, 1, "stored once under the shared key — the signal authorizes the share");
+});
+
 // --- KV guardrail tests (W2: kv_ttl, kv_max_bytes, cross-POP, TTL-only) ------
 
 // store-level: expirationTtl = clamp(ttl+grace, 60s, kv_ttl). The EDGE_IR (06)
@@ -1570,6 +1625,152 @@ await test("BUG-1: lifted (?i) regex compiles + matches case-insensitively, no t
   assert.equal(d3.request.redirect, null);
 });
 
+// OPEN-REDIRECT RUNTIME DEFENSE (parity with Go redirect.go locationAuthority backstop):
+// a `redirect` whose authority is built from a $N capture (or a request-sourced token)
+// compiles, but at runtime a request like `/index.php@evil.example.com/` can inject an
+// off-origin authority (the validated {host} becomes mere userinfo). The worker must SUPPRESS
+// such redirects (fall through, request.redirect == null) while still firing every legitimate
+// redirect. Mirrors internal/pipeline/redirect_test.go TestRedirectRuntimeAuthorityInjection.
+await test("open-redirect: index.php userinfo injection suppressed, legit strip still redirects", async () => {
+  const { decide } = await import("./interpreter.js");
+  const ir = {
+    irVersion: IR_VERSION,
+    site: { hosts: ["brand-a.example"], redirectHosts: ["brand-a.example"], canonicalHost: "brand-a.example" },
+    upstream: { to: "backend" },
+    recv: {
+      redirect: [{ regex: "^(/.*?)?/index\\.php(.*)$", regexFlags: "i", status: 301, target: "https://{host}$1$2?{query}" }],
+    },
+    key: { tokens: [{ kind: "host" }, { kind: "path" }] },
+    response: { ttl: [{ selKind: "default", ttl: "300s" }] },
+    deliver: {},
+    edge: { default: "local" },
+  };
+  // Exploit: $1="", $2="@evil.example.com/" → https://brand-a.example@evil.example.com/? → SUPPRESS.
+  const exploit = decide(ir, { method: "GET", host: "brand-a.example", path: "/index.php@evil.example.com/", origin: { status: 0 }, cacheStatus: "MISS" });
+  assert.equal(exploit.request.redirect, null, "open-redirect (userinfo injection) must be suppressed");
+  // Legit: /foo/index.php/bar?x=1 → https://brand-a.example/foo/bar?x=1 (authority unchanged) → ALLOW.
+  const legit = decide(ir, { method: "GET", host: "brand-a.example", path: "/foo/index.php/bar", query: { x: ["1"] }, origin: { status: 0 }, cacheStatus: "MISS" });
+  assert.ok(legit.request.redirect, "legit index.php strip must still redirect");
+  assert.equal(legit.request.redirect.location, "https://brand-a.example/foo/bar?x=1");
+});
+
+await test("open-redirect: language {host.base} redirect allowed, relative {query.next} absolute target suppressed", async () => {
+  const { decide } = await import("./interpreter.js");
+  // Language redirect: host kept under neutralization → authorities match → ALLOW.
+  const langIR = {
+    irVersion: IR_VERSION,
+    site: { hosts: ["es.brand-a.example", "brand-a.example"], redirectHosts: ["es.brand-a.example", "brand-a.example"], canonicalHost: "es.brand-a.example" },
+    upstream: { to: "backend" },
+    recv: { redirect: [{ regex: "^/(.*)$", status: 302, target: "https://es.{host.base}{uri}" }] },
+    key: { tokens: [{ kind: "host" }, { kind: "path" }] },
+    response: { ttl: [{ selKind: "default", ttl: "300s" }] },
+    deliver: {},
+    edge: { default: "local" },
+  };
+  const lang = decide(langIR, { method: "GET", host: "brand-a.example", path: "/page", query: { q: ["1"] }, origin: { status: 0 }, cacheStatus: "MISS" });
+  assert.ok(lang.request.redirect, "language redirect must still fire");
+  assert.equal(lang.request.redirect.location, "https://es.brand-a.example/page?q=1");
+
+  // Latent #2: relative target whose leading token is request-sourced → absolute off-origin.
+  const nextIR = {
+    irVersion: IR_VERSION,
+    site: { hosts: ["brand-a.example"], redirectHosts: ["brand-a.example"], canonicalHost: "brand-a.example" },
+    upstream: { to: "backend" },
+    recv: { redirect: [{ regex: "^/r$", status: 302, target: "{query.next}" }] },
+    key: { tokens: [{ kind: "host" }, { kind: "path" }] },
+    response: { ttl: [{ selKind: "default", ttl: "300s" }] },
+    deliver: {},
+    edge: { default: "local" },
+  };
+  const evil = decide(nextIR, { method: "GET", host: "brand-a.example", path: "/r", query: { next: ["https://evil.com/x"] }, origin: { status: 0 }, cacheStatus: "MISS" });
+  assert.equal(evil.request.redirect, null, "relative request-sourced absolute redirect must be suppressed");
+  // A safe relative next stays relative after expansion → ALLOW.
+  const safe = decide(nextIR, { method: "GET", host: "brand-a.example", path: "/r", query: { next: ["/account"] }, origin: { status: 0 }, cacheStatus: "MISS" });
+  assert.ok(safe.request.redirect, "safe relative next must still redirect");
+  assert.equal(safe.request.redirect.location, "/account");
+});
+
+// OPEN-REDIRECT whitespace/control-char bypass hardening (parity with Go redirect_test.go
+// TestRedirectWhitespaceAuthorityBypass): a Location whose expansion begins with leading OWS
+// ("  //evil/") or carries an embedded TAB/CR/LF reports NO authority to a naive inspector,
+// yet the wire/UA strips those bytes — restoring a live off-origin authority. The edge runs
+// normalizeRedirectLocation BEFORE the authority check, so these all SUPPRESS, while legit
+// redirects keep firing. Mirrors the Go server byte-for-byte.
+await test("open-redirect: whitespace/control-char authority bypass suppressed (Go≡JS)", async () => {
+  const { decide } = await import("./interpreter.js");
+  const nextIR = {
+    irVersion: IR_VERSION,
+    site: { hosts: ["brand-a.example"], redirectHosts: ["brand-a.example"], canonicalHost: "brand-a.example" },
+    upstream: { to: "backend" },
+    recv: { redirect: [{ regex: "^/n$", status: 302, target: "{query.next}" }] },
+    key: { tokens: [{ kind: "host" }, { kind: "path" }] },
+    response: { ttl: [{ selKind: "default", ttl: "300s" }] },
+    deliver: {},
+    edge: { default: "local" },
+  };
+  const bypasses = [
+    "  //evil.example.com/",
+    "\t//evil.example.com/",
+    " https://evil.example.com/",
+    "  https://evil.example.com/",
+    "//evil.example\r\n.com/",
+    "//evil.\texample.com/",
+  ];
+  for (const next of bypasses) {
+    const d = decide(nextIR, { method: "GET", host: "brand-a.example", path: "/n", query: { next: [next] }, origin: { status: 0 }, cacheStatus: "MISS" });
+    assert.equal(d.request.redirect, null, `whitespace/control bypass must be suppressed: ${JSON.stringify(next)}`);
+  }
+  // A relative path with surrounding OWS normalizes to a clean relative Location → ALLOW.
+  const okPath = decide(nextIR, { method: "GET", host: "brand-a.example", path: "/n", query: { next: ["  /clean/path  "] }, origin: { status: 0 }, cacheStatus: "MISS" });
+  assert.ok(okPath.request.redirect, "OWS-wrapped relative path must still redirect");
+  assert.equal(okPath.request.redirect.location, "/clean/path");
+
+  // {http.NAME}-only target: same bypass surface via an attacker-influenced header.
+  const hdrIR = {
+    irVersion: IR_VERSION,
+    site: { hosts: ["brand-a.example"], redirectHosts: ["brand-a.example"], canonicalHost: "brand-a.example" },
+    upstream: { to: "backend" },
+    recv: { redirect: [{ regex: "^/h$", status: 302, target: "{http.X-Next}" }] },
+    key: { tokens: [{ kind: "host" }, { kind: "path" }] },
+    response: { ttl: [{ selKind: "default", ttl: "300s" }] },
+    deliver: {},
+    edge: { default: "local" },
+  };
+  for (const next of bypasses) {
+    const d = decide(hdrIR, { method: "GET", host: "brand-a.example", path: "/h", header: { "X-Next": [next] }, origin: { status: 0 }, cacheStatus: "MISS" });
+    assert.equal(d.request.redirect, null, `header bypass must be suppressed: ${JSON.stringify(next)}`);
+  }
+
+  // Legit redirects unaffected after normalization: index.php strip, language, literal, relative.
+  const stripIR = {
+    irVersion: IR_VERSION,
+    site: { hosts: ["brand-a.example"], redirectHosts: ["brand-a.example"], canonicalHost: "brand-a.example" },
+    upstream: { to: "backend" },
+    recv: { redirect: [{ regex: "^(/.*?)?/index\\.php(/.*)?$", regexFlags: "i", status: 301, target: "https://{host}$1$2?{query}" }] },
+    key: { tokens: [{ kind: "host" }, { kind: "path" }] },
+    response: { ttl: [{ selKind: "default", ttl: "300s" }] },
+    deliver: {},
+    edge: { default: "local" },
+  };
+  const strip = decide(stripIR, { method: "GET", host: "brand-a.example", path: "/foo/index.php/bar", query: { x: ["1"] }, origin: { status: 0 }, cacheStatus: "MISS" });
+  assert.ok(strip.request.redirect, "legit index.php strip must still fire");
+  assert.equal(strip.request.redirect.location, "https://brand-a.example/foo/bar?x=1");
+
+  const litIR = {
+    irVersion: IR_VERSION,
+    site: { hosts: ["brand-a.example"], redirectHosts: ["brand-a.example"], canonicalHost: "brand-a.example" },
+    upstream: { to: "backend" },
+    recv: { redirect: [{ regex: "^/go$", status: 302, target: "https://provider.example.com/x" }] },
+    key: { tokens: [{ kind: "host" }, { kind: "path" }] },
+    response: { ttl: [{ selKind: "default", ttl: "300s" }] },
+    deliver: {},
+    edge: { default: "local" },
+  };
+  const lit = decide(litIR, { method: "GET", host: "brand-a.example", path: "/go", origin: { status: 0 }, cacheStatus: "MISS" });
+  assert.ok(lit.request.redirect, "literal off-site redirect must still fire");
+  assert.equal(lit.request.redirect.location, "https://provider.example.com/x");
+});
+
 // BUG-1 negative: an untranslatable regex matcher (marked regexUntranslatable, source
 // stripped by the projector) must FAIL CLOSED at the edge — no compile, no throw, no
 // match — so the worker never 500s and never silently mis-matches a delegated rule.
@@ -1831,6 +2032,214 @@ await test("multi-Cookie-line runtime ingestion: buildIReq normalizes the \", \"
   // A single cookie (the common case) is byte-identical.
   const ireqOne = buildIReq(rawReq("https://example.com/p", [["cookie", "only=1"]]), NOGEO);
   assert.deepEqual(ireqOne.header.get(canonicalHeaderKey("Cookie")), ["only=1"], "single cookie byte-identical");
+});
+
+// +cache_age integer-age formula parity: pin Math.floor(ms/1000) to the same expected
+// whole-second integer as Go's int64(duration.Seconds()) over the same elapsed-ms table.
+// Both formulas truncate toward zero for non-negative elapsed (Math.floor is identical to
+// int64-truncation here). A future rounding-mode change on either side breaks this pin.
+//
+// Go formula (handler.go): int64(h.now().Sub(st).Seconds())
+// JS formula (entry.js):   Math.floor((Date.now() - opts.storedAt) / 1000)
+await test("+cache_age age formula: Math.floor(ms/1000) matches Go int64(d.Seconds()) over fixed elapsed table", () => {
+  const cases = [
+    { elapsedMs: 0, want: 0 },
+    { elapsedMs: 999, want: 0 },
+    { elapsedMs: 1_000, want: 1 },
+    { elapsedMs: 1_500, want: 1 },
+    { elapsedMs: 45_000, want: 45 },
+    { elapsedMs: 45_999, want: 45 },
+  ];
+  for (const { elapsedMs, want } of cases) {
+    const got = Math.floor(elapsedMs / 1000);
+    assert.equal(got, want, `+cache_age elapsed=${elapsedMs}ms: Math.floor(ms/1000)=${got}, want ${want}`);
+  }
+});
+
+// +cache_age Go/JS parity on the stale-on-error salvage path:
+// The Go server (handler.go ~:1645) gates on CacheStatusHit || CacheStatusHitStale
+// and NEVER emits X-Cache-Age for CacheStatusHitStaleError (the origin-error salvage).
+// The edge must suppress the header on that path too (byte-identical-delivery invariant).
+//
+// A genuine HIT (fresh) and a genuine HIT-STALE (revalidation grace, SWR) SHOULD still
+// emit the header — only the origin-error salvage path (HIT-STALE-ERROR) must not.
+function cacheAgeStaleIR() {
+  return {
+    irVersion: IR_VERSION,
+    site: { hosts: ["example.com"] },
+    upstream: {},
+    matchers: {},
+    recv: {},
+    key: { tokens: [{ kind: "host" }, { kind: "path" }] },
+    response: {
+      ttl: [{ selKind: "default", ttl: "1s", grace: "1s", maxStale: "24h" }],
+      headerResp: [
+        { scope: { always: true }, ops: [{ op: "cache_status", name: "X-Cache" }] },
+        { scope: { always: true }, ops: [{ op: "cache_age", name: "X-CF-Cache-Age" }] },
+      ],
+    },
+    deliver: {},
+    edge: { default: "local" },
+  };
+}
+
+await test("+cache_age: genuine HIT emits X-CF-Cache-Age", async () => {
+  clock.t = 1_000_000;
+  const cache = freshCache();
+  const ir = cacheAgeStaleIR();
+  const ok = originStub(200, { "Content-Type": "text/html" }, "body");
+  await prime("/page", { ir, cache, fetchImpl: ok, originBase: "http://o" });
+  clock.t += 500; // 500ms — still fresh (ttl=1s)
+  const r = await handle(req("/page"), {}, mockCtx(), { ir, cache, fetchImpl: ok, originBase: "http://o" });
+  assert.equal(r.headers.get("X-Cache"), "HIT");
+  assert.ok(r.headers.get("X-CF-Cache-Age") != null, "a genuine HIT must emit X-CF-Cache-Age");
+});
+
+await test("+cache_age: HIT-STALE (within grace, SWR) emits X-CF-Cache-Age", async () => {
+  clock.t = 1_000_000;
+  const cache = freshCache();
+  const ir = cacheAgeStaleIR();
+  const ok = originStub(200, { "Content-Type": "text/html" }, "body");
+  await prime("/page", { ir, cache, fetchImpl: ok, originBase: "http://o" });
+  clock.t += 1_500; // 1.5s — past ttl(1s), within grace(+1s total=2s) → stale
+  const r = await handle(req("/page"), {}, mockCtx(), { ir, cache, fetchImpl: ok, originBase: "http://o" });
+  assert.equal(r.headers.get("X-Cache"), "HIT-STALE");
+  assert.ok(r.headers.get("X-CF-Cache-Age") != null, "HIT-STALE (within grace) must emit X-CF-Cache-Age");
+});
+
+await test("+cache_age: stale-on-error transport salvage (HIT-STALE-ERROR) suppresses X-CF-Cache-Age (Go/JS parity)", async () => {
+  clock.t = 1_000_000;
+  const cache = freshCache();
+  const ir = cacheAgeStaleIR();
+  const ok = originStub(200, { "Content-Type": "text/html" }, "STALE");
+  await prime("/page", { ir, cache, fetchImpl: ok, originBase: "http://o" });
+  clock.t += 10 * 3600 * 1000; // 10h — past ttl+grace(2s), within max_stale(24h)
+  const boom = async () => { throw new Error("origin down"); };
+  const r = await handle(req("/page"), {}, mockCtx(), { ir, cache, fetchImpl: boom, originBase: "http://o" });
+  assert.equal(r.status, 200, "should serve the stale-on-error salvage copy");
+  assert.equal(r.headers.get("X-Cache"), "HIT-STALE-ERROR", "cache-status must still be HIT-STALE-ERROR");
+  assert.equal(r.headers.get("X-CF-Cache-Age"), null, "HIT-STALE-ERROR MUST NOT emit X-CF-Cache-Age (Go server suppresses it; parity)");
+});
+
+await test("+cache_age: stale-on-error origin-returned-5xx salvage (handleOriginResponseError path) suppresses X-CF-Cache-Age (Go/JS parity)", async () => {
+  clock.t = 1_000_000;
+  const cache = freshCache();
+  const ir = cacheAgeStaleIR();
+  const ok = originStub(200, { "Content-Type": "text/html" }, "STALE");
+  await prime("/page", { ir, cache, fetchImpl: ok, originBase: "http://o" });
+  clock.t += 10 * 3600 * 1000; // 10h — past ttl+grace(2s), within max_stale(24h)
+  const boom = originStub(503, {}, "boom");
+  const r = await handle(req("/page"), {}, mockCtx(), { ir, cache, fetchImpl: boom, originBase: "http://o" });
+  assert.equal(r.status, 200, "should serve the stale-on-error salvage copy");
+  assert.equal(r.headers.get("X-Cache"), "HIT-STALE-ERROR", "cache-status must still be HIT-STALE-ERROR");
+  assert.equal(r.headers.get("X-CF-Cache-Age"), null, "origin-returned-5xx salvage MUST NOT emit X-CF-Cache-Age (Go server suppresses it; parity)");
+});
+
+await test("+cache_age: stale-on-error origin-returned-404 salvage (negative-response path) suppresses X-CF-Cache-Age (Go/JS parity)", async () => {
+  // entry.js line ~:745 — the 404/410 case where a stale last-good copy outranks storing the 404.
+  // This path passes storedAt, causing the bug; it must be suppressed to match the server.
+  clock.t = 1_000_000;
+  const cache = freshCache();
+  const ir = cacheAgeStaleIR();
+  const ok = originStub(200, { "Content-Type": "text/html" }, "STALE");
+  await prime("/page", { ir, cache, fetchImpl: ok, originBase: "http://o" });
+  clock.t += 10 * 3600 * 1000; // 10h — past ttl+grace(2s), within max_stale(24h)
+  const notFound = originStub(404, {}, "not found");
+  const r = await handle(req("/page"), {}, mockCtx(), { ir, cache, fetchImpl: notFound, originBase: "http://o" });
+  assert.equal(r.status, 200, "a stale salvage copy outranks a 404 response");
+  assert.equal(r.headers.get("X-Cache"), "HIT-STALE-ERROR", "cache-status must still be HIT-STALE-ERROR");
+  assert.equal(r.headers.get("X-CF-Cache-Age"), null, "origin-returned-404 salvage MUST NOT emit X-CF-Cache-Age (Go server suppresses it; parity)");
+});
+
+// --- origin passthrough mode -------------------------------------------------
+// PASSTHROUGH (origin binding == "passthrough"): the worker must fetch the ORIGINAL
+// request URL unchanged — preserving the client host AND scheme (HTTPS:443 for an https
+// request) — and must NOT rewrite the URL host or set a Host header to a different host.
+// This relies on Cloudflare same-zone loop-prevention to reach the real multi-host origin
+// (apex/www both in the zone), avoiding the canonicalize-redirect loop that a host rewrite
+// to the apex/backend hostname triggers. The request-phase header ops, geo headers, the
+// X-Cadish-Peer hop-guard, and the EDGE_TRUST_HEADERS strip must STILL be applied.
+
+await test("PASSTHROUGH: origin binding 'passthrough' fetches the ORIGINAL url (host+scheme preserved) and sets no divergent Host; ops/geo/peer/trust-strip still apply", async () => {
+  let capturedURL = null;
+  let capturedHeaders = null;
+  const fetchImpl = async (url, init) => {
+    capturedURL = url;
+    capturedHeaders = init.headers;
+    return new Response("body", { status: 200 });
+  };
+  const request = new Request("https://www.example.com/p?q=1", {
+    headers: {
+      // A client-supplied edge-trust header that MUST be stripped before forwarding.
+      "X-Cadish-Geo-Region": "INJECTED",
+    },
+  });
+  const reqHeaderOps = [{ op: "set", name: "X-Test-Op", value: "yes" }];
+  const geo = { geo: "US", geoContinent: "NA", geoRegion: "US-UT" };
+  await fetchOrigin(request, { originBase: "passthrough", reqHeaderOps, geo, fetchImpl });
+
+  // The ORIGINAL url is fetched unchanged — host AND scheme preserved (https:443).
+  assert.equal(capturedURL, "https://www.example.com/p?q=1", "passthrough must fetch the original url unchanged (host+scheme preserved)");
+  // No Host header rewritten to a different host — let the original host stand. The test
+  // Request carries no Host, so none is set (and certainly not the apex/backend host).
+  const host = capturedHeaders.get("Host");
+  assert.ok(host === null || host === "www.example.com", `passthrough must not set a divergent Host (got ${host})`);
+  // The request-phase header ops still apply.
+  assert.equal(capturedHeaders.get("X-Test-Op"), "yes", "request header ops must still apply in passthrough");
+  // Geo headers still injected.
+  assert.equal(capturedHeaders.get("CF-IPCountry"), "US", "geo headers must still apply in passthrough");
+  assert.equal(capturedHeaders.get("X-Cadish-Geo-Region"), "US-UT", "the edge-resolved geo region must overwrite the stripped client value");
+  // The hop-guard is set.
+  assert.equal(capturedHeaders.get(PEER_HEADER), "1", "X-Cadish-Peer hop-guard must still be set in passthrough");
+});
+
+await test("EMPTY origin binding throws loudly (NOT a silent passthrough degrade) — passthrough must be opted into explicitly", async () => {
+  let fetched = false;
+  const fetchImpl = async () => {
+    fetched = true;
+    return new Response("body", { status: 200 });
+  };
+  const request = new Request("https://www.example.com/x");
+  // An empty CADISH_ORIGIN is an operator error (the deploy plane rejects it). It must fail
+  // loudly rather than silently fetch the original host: in the separate-cadish-server-behind
+  // topology a silent passthrough would fetch the public zone host instead of the server.
+  // Passthrough is reached ONLY via the explicit "passthrough" sentinel.
+  await assert.rejects(
+    () => fetchOrigin(request, { originBase: "", reqHeaderOps: [], geo: null, fetchImpl }),
+    /no origin binding/,
+    "an empty origin binding must throw, not silently pass through",
+  );
+  assert.equal(fetched, false, "no origin fetch must happen on an empty binding");
+});
+
+await test("REWRITE (contrast): a real -origin URL still rewrites the host and sets the canonical Host header", async () => {
+  let capturedURL = null;
+  let capturedHeaders = null;
+  const fetchImpl = async (url, init) => {
+    capturedURL = url;
+    capturedHeaders = init.headers;
+    return new Response("body", { status: 200 });
+  };
+  const request = new Request("https://www.example.com/p?q=1");
+  await fetchOrigin(request, { originBase: "http://cadish-behind.internal:8080", reqHeaderOps: [], geo: null, fetchImpl });
+  // The host/scheme/port come from the origin base; path+query preserved.
+  const out = new URL(capturedURL);
+  assert.equal(out.hostname, "cadish-behind.internal", "rewrite mode takes the host from the origin base");
+  assert.equal(out.protocol, "http:", "rewrite mode takes the scheme from the origin base");
+  assert.equal(out.pathname + out.search, "/p?q=1", "path+query preserved");
+  // The Host header is set to the CANONICAL original host (key↔forward parity).
+  assert.equal(capturedHeaders.get("Host"), "www.example.com", "rewrite mode sets the canonical original Host");
+});
+
+// --- X-Cadish-Edge marker (worker-served vs origin-direct) -------------------
+await test("worker stamps X-Cadish-Edge on every response (the worker-served marker)", async () => {
+  const worker = (await import("./entry.js")).default;
+  // No IR is baked into the raw source, so handle() returns its 'no IR' 500 — but the point is
+  // the fetch WRAPPER stamps X-Cadish-Edge on EVERY response the worker returns, so an operator
+  // can tell a worker-served response from one served DIRECTLY by the origin (an `edge { bypass }`
+  // route, which has no worker → no marker). The cadish server behind never sets this header.
+  const res = await worker.fetch(new Request("https://www.example.com/x"), {}, { waitUntil() {} });
+  assert.ok(res.headers.get("X-Cadish-Edge"), `X-Cadish-Edge must be set on a worker response (status ${res.status})`);
 });
 
 // --- report -----------------------------------------------------------------

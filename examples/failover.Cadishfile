@@ -25,6 +25,10 @@ cdn.example.com {
     # The chain is itself an origin, so caching/TTL behave exactly as with one.
     origin chain primary -> backup
 
+    # Key on path + query so query-varying responses don't collide (the default key
+    # omits the query), but drop tracking params that never change the response.
+    cache_key method host path query_strip utm_* gclid fbclid
+
     cache_ttl status 404 410 ttl 30s grace 1h # don't hammer both on a deletion
     cache_ttl default ttl 5m grace 24h
 

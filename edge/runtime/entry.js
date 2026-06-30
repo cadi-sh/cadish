@@ -130,6 +130,8 @@ function ireqHeader(ireq, name) {
 // Response. statusOverride forces the cache-status token (e.g. HIT-STALE-ERROR).
 // opts.isHead / opts.isRange flip the `replace` transform-skip gating (a HEAD/Range
 // response is never body-transformed, mirroring the server).
+// opts.storedAt (ms since epoch) is the timestamp of when the object was stored —
+// present only on a cache HIT (fresh or stale), used to materialize `+cache_age`.
 async function deliver(ir, ireq, resp, cacheStatus, statusOverride, key, opts = {}) {
   const respHeader = respHeaderToObj(resp.headers);
   const dd = evalDeliver(ir, ireq, respHeader, cacheStatus);
@@ -162,6 +164,16 @@ async function deliver(ir, ireq, resp, cacheStatus, statusOverride, key, opts = 
   if (dd.cacheKeyHeader && key) {
     const v = cacheKeyHeaderValue(key, dd.cacheKeyRaw);
     if (v) headers.set(dd.cacheKeyHeader, v);
+  }
+  // `header +cache_age NAME` (debug): emit the object's age in whole seconds on a
+  // cache HIT (fresh or stale). Omitted on MISS/bypass (no storedAt) and on the
+  // origin-error salvage path (HIT-STALE-ERROR) — mirroring the Go server, which
+  // gates on CacheStatusHit || CacheStatusHitStale and skips CacheStatusHitStaleError
+  // (handler.go ~:1645). The error-salvage deliver calls deliberately omit storedAt
+  // so the `opts.storedAt != null` check already suppresses on that path.
+  if (dd.cacheAgeHeader && opts.storedAt != null && (cacheStatus === "HIT" || cacheStatus === "HIT-STALE")) {
+    const age = Math.floor((Date.now() - opts.storedAt) / 1000);
+    if (age >= 0) headers.set(dd.cacheAgeHeader, String(age));
   }
   // `replace` body transform (D75): a SIZE-BOUNDED literal substitution applied
   // post-cache on delivery. Skipped for HEAD/Range/already-encoded responses, and for
@@ -350,7 +362,7 @@ function storeResponse(ir, ireq, resp, respHeader) {
 
 async function revalidate(ir, ireq, request, geo, credentialed, originBase, fetchImpl, cache, key, ctx) {
   try {
-    const resp = await fetchOrigin(request, { originBase, reqHeaderOps: ireq._reqHeaderOps, geo, fetchImpl });
+    const resp = await fetchOrigin(request, { originBase, reqHeaderOps: ireq._reqHeaderOps, geo, fetchImpl, usesGeo: ir.usesGeo });
     const respHeader = respHeaderToObj(resp.headers);
     const rdec = evalResponse(ir, ireq, resp.status, respHeader);
     // Defense in depth: never (re)store a credentialed request's response. `credentialed` is
@@ -513,7 +525,14 @@ export async function handle(request, env, ctx, deps = {}) {
 
   if (dec.synthetic) return new Response(dec.synthetic.body, { status: dec.synthetic.status });
   if (dec.redirect) {
-    return new Response(null, { status: dec.redirect.status, headers: { Location: dec.redirect.location } });
+    const redirectHeaders = { Location: dec.redirect.location };
+    if (dec.redirect.noStore) {
+      // The `no_store` modifier marks a personalized redirect uncacheable — mirrors the
+      // Go server's Cache-Control emission (handler.go) and the original worker pattern
+      // (lang-redirects.js:396-399). No shared cache or browser caches the redirect.
+      redirectHeaders["Cache-Control"] = "no-store, no-cache, must-revalidate, private";
+    }
+    return new Response(null, { status: dec.redirect.status, headers: redirectHeaders });
   }
 
   const originBase = deps.originBase || originURLFor(env, dec.upstream);
@@ -609,7 +628,7 @@ export async function handle(request, env, ctx, deps = {}) {
       passReqHeaderOps = [origCookie ? { op: "set", name: "Cookie", value: origCookie } : { op: "remove", name: "Cookie" }, ...baseReqHeaderOps];
     }
     try {
-      const resp = await fetchOrigin(request, { originBase, reqHeaderOps: passReqHeaderOps, geo, fetchImpl });
+      const resp = await fetchOrigin(request, { originBase, reqHeaderOps: passReqHeaderOps, geo, fetchImpl, usesGeo: ir.usesGeo });
       // RFC 9111 §4.4 INVALIDATION: a SUCCESSFUL (2xx/3xx) response to an unsafe method on a
       // URI invalidates any cached entry for that URI. Forget the SIBLING GET entry — the key
       // a GET to this same URI would produce — so the next GET re-fetches the post-write body
@@ -673,17 +692,17 @@ export async function handle(request, env, ctx, deps = {}) {
   // ignoreClientRevalidation flag in the EdgeIR and nothing to fail closed on here.
   if (lookup.state === "fresh") {
     if (lookup.fromL2) await cache.populateL1(key, lookup.response.clone(), lookup.meta, ctx);
-    return await deliver(ir, ireq, lookup.response, "HIT", undefined, key);
+    return await deliver(ir, ireq, lookup.response, "HIT", undefined, key, { storedAt: lookup.meta.storedAt });
   }
   if (lookup.state === "stale") {
     if (ctx) ctx.waitUntil(revalidate(ir, ireq, request, geo, credentialed, originBase, fetchImpl, cache, key, ctx));
-    return await deliver(ir, ireq, lookup.response, "HIT-STALE", undefined, key);
+    return await deliver(ir, ireq, lookup.response, "HIT-STALE", undefined, key, { storedAt: lookup.meta.storedAt });
   }
 
   // miss → origin.
   let originResp;
   try {
-    originResp = await fetchOrigin(request, { originBase, reqHeaderOps: dec.reqHeaderOps, geo, fetchImpl });
+    originResp = await fetchOrigin(request, { originBase, reqHeaderOps: dec.reqHeaderOps, geo, fetchImpl, usesGeo: ir.usesGeo });
   } catch {
     // TRANSPORT failure (fetch threw — no response, status 0). This is Go's
     // transport-error branch (origin.StatusOf == 0): no status to negatively cache, so
@@ -813,8 +832,21 @@ function onErrorOr502(ir, ireq) {
   return new Response("origin unavailable", { status: 502 });
 }
 
+// EDGE_MARKER_HEADER is stamped on EVERY response the worker returns, so an operator can tell
+// a worker-served response from one served DIRECTLY by the origin (a path carved out of the
+// worker via a CF no-script route — `edge { bypass … }`). The cadish SERVER behind emits its
+// own cache-status header (`+cache_status`), so that header is NOT a reliable "did the worker
+// run?" signal — this one is, because the server never sets it. The value is the Cloudflare
+// colo (POP) for debugging, or "1" when request.cf is absent (tests/local).
+const EDGE_MARKER_HEADER = "X-Cadish-Edge";
+
 export default {
-  fetch(request, env, ctx) {
-    return handle(request, env, ctx);
+  async fetch(request, env, ctx) {
+    const resp = await handle(request, env, ctx);
+    // Re-wrap with a mutable Headers so the marker lands even on responses whose headers are
+    // immutable (a cached/`fetch`-derived Response); the body stream is passed through unbuffered.
+    const headers = new Headers(resp.headers);
+    headers.set(EDGE_MARKER_HEADER, (request.cf && request.cf.colo) || "1");
+    return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers });
   },
 };

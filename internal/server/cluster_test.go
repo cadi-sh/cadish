@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -100,6 +101,26 @@ func getVia(t *testing.T, node *clusterNode, path string) (int, string) {
 	resp, err := http.Get(node.srv.URL + path)
 	if err != nil {
 		t.Fatalf("GET %s via %s: %v", path, node.name, err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
+}
+
+// getViaHost issues a GET to a specific node but with a SHARED client Host header
+// (as a real deployment behind DNS round-robin does: every node answers the same
+// hostname). This is what exposes cache-key divergence between a direct request and
+// a peer-proxied one — getVia uses the node's own address as Host, which masks it.
+func getViaHost(t *testing.T, node *clusterNode, path, host string) (int, string) {
+	t.Helper()
+	req, err := http.NewRequest("GET", node.srv.URL+path, nil)
+	if err != nil {
+		t.Fatalf("new req: %v", err)
+	}
+	req.Host = host
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s via %s (Host %s): %v", path, node.name, host, err)
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
@@ -238,6 +259,324 @@ func TestCluster_Owner_RoutesToOwnerCachedOnce(t *testing.T) {
 		if got := originHits.Load(); got != 1 {
 			t.Errorf("origin hits after third request = %d, want 1", got)
 		}
+	}
+}
+
+// TestCluster_ReadThrough_PassSkipsPeer proves the v0.2.2 fix: in read_through mode a
+// request whose URL is defined `pass` goes STRAIGHT to origin and must NOT hop to the
+// owning peer (the response is never stored, so the detour is pure wasted latency). We
+// send a `pass` request to a NON-owner node and assert the origin saw NO X-Cadish-Peer
+// header — i.e. the asker fetched origin directly rather than via PeerOrigin (which would
+// stamp the hop, and the owner would forward it to origin as "gra", as the trust-boundary
+// test demonstrates). Without the fix the pass flows through the chained PeerOrigin and
+// the origin observes the hop.
+func TestCluster_ReadThrough_PassSkipsPeer(t *testing.T) {
+	var gotHop atomic.Value // string: the X-Cadish-Peer the origin observed
+	gotHop.Store("")
+	var originHits atomic.Int64
+	originSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		originHits.Add(1)
+		gotHop.Store(r.Header.Get("X-Cadish-Peer"))
+		_, _ = io.WriteString(w, "live "+r.URL.Path)
+	}))
+	defer originSrv.Close()
+
+	// Two read_through nodes sharing the origin, with /live/* defined `pass`.
+	nodes := make([]*clusterNode, 2)
+	for i := range nodes {
+		sh := &settableHandler{}
+		srv := httptest.NewServer(sh)
+		nodes[i] = &clusterNode{srv: srv, sh: sh, name: fmt.Sprintf("node%d", i)}
+		t.Cleanup(srv.Close)
+	}
+	peerList := ""
+	for _, nd := range nodes {
+		peerList += " " + nd.srv.URL
+	}
+	for i, nd := range nodes {
+		cfgText := fmt.Sprintf(`test.local {
+	cache { ram 64MiB }
+	upstream backend { to %s }
+	trust_proxy 127.0.0.0/8 ::1/128
+	pass path /live/*
+	cluster {
+		self   %s
+		peers %s
+		region gra
+		mode   read_through
+	}
+	cache_ttl default ttl 60s
+}
+`, originSrv.URL, nd.srv.URL, peerList)
+		dir := t.TempDir()
+		path := filepath.Join(dir, "Cadishfile")
+		if err := os.WriteFile(path, []byte(cfgText), 0o644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		cfg, err := config.Load(path)
+		if err != nil {
+			t.Fatalf("node %d load: %v\n%s", i, err, cfgText)
+		}
+		t.Cleanup(func() { _ = cfg.Close() })
+		h := NewHandler(cfg, Options{Logger: discardLogger()})
+		t.Cleanup(h.Shutdown)
+		nd.h = h
+		nd.cfg = cfg
+		nd.sh.h.Store(h)
+	}
+
+	const key = "/live/stream.m3u8"
+	ownerURL := ownerOf(nodes, key)
+	var asker *clusterNode
+	for _, nd := range nodes {
+		if nd.srv.URL != ownerURL {
+			asker = nd
+			break
+		}
+	}
+	if asker == nil {
+		t.Fatal("could not pick a non-owner asker")
+	}
+
+	code, body := getVia(t, asker, key)
+	if code != 200 || body != "live "+key {
+		t.Fatalf("pass request: %d %q", code, body)
+	}
+	if got := originHits.Load(); got != 1 {
+		t.Fatalf("origin hits = %d, want 1", got)
+	}
+	if got := gotHop.Load().(string); got != "" {
+		t.Errorf("origin saw X-Cadish-Peer=%q for a pass request: it hopped to the peer; a pass must go straight to origin", got)
+	}
+}
+
+// TestCluster_Owner_StoreOnce_SharedHost proves the v0.2.2 store-once fix: in owner
+// mode, when every node answers the SAME client hostname (a real DNS-round-robin
+// deployment) and the cache key includes the host (the DEFAULT cache_key), an object
+// must be fetched from origin EXACTLY ONCE per region. Before the fix, proxyToPeer
+// dropped the client Host, so the owner keyed a peer-proxied request under the peer's
+// URL host but a direct request under the client host — two cache entries on the
+// owner, two origin fetches. (TestCluster_Owner_RoutesToOwnerCachedOnce masks this by
+// connecting to each node by its own address, so proxied and direct Host coincide.)
+func TestCluster_Owner_StoreOnce_SharedHost(t *testing.T) {
+	var originHits atomic.Int64
+	originSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		originHits.Add(1)
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, "owned "+r.URL.Path)
+	}))
+	defer originSrv.Close()
+
+	// buildClusterNodes uses the DEFAULT cache key (method host path query) — host is keyed.
+	nodes := buildClusterNodes(t, 3, originSrv.URL, "owner", "degraded")
+	const host = "shared.example.com"
+	const key = "/assets/app.js"
+
+	ownerURL := ownerOf(nodes, key)
+	var owner, nonOwner *clusterNode
+	for _, nd := range nodes {
+		if nd.srv.URL == ownerURL {
+			owner = nd
+		} else if nonOwner == nil {
+			nonOwner = nd
+		}
+	}
+	if owner == nil || nonOwner == nil {
+		t.Fatal("owner/non-owner selection failed")
+	}
+
+	// 1) Request lands on a NON-owner with the shared Host → routed to the owner, which
+	// fetches origin once and caches.
+	if code, body := getViaHost(t, nonOwner, key, host); code != 200 || body != "owned "+key {
+		t.Fatalf("non-owner routed: %d %q", code, body)
+	}
+	// 2) Same object, now DIRECT to the owner with the same shared Host → MUST be the
+	// owner's cached copy, NOT a second origin fetch under a different (host) key.
+	if code, body := getViaHost(t, owner, key, host); code != 200 || body != "owned "+key {
+		t.Fatalf("owner direct: %d %q", code, body)
+	}
+	if got := originHits.Load(); got != 1 {
+		t.Errorf("origin hits = %d, want 1 (cached ONCE per region; the peer proxy must preserve the client Host so the owner's cache key matches)", got)
+	}
+}
+
+// TestCluster_Owner_ProxyForwardsClientIP proves the v0.2.2 client-IP fix: when an
+// owner-mode node reverse-proxies a request to the owning peer, it must carry the
+// ORIGINAL client IP in X-Forwarded-For. Otherwise the owner derives the PEER's IP
+// (the dial source), which both diverges the cache key for IP-based tokens ({geo},
+// {sticky}) — a store-multiple bug — and feeds the wrong IP to ACL / rate-limit / geo
+// decisions. We invoke a real non-owner node with a distinct, untrusted client
+// RemoteAddr and a recorder standing in as the owning peer, then assert the recorder
+// received X-Forwarded-For = the original client IP.
+func TestCluster_Owner_ProxyForwardsClientIP(t *testing.T) {
+	gotXFF := make(chan string, 1)
+	recorder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case gotXFF <- r.Header.Get("X-Forwarded-For"):
+		default:
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer recorder.Close()
+
+	// One real cadish node; its cluster peers are [self, recorder]. We then pick a key
+	// the ring assigns to the recorder so the node reverse-proxies to it.
+	sh := &settableHandler{}
+	srv := httptest.NewServer(sh)
+	defer srv.Close()
+	originSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "origin")
+	}))
+	defer originSrv.Close()
+
+	cfgText := fmt.Sprintf(`test.local {
+	cache { ram 16MiB }
+	upstream backend { to %s }
+	trust_proxy 127.0.0.0/8 ::1/128
+	cluster {
+		self   %s
+		peers  %s %s
+		region gra
+		mode   owner
+	}
+	cache_ttl default ttl 60s
+}
+`, originSrv.URL, srv.URL, srv.URL, recorder.URL)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "Cadishfile")
+	if err := os.WriteFile(path, []byte(cfgText), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v\n%s", err, cfgText)
+	}
+	t.Cleanup(func() { _ = cfg.Close() })
+	h := NewHandler(cfg, Options{Logger: discardLogger()})
+	t.Cleanup(h.Shutdown)
+	sh.h.Store(h)
+
+	// Find a key the ring assigns to the recorder (so the node proxies to it).
+	m := h.route.Load().sites[0].Cluster
+	key := ""
+	for i := 0; i < 200; i++ {
+		k := fmt.Sprintf("/obj-%d", i)
+		if owner, ok := m.Owner(k); ok && owner == recorder.URL {
+			key = k
+			break
+		}
+	}
+	if key == "" {
+		t.Fatal("could not find a key owned by the recorder peer")
+	}
+
+	// Direct client request with a DISTINCT, untrusted RemoteAddr (so RealClientIP is
+	// the socket IP, carried only in RemoteAddr — exactly the case proxyToPeer dropped).
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://test.local"+key, nil)
+	req.RemoteAddr = "198.51.100.7:40000"
+	h.ServeHTTP(rec, req)
+
+	select {
+	case xff := <-gotXFF:
+		if xff != "198.51.100.7" {
+			t.Errorf("peer received X-Forwarded-For=%q, want %q (the original client IP must be forwarded so the owner derives the same IP / cache key)", xff, "198.51.100.7")
+		}
+	default:
+		t.Fatalf("recorder peer was not reached (status %d) — owner routing did not proxy", rec.Code)
+	}
+}
+
+// TestCluster_Owner_WriteNotRoutedToPeer proves the F-D3 fix: an unsafe (write) method
+// is NEVER owner-routed, even when the ring assigns its key to another node. Owner
+// routing streams r.Body to the peer with no GetBody replay, so a peer that accepts
+// then fails mid-upload would leave the body consumed and the local fallback would
+// forward a truncated body to origin. Writes therefore take the local origin path,
+// where the body is read exactly once. We assert the would-be peer (a recorder) is
+// NOT reached and the local origin receives the FULL POST body.
+func TestCluster_Owner_WriteNotRoutedToPeer(t *testing.T) {
+	peerHit := make(chan struct{}, 1)
+	recorder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case peerHit <- struct{}{}:
+		default:
+		}
+		_, _ = io.WriteString(w, "peer")
+	}))
+	defer recorder.Close()
+
+	gotBody := make(chan string, 1)
+	originSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		select {
+		case gotBody <- string(b):
+		default:
+		}
+		_, _ = io.WriteString(w, "origin")
+	}))
+	defer originSrv.Close()
+
+	sh := &settableHandler{}
+	srv := httptest.NewServer(sh)
+	defer srv.Close()
+	cfgText := fmt.Sprintf(`test.local {
+	cache { ram 16MiB }
+	upstream backend { to %s }
+	trust_proxy 127.0.0.0/8 ::1/128
+	cluster {
+		self   %s
+		peers  %s %s
+		region gra
+		mode   owner
+	}
+	cache_ttl default ttl 60s
+}
+`, originSrv.URL, srv.URL, srv.URL, recorder.URL)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "Cadishfile")
+	if err := os.WriteFile(path, []byte(cfgText), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v\n%s", err, cfgText)
+	}
+	t.Cleanup(func() { _ = cfg.Close() })
+	h := NewHandler(cfg, Options{Logger: discardLogger()})
+	t.Cleanup(h.Shutdown)
+	sh.h.Store(h)
+
+	// A key the ring assigns to the recorder peer (a GET here WOULD be proxied).
+	m := h.route.Load().sites[0].Cluster
+	key := ""
+	for i := 0; i < 200; i++ {
+		k := fmt.Sprintf("/obj-%d", i)
+		if owner, ok := m.Owner(k); ok && owner == recorder.URL {
+			key = k
+			break
+		}
+	}
+	if key == "" {
+		t.Fatal("could not find a key owned by the recorder peer")
+	}
+
+	const payload = "the full request body that must not be truncated"
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "http://test.local"+key, strings.NewReader(payload))
+	h.ServeHTTP(rec, req)
+
+	select {
+	case <-peerHit:
+		t.Fatal("write method was owner-routed to the peer — writes must serve locally (F-D3)")
+	default:
+	}
+	select {
+	case b := <-gotBody:
+		if b != payload {
+			t.Errorf("origin received body %q, want the full %q", b, payload)
+		}
+	default:
+		t.Fatal("local origin never received the POST — write was not served locally")
 	}
 }
 

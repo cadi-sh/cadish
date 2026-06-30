@@ -1,0 +1,21 @@
+{
+  "name": "71-query-param-token",
+  "cadishfile": "q.example.com {\n    cache_key   host path\n    cache_ttl   default ttl 60s\n    header      +cache_status X-Cache\n    header      X-Genre  {query.genre}\n    header      X-Age    {query.age}\n    header      X-CamLang {query.cam_lang}\n    header      X-Miss   {query.missing}\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "q.example.com", "path": "/video", "query": { "genre": ["comedy"], "age": ["25"], "cam_lang": ["en-US"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "q.example.com", "path": "/video", "query": { "genre": ["drama", "comedy"], "age": ["30"] } },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "HIT"
+    },
+    {
+      "request": { "method": "GET", "host": "q.example.com", "path": "/video", "query": {} },
+      "origin": { "status": 200, "header": { "Content-Type": ["text/html"] } },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

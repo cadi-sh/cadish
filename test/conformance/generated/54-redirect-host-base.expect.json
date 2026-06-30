@@ -5,7 +5,7 @@
       "synthetic": null,
       "redirect": {
         "status": 302,
-        "location": "https://www.nudity.tv/lang/es/p"
+        "location": "https://www.brand-a.example/lang/es/p"
       },
       "upstream": "",
       "cacheKey": "",
@@ -39,7 +39,7 @@
       "synthetic": null,
       "redirect": {
         "status": 302,
-        "location": "https://www.amateur.tv/lang/www/p"
+        "location": "https://www.brand-b.example/lang/www/p"
       },
       "upstream": "",
       "cacheKey": "",
@@ -73,7 +73,7 @@
       "synthetic": null,
       "redirect": {
         "status": 302,
-        "location": "https://www.nudity.tv/lang//p"
+        "location": "https://www.brand-a.example/lang//p"
       },
       "upstream": "",
       "cacheKey": "",
@@ -141,7 +141,7 @@
       "synthetic": null,
       "redirect": {
         "status": 302,
-        "location": "https://www.nudity.tv/lang/es/p"
+        "location": "https://www.brand-a.example/lang/es/p"
       },
       "upstream": "",
       "cacheKey": "",

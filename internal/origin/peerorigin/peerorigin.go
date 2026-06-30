@@ -57,21 +57,53 @@ func New(peers *lb.Upstream, hopHeader, region, self string) *PeerOrigin {
 // peer-unreachable as a connection-class error, either of which lets a chain fall
 // through to the real origin.
 func (p *PeerOrigin) Fetch(ctx context.Context, req *origin.Request) (*origin.Response, error) {
+	// Cache-bypass guard: a `pass` / credential-bypass request is never stored, so a
+	// peer read-through is pure wasted latency (the peer would only pass to origin
+	// too). Surface ErrSkip — a no-op decline (body untouched) so the chain falls
+	// through to the real origin even for a write — the read-through twin of the server
+	// skipping the owner seam for a `pass`. Checked first: no routing, no hop stamp, no
+	// peer dial.
+	if req.Bypass {
+		return nil, origin.ErrSkip
+	}
+
+	// Write guard (F-B1): only the cacheable, body-less methods (GET/HEAD) are
+	// read-through-routed to a peer. A write (POST/PUT/… or any request carrying a
+	// body) gains nothing from a peer — it is never cached — and routing it risks the
+	// same consumed-body hazard the owner-mode path avoids (server/cluster.go): the
+	// peer pool streams req.Body with no replay. Surface ErrSkip — a no-op decline that
+	// did NOT read req.Body — so the chain falls THROUGH to the real origin even though
+	// the request carries a body (ErrNotFound would be terminal for a body request and
+	// 404 the write, dropping it — F-C). The body reaches the real origin intact, the
+	// read-through twin of server/cluster.go's GET/HEAD-only owner routing.
+	if (req.Method != "" && req.Method != http.MethodGet && req.Method != http.MethodHead) || req.Body != nil {
+		return nil, origin.ErrSkip
+	}
+
 	// Loop guard: if THIS request was already forwarded to us by a peer (it carries
 	// the hop header), we must NOT read-through to a peer again — that would bounce
-	// the request around the cluster. Surface ErrNotFound so the chain falls through
-	// to the real origin, serving the object locally. This is the read-through twin
-	// of the server's owner-route hop guard.
+	// the request around the cluster. Surface ErrSkip (no-op decline, body untouched)
+	// so the chain falls through to the real origin, serving the object locally. This
+	// is the read-through twin of the server's owner-route hop guard.
 	if req.Header != nil && req.Header.Get(p.hopHeader) != "" {
-		return nil, origin.ErrNotFound
+		return nil, origin.ErrSkip
 	}
 
 	// If the ring assigns this object to US, do not read-through (a self-fetch
-	// deadlocks against coalescing). Serve it locally: surface ErrNotFound so the
-	// chain falls through to the real origin on this node.
+	// deadlocks against coalescing). Serve it locally: surface ErrSkip (no-op decline,
+	// body untouched) so the chain falls through to the real origin on this node.
+	//
+	// The guard resolves the owner health-aware (healthyOnly=true), matching where
+	// Fetch's pickRing would route, so it fires in the steady state when the topological
+	// owner is down and self is the eligible successor. But the guard is a point-in-time
+	// read; a health flap between it and Fetch's pick could still let pickRing walk onto
+	// self. The WithExcludeBaseURL(ctx, self) below is the race-proof backstop — pick
+	// can never select self regardless of flap timing (F-B2) — so the two together both
+	// avoid a wasted dial in the common case and make a self-dial structurally
+	// impossible.
 	if p.self != "" {
-		if owner, ok := p.peers.Owner(req.Key, false); ok && owner == p.self {
-			return nil, origin.ErrNotFound
+		if owner, ok := p.peers.Owner(req.Key, true); ok && owner == p.self {
+			return nil, origin.ErrSkip
 		}
 	}
 
@@ -79,6 +111,12 @@ func (p *PeerOrigin) Fetch(ctx context.Context, req *origin.Request) (*origin.Re
 	// peer fetch (it equals the object identity), so shard-by-key and the request
 	// path coincide; attach it explicitly so a shard-by-key pool pins correctly.
 	ctx = lb.WithRoutingKey(ctx, req.Key)
+	// Never dial self for a read-through (see the self-guard rationale above): self
+	// stays in the ownership ring but is excluded from the routing decision, closing
+	// the guard/pick health-flap race structurally.
+	if p.self != "" {
+		ctx = lb.WithExcludeBaseURL(ctx, p.self)
+	}
 
 	// Stamp the loop guard. Clone the header so we never mutate the caller's map.
 	hopReq := *req

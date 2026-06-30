@@ -1,0 +1,108 @@
+{
+  "irVersion": 9,
+  "site": {
+    "hosts": [
+      "example.com"
+    ],
+    "redirectHosts": [
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "testverify": {
+      "kind": "ip",
+      "serverOnly": true
+    },
+    "us": {
+      "kind": "geo",
+      "geoGranularity": "country",
+      "geoValues": [
+        "US"
+      ]
+    },
+    "verified": {
+      "kind": "cookie",
+      "name": "verified"
+    }
+  },
+  "classifiers": {
+    "age": {
+      "rows": [
+        {
+          "conj": [
+            "testverify",
+            "verified"
+          ],
+          "value": "0"
+        },
+        {
+          "conj": [
+            "us",
+            "verified"
+          ],
+          "value": "0"
+        },
+        {
+          "conj": [
+            "testverify"
+          ],
+          "value": "1"
+        },
+        {
+          "conj": [
+            "us"
+          ],
+          "value": "1"
+        }
+      ],
+      "default": "2"
+    }
+  },
+  "recv": {
+    "pass": [
+      {
+        "always": true
+      }
+    ]
+  },
+  "key": {
+    "tokens": null
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1h0m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "cache_status",
+            "name": "X-Cache"
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {
+    "cacheStatusHeader": "X-Cache"
+  },
+  "usesGeo": true,
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  },
+  "delegate": [
+    {
+      "directive": "ip",
+      "reason": "matcher @testverify uses the `ip` matcher (a server-side Gateway matcher with no edge JavaScript runtime case); it is failed-closed at the edge, so any directive matching on it must run on the Cadish server behind"
+    }
+  ]
+}

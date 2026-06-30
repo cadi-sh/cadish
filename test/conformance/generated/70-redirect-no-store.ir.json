@@ -1,0 +1,68 @@
+{
+  "irVersion": 9,
+  "site": {
+    "hosts": [
+      "example.com"
+    ],
+    "redirectHosts": [
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "lang": {
+      "kind": "cookie",
+      "name": "lang",
+      "values": [
+        "es"
+      ]
+    }
+  },
+  "recv": {
+    "redirect": [
+      {
+        "scope": {
+          "names": [
+            "lang"
+          ]
+        },
+        "status": 302,
+        "target": "https://es.example.com{uri}",
+        "noStore": true
+      },
+      {
+        "regex": "^/p/(\\d+)$",
+        "status": 301,
+        "target": "https://example.com/product/$1"
+      }
+    ]
+  },
+  "key": {
+    "tokens": [
+      {
+        "kind": "method"
+      },
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s"
+      }
+    ]
+  },
+  "deliver": {},
+  "usesGeo": false,
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

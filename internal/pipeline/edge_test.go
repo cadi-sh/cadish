@@ -162,6 +162,63 @@ func TestEdgeBlockUsesKVImpliedByDistribute(t *testing.T) {
 	}
 }
 
+// TestEdgeBypassPatternsParse: `bypass /a* /b` is accepted, multiple lines accumulate,
+// and the patterns are surfaced via EdgeBypassPatterns in declaration order.
+func TestEdgeBypassPatternsParse(t *testing.T) {
+	p := compileSite(t, `example.com {
+    edge {
+        worker w
+        zone   example.com
+        bypass /transmit* /v2/*
+        bypass /atvpanel
+    }
+    cache_ttl default ttl 1m
+}`)
+	got := p.EdgeBypassPatterns()
+	want := []string{"/transmit*", "/v2/*", "/atvpanel"}
+	if len(got) != len(want) {
+		t.Fatalf("EdgeBypassPatterns = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("EdgeBypassPatterns[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	// No bypass declared => nil.
+	np := compileSite(t, `example.com {
+    edge { worker w }
+    cache_ttl default ttl 1m
+}`).EdgeBypassPatterns()
+	if len(np) != 0 {
+		t.Fatalf("no bypass: want empty, got %v", np)
+	}
+}
+
+// TestEdgeBypassPatternErrors: a malformed bypass pattern is a compile error.
+func TestEdgeBypassPatternErrors(t *testing.T) {
+	cases := []struct{ name, src string }{
+		{"no args", `example.com { edge { bypass } }`},
+		{"leading wildcard", `example.com { edge { bypass */x } }`},
+		{"no leading slash", `example.com { edge { bypass a } }`},
+		{"interior wildcard", `example.com { edge { bypass /a*/b } }`},
+		{"double wildcard", `example.com { edge { bypass /a** } }`},
+		{"second arg bad", `example.com { edge { bypass /ok b } }`},
+		{"catch-all root", `example.com { edge { bypass / } }`},       // next#4
+		{"catch-all root glob", `example.com { edge { bypass /* } }`}, // next#4
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, err := cadishfile.Parse("e.cadish", []byte(tc.src))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if _, err := Compile(f.Sites[0]); err == nil {
+				t.Errorf("expected a compile error for %q", tc.src)
+			}
+		})
+	}
+}
+
 func TestEdgeBlockErrors(t *testing.T) {
 	cases := []struct{ name, src string }{
 		{"bad tier", `example.com { edge { default bogus } }`},

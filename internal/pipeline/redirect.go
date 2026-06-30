@@ -22,11 +22,16 @@ import (
 //
 // Evaluated in RECV, first-match-wins; a match short-circuits the lifecycle with
 // a synthetic 3xx (no cache, no origin) — the redirect sibling of `respond`.
+//
+// noStore, when true, carries the `no_store` modifier: the server (and edge)
+// attaches Cache-Control: no-store, no-cache, must-revalidate, private to the
+// short-circuit response so no intermediary or browser caches the redirect.
 type redirectRule struct {
-	re     *regexp.Regexp // path-regex selector: matched against the request path; nil when absent
-	sc     *scope         // scope selector: the matcher scope that fires this redirect; nil when absent
-	status int            // 301/302/303/307/308
-	target string         // template: {host}/{path}/{query}/{uri} (+ $0..$9 captures when re is set)
+	re      *regexp.Regexp // path-regex selector: matched against the request path; nil when absent
+	sc      *scope         // scope selector: the matcher scope that fires this redirect; nil when absent
+	status  int            // 301/302/303/307/308
+	target  string         // template: {host}/{path}/{query}/{uri} (+ $0..$9 captures when re is set)
+	noStore bool           // true when the directive carried a trailing `no_store` modifier
 }
 
 // eval returns a *Redirect if the rule fires for the request, or nil. For the
@@ -59,11 +64,13 @@ func (r *redirectRule) eval(c *matchContext, p *Pipeline) *Redirect {
 		Host:         p.redirectHost(req),
 		Path:         req.Path,
 		Query:        canonicalQuery(req),
+		QueryParams:  req.Query,
 		Header:       req.Header,
 		ClientIP:     req.ClientIP,
 		Geo:          req.Geo,
 		GeoContinent: req.GeoContinent,
 		GeoRegion:    req.GeoRegion,
+		Device:       req.Device,
 		Scheme:       scheme,
 	}
 	// Scope and regex are ANDed: in the combined form (both set) the rule fires only
@@ -82,7 +89,110 @@ func (r *redirectRule) eval(c *matchContext, p *Pipeline) *Redirect {
 	// Pass the LIVE resolver (the one header/cache_key use) so {classify.NAME} resolves
 	// to its computed value instead of expanding empty. It is built inline and passed
 	// by value — the per-request matchContext is never stored on env.
-	return &Redirect{Status: r.status, Location: expandTemplate(r.target, env, classifyResolver{ctx: c, classifiers: p.classifiers})}
+	loc := normalizeRedirectLocation(expandTemplate(r.target, env, classifyResolver{ctx: c, classifiers: p.classifiers}))
+
+	// Open-redirect RUNTIME defense (the robust backstop to the compile-time
+	// redirectTargetUnsafeAuthorityToken guard). That guard treats a $N regex backref and
+	// literal text in the authority span as safe, so a target like
+	// `https://{host}$1$2?{query}` compiles — yet at RUNTIME a request such as
+	// `/index.php@evil.example.com/` can drive a capture into the authority, turning the
+	// validated {host} into mere USERINFO and the attacker string into the real navigation
+	// origin (and a relative target like {query.next} can expand to an absolute off-origin
+	// Location). After expanding the Location, re-derive its authority with EVERY
+	// request-sourced input neutralized (captures + request tokens → "", validated host
+	// family + scheme KEPT). If the live authority differs from that reference authority, the
+	// request injected an off-origin host → SUPPRESS the redirect (return nil) so the request
+	// falls through to normal handling. Only computed for an absolute/protocol-relative
+	// Location (gotHas) — a relative result has no authority and is always safe; the redirect
+	// path is a short-circuit, not the hot path, so this is not on the critical path.
+	if gotAuth, gotHas := locationAuthority(loc); gotHas {
+		ref := *env
+		ref.Capture = nil
+		ref.Path = ""
+		ref.Query = ""
+		ref.QueryParams = nil
+		ref.Header = nil
+		ref.ClientIP = ""
+		ref.Geo = ""
+		ref.GeoContinent = ""
+		ref.GeoRegion = ""
+		ref.Device = ""
+		// Host and Scheme are KEPT — the validated host family and scheme are trusted.
+		refLoc := normalizeRedirectLocation(expandTemplate(r.target, &ref, classifyResolver{}))
+		refAuth, refHas := locationAuthority(refLoc)
+		if !refHas || refAuth != gotAuth {
+			return nil
+		}
+	}
+	return &Redirect{Status: r.status, Location: loc, NoStore: r.noStore}
+}
+
+// redirectAuthorityRest strips a redirect target/Location down to the remainder that BEGINS
+// its AUTHORITY span, returning that remainder and whether an authority is present at all. A
+// SPECIAL scheme (http/https) introduces the authority right after the ':' regardless of the
+// slash count or direction (browsers fold '\'→'/'), so it folds '\'→'/' and trims ALL leading
+// slashes after the boundary; a bare protocol-relative "//" (or "\\", "/\", "\/") likewise
+// introduces an authority. A relative URL (no scheme, no leading "//") has none → ("", false).
+// Shared by the compile-time guard (redirectTargetUnsafeAuthorityToken) and the runtime
+// authority extractor (locationAuthority) so both apply identical boundary logic.
+func redirectAuthorityRest(s string) (string, bool) {
+	if m := redirectSchemePrefix.FindString(s); m != "" {
+		rest := strings.ReplaceAll(s[len(m):], "\\", "/")
+		return strings.TrimLeft(rest, "/"), true
+	}
+	norm := strings.ReplaceAll(s, "\\", "/")
+	if !strings.HasPrefix(norm, "//") {
+		return "", false
+	}
+	return strings.TrimLeft(norm, "/"), true
+}
+
+// locationAuthority extracts the AUTHORITY span (host[:port], INCLUDING any leading userinfo
+// before an '@') of a CONCRETE, already-expanded Location string, reusing the exact
+// scheme/slash boundary logic the static guard relies on (redirectAuthorityRest). The span
+// runs to the first '/', '?' or '#' (or the whole remainder). It returns ("", false) for a
+// relative result (no authority). Keeping the full span — userinfo included — is what makes
+// `brand-a.example@evil.example.com` compare UNEQUAL to the reference `brand-a.example`, catching the
+// userinfo open-redirect trick.
+func locationAuthority(s string) (string, bool) {
+	rest, has := redirectAuthorityRest(s)
+	if !has {
+		return "", false
+	}
+	if j := strings.IndexAny(rest, "/?#"); j >= 0 {
+		return rest[:j], true
+	}
+	return rest, true
+}
+
+// normalizeRedirectLocation reduces an expanded Location to EXACTLY the bytes the HTTP
+// layer will put on the wire, so the open-redirect authority inspection examines the same
+// value a user agent will navigate to (and so the emitted Location cannot smuggle an
+// authority past the inspector). Go's net/http Header.Set trims leading/trailing optional
+// whitespace (OWS) before transmission, and user agents IGNORE control bytes embedded in a
+// URL — so a Location such as "  //evil.example.com/" (leading OWS) or one carrying an
+// embedded TAB/CR/LF would report NO authority to a naive inspector yet resolve off-origin
+// once the wire/UA strips those bytes (and an embedded CR/LF is a header-splitting vector).
+// We therefore (1) remove every byte a UA ignores or that mangles a header — TAB (0x09),
+// LF (0x0A), CR (0x0D), FF (0x0C), NUL (0x00) — anywhere in the string, then (2) trim EVERY
+// leading/trailing byte <= 0x20 (ASCII space + the whole C0 control range). Step (2) is the
+// critical one: per the WHATWG URL spec a user agent strips ALL leading C0-control-or-space
+// before parsing, so a Location like "\x0b//evil.example.com/" (leading vertical tab, or any
+// 0x01-0x08/0x0B/0x0E-0x1F) would report NO authority to a naive inspector yet navigate
+// off-origin once the UA strips the byte — the open-redirect class the runtime guard exists
+// to close. Trimming only space+tab (the old behaviour) left those C0 bytes in place and let
+// the authority check be skipped. The normalized result is used BOTH for the authority check
+// AND as the emitted Location, and is applied identically to the JS edge (interpreter.js
+// normalizeRedirectLocation) so Go and the worker stay byte-identical.
+func normalizeRedirectLocation(s string) string {
+	s = strings.Map(func(r rune) rune {
+		switch r {
+		case '\t', '\n', '\r', '\f', 0x00:
+			return -1 // drop
+		}
+		return r
+	}, s)
+	return strings.TrimFunc(s, func(r rune) bool { return r <= 0x20 })
 }
 
 // redirectSchemePrefix matches a leading URL scheme followed by its ':' separator
@@ -92,51 +202,119 @@ func (r *redirectRule) eval(c *matchContext, p *Pipeline) *Redirect {
 // the real boundary.
 var redirectSchemePrefix = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*:`)
 
-// redirectTargetHasUnsafeHostToken reports whether a redirect TARGET template places a
-// raw {http.NAME} token in the AUTHORITY (host[:port]) position of an absolute or
-// protocol-relative Location. Such a token resolves a request header verbatim (e.g.
-// {http.x-forwarded-host}) with NO host validation, so a redirect like
-// `https://{http.x-forwarded-host}/login` reflects an attacker-supplied Host into the
-// Location — an open redirect (R26 of the 2026-06-26 review battery).
+// redirectAuthorityAllowedToken reports whether a template token NAME may appear in a
+// redirect Location AUTHORITY (host position). ONLY the validated host family is
+// permitted: {host}/{host.base}/{host.sub} all derive from Pipeline.redirectHost — the
+// site's allowlist, the F12 open-redirect defense — so they can never become an
+// attacker-controlled origin. Every OTHER token ({query.*}, {http.*}, {client_ip},
+// {geo*}, {classify.*}, {device}, {currency}, …) is request-sourced and host-unvalidated.
+func redirectAuthorityAllowedToken(name string) bool {
+	switch name {
+	case "host", "host.base", "host.sub":
+		return true
+	default:
+		return false
+	}
+}
+
+// redirectAuthorityTerminatesToken reports whether a template token's runtime expansion
+// BEGINS with a path separator and therefore ENDS the authority, exactly like a literal
+// '/'. {uri} (request path + query) and {path} (request path) are always rooted at '/',
+// so `https://{host.base}{uri}` is the validated host {host.base} with the path supplied
+// by {uri}: the token is the authority/path boundary, not part of the host.
+func redirectAuthorityTerminatesToken(name string) bool {
+	switch name {
+	case "uri", "path":
+		return true
+	default:
+		return false
+	}
+}
+
+// redirectTargetUnsafeAuthorityToken reports whether a redirect TARGET template places a
+// request-sourced template token in the AUTHORITY (host[:port], incl. any userinfo) of an
+// absolute or protocol-relative Location, returning the offending token. The authority is
+// a navigation origin, so reflecting ANY unvalidated, attacker-influenceable value there
+// is an open redirect (R26 of the 2026-06-26 review battery; Fix B extends the original
+// {http.*}-only guard to ALL non-host tokens, e.g. the {query.NAME} token).
+//
+// Whitelist (robust, future-proof): in the authority span the ONLY permitted template
+// tokens are the validated host family ({host}/{host.base}/{host.sub}); literal text is
+// fine. Any OTHER {…} token is rejected. A $N regex backref is permitted only when a
+// validated {host} token already anchors the authority (e.g. `https://{host}$1` rebuilds
+// the path from a capture); an UNANCHORED $N forms an unvalidated host and is rejected,
+// because the runtime authority guard would otherwise suppress such a redirect on every
+// request — a directive that compiles but is permanently dead (F-D2). A token whose
+// expansion is rooted at '/' ({uri}/{path}) terminates the authority — everything after
+// it is PATH, where request reflection can never become the navigation origin, so it is
+// unrestricted.
 //
 // Browsers treat a SPECIAL scheme (http/https) as introducing the authority immediately
 // after the ':', independent of the slash count or direction, so the classic filter-
-// bypass variants — `https:/{http.x-forwarded-host}/login`, `https:{http.host}/login`,
-// `https:\{http.host}`, `https:/\{http.host}` — all reflect the header into the
-// navigation origin exactly like the naive `https://{http.host}`. We therefore detect a
-// leading `scheme:`, fold backslashes to forward slashes, and strip ALL leading slashes
-// after the scheme before extracting the authority span (up to the first '/','?','#').
+// bypass variants — `https:/{query.next}/x`, `https:{query.next}/x`, `https:\{…}`,
+// `https:/\{…}` — all reflect the token into the navigation origin exactly like the naive
+// `https://{query.next}`. We therefore detect a leading `scheme:`, fold backslashes to
+// forward slashes, and strip ALL leading slashes after the scheme before scanning the
+// authority. A relative target (no scheme, no leading "//"/"\\") has no authority — a
+// leading {token} there renders as a path segment, not a host — so it is allowed.
 //
-// Only the unvalidated {http.*} family in the authority is rejected. The validated host
-// tokens ({host}/{host.base}/{host.sub} — all derived from the site's allowlist via
-// Pipeline.redirectHost, the F12 defense) stay allowed (so `https://{host.base}{uri}`
-// compiles: the host is still the validated token; {uri} expands to the path/query at
-// runtime), and a {http.*} in the PATH or QUERY of the Location is harmless (it can never
-// become the navigation origin), so it is still allowed. A relative target (no scheme, no
-// leading "//"/"\\") has no authority — a leading {http.host} there renders as a path
-// segment, not a host — so it is allowed.
-func redirectTargetHasUnsafeHostToken(target string) bool {
-	rest := target
-	if m := redirectSchemePrefix.FindString(rest); m != "" {
-		// Authority follows the scheme ':'. Fold '\'→'/' and drop every leading slash so
-		// `https:`, `https:/`, `https://`, `https:\\`, `https:/\` all reduce alike.
-		rest = strings.ReplaceAll(rest[len(m):], "\\", "/")
-		rest = strings.TrimLeft(rest, "/")
-	} else {
-		// No scheme. A protocol-relative authority starts with two slash-likes ("//",
-		// "\\", "/\", "\/" — browsers fold '\' to '/'); a single leading slash is a
-		// path-absolute relative URL with no authority.
-		norm := strings.ReplaceAll(rest, "\\", "/")
-		if !strings.HasPrefix(norm, "//") {
-			return false
+// The whole authority span (including any userinfo before an '@') is whitelisted: a token
+// in userinfo is harmless for the navigation origin but conservatively rejected, while a
+// token AFTER the '@' is the real host and MUST be rejected — scanning the full span
+// covers both without parsing the '@' boundary.
+func redirectTargetUnsafeAuthorityToken(target string) (string, bool) {
+	// Reduce to the authority span using the SAME scheme/slash boundary logic the runtime
+	// extractor uses (so `https:`, `https:/`, `https://`, `https:\\`, `https:/\`, and a bare
+	// protocol-relative "//" all reduce alike). A relative target has no authority → safe.
+	rest, has := redirectAuthorityRest(target)
+	if !has {
+		return "", false
+	}
+	// Walk the authority. It ends at the first literal '/', '?' or '#', or at a
+	// path-introducing token ({uri}/{path}). Any other {…} token in this span is an
+	// unvalidated, request-sourced host — reject it. Literal text passes.
+	//
+	// A $N regex backref forming the host is special (F-D2): when it is NOT anchored by
+	// a preceding validated-host token it always builds an unvalidated authority, and
+	// the runtime authority guard (which neutralizes captures to derive the reference
+	// authority) then suppresses the redirect on EVERY request — so the directive
+	// compiles but is permanently dead. Reject an UNANCHORED $N in the host position so
+	// the misconfiguration is loud at `check` instead of silently never firing. A $N
+	// that follows a validated {host} token (e.g. `https://{host}$1$2` rebuilding a
+	// path from captures) is left to the runtime guard, which fires it when the capture
+	// is a rooted path and suppresses it if it escapes the host.
+	sawHost := false
+	for i := 0; i < len(rest); {
+		c := rest[i]
+		if c == '/' || c == '?' || c == '#' {
+			return "", false // authority ended cleanly
 		}
-		rest = strings.TrimLeft(norm, "/")
+		if c == '{' {
+			end := strings.IndexByte(rest[i:], '}')
+			if end < 0 {
+				// Unterminated '{' in host position: no legitimate host carries a literal
+				// '{', so treat the dangling token as unsafe (conservative).
+				return rest[i:], true
+			}
+			name := rest[i+1 : i+end]
+			if redirectAuthorityTerminatesToken(name) {
+				return "", false // {uri}/{path}: authority ends here, rest is PATH
+			}
+			if !redirectAuthorityAllowedToken(name) {
+				return "{" + name + "}", true
+			}
+			sawHost = true // a validated {host}/{host.base}/{host.sub} anchors the authority
+			i += end + 1
+			continue
+		}
+		if c == '$' && i+1 < len(rest) && rest[i+1] >= '0' && rest[i+1] <= '9' && !sawHost {
+			// Unanchored capture in the host position → a config that compiles but the
+			// runtime guard suppresses on every request. Reject it loudly.
+			return rest[i : i+2], true
+		}
+		i++
 	}
-	// The authority ends at the first '/', '?', or '#'.
-	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
-		rest = rest[:i]
-	}
-	return strings.Contains(rest, "{http.")
+	return "", false
 }
 
 // validRedirectCode reports whether code is a redirect status cadish emits.
@@ -147,6 +325,15 @@ func validRedirectCode(code int) bool {
 	default:
 		return false
 	}
+}
+
+// isRedirectCodeToken reports whether raw is a literal valid 3xx redirect code (e.g.
+// "301"). It backs the scoped-redirect disambiguation: it tells a leading CODE from a
+// leading PATH_REGEX more precisely than "all digits", so an all-digit PATH_REGEX
+// (e.g. "12") in the combined form is not misread as a status code.
+func isRedirectCodeToken(raw string) bool {
+	n, err := strconv.Atoi(raw)
+	return err == nil && validRedirectCode(n)
 }
 
 // compileRedirect parses a `redirect` directive in one of four forms:
@@ -194,15 +381,23 @@ func compileRedirect(d *cadishfile.Directive, matchers map[string]*matcher) ([]r
 	if target == "" {
 		return nil, &CompileError{Pos: d.Args[2].Pos, Msg: "redirect: TARGET must be non-empty"}
 	}
-	if redirectTargetHasUnsafeHostToken(target) {
-		return nil, &CompileError{Pos: d.Args[2].Pos, Msg: "redirect: a raw {http.*} request-header token in the Location host is an open redirect — use the validated {host}/{host.base}/{host.sub} instead: " + quote(target)}
+	if bad, unsafe := redirectTargetUnsafeAuthorityToken(target); unsafe {
+		return nil, &CompileError{Pos: d.Args[2].Pos, Msg: "redirect: the request-sourced token " + quote(bad) + " in the Location host is an open redirect — only the validated {host}/{host.base}/{host.sub} may appear in the authority: " + quote(target)}
 	}
-	// A stray token after TARGET is almost always a typo (e.g. a second target or an
-	// unquoted space); surface it at check time rather than silently dropping it.
+	// The only allowed token after TARGET is `no_store` (a caching modifier). Any
+	// other token is almost certainly a typo and is surfaced as an error.
+	var noStore bool
 	if len(d.Args) > 3 {
-		return nil, &CompileError{Pos: d.Args[3].Pos, Msg: "redirect: unexpected extra argument(s) after TARGET: " + quote(d.Args[3].Raw)}
+		if d.Args[3].Raw == "no_store" {
+			noStore = true
+		} else {
+			return nil, &CompileError{Pos: d.Args[3].Pos, Msg: "redirect: unexpected extra argument(s) after TARGET: " + quote(d.Args[3].Raw)}
+		}
 	}
-	return []redirectRule{{re: re, status: code, target: target}}, nil
+	if len(d.Args) > 4 {
+		return nil, &CompileError{Pos: d.Args[4].Pos, Msg: "redirect: unexpected extra argument(s) after TARGET: " + quote(d.Args[4].Raw)}
+	}
+	return []redirectRule{{re: re, status: code, target: target, noStore: noStore}}, nil
 }
 
 // compileRedirectScoped parses the two `@scope`-led redirect forms: one or more
@@ -226,10 +421,17 @@ func compileRedirectScoped(d *cadishfile.Directive, matchers map[string]*matcher
 	if len(rest) < 2 {
 		return nil, &CompileError{Pos: d.Pos, Msg: "redirect scoped form needs `@scope CODE TARGET` (or `@scope PATH_REGEX CODE TARGET`)"}
 	}
-	// Combined form: a path regex precedes the CODE TARGET (≥3 trailing args). The
-	// scope-only form has exactly the `CODE TARGET` pair.
+	// Combined form: a path regex precedes the CODE TARGET (≥3 trailing args and
+	// the first arg is NOT a valid 3xx redirect code). The scope-only form starts
+	// directly with the numeric CODE. We disambiguate on a VALID redirect code (not
+	// merely "all digits") so a combined form whose PATH_REGEX first token is itself
+	// all-digits (e.g. `@scope 12 301 /x` — a redirect matching a numeric path) is
+	// NOT misread as the scope-only `@scope CODE TARGET` form. We must also not confuse
+	// `no_store` in position 2 of the scope-only form (`CODE TARGET no_store`) with a
+	// combined form's PATH_REGEX (which would also yield len(rest)==3): there the first
+	// arg IS a valid code, so it stays scope-only.
 	var re *regexp.Regexp
-	if len(rest) >= 3 {
+	if len(rest) >= 3 && !isRedirectCodeToken(rest[0].Raw) {
 		re, err = regexp.Compile(rest[0].Raw)
 		if err != nil {
 			return nil, &CompileError{Pos: rest[0].Pos, Msg: "redirect: invalid path regex " + quote(rest[0].Raw) + ": " + err.Error()}
@@ -247,15 +449,23 @@ func compileRedirectScoped(d *cadishfile.Directive, matchers map[string]*matcher
 	if target == "" {
 		return nil, &CompileError{Pos: rest[1].Pos, Msg: "redirect: TARGET must be non-empty"}
 	}
-	if redirectTargetHasUnsafeHostToken(target) {
-		return nil, &CompileError{Pos: rest[1].Pos, Msg: "redirect: a raw {http.*} request-header token in the Location host is an open redirect — use the validated {host}/{host.base}/{host.sub} instead: " + quote(target)}
+	if bad, unsafe := redirectTargetUnsafeAuthorityToken(target); unsafe {
+		return nil, &CompileError{Pos: rest[1].Pos, Msg: "redirect: the request-sourced token " + quote(bad) + " in the Location host is an open redirect — only the validated {host}/{host.base}/{host.sub} may appear in the authority: " + quote(target)}
 	}
-	// A stray token after TARGET (in either the scope-only or the combined form) is
-	// almost always a typo; surface it instead of silently dropping it.
+	// The only allowed token after TARGET (in either the scope-only or the combined
+	// form) is `no_store` (a caching modifier). Any other token is surfaced as a typo.
+	var noStore bool
 	if len(rest) > 2 {
-		return nil, &CompileError{Pos: rest[2].Pos, Msg: "redirect: unexpected extra argument(s) after TARGET: " + quote(rest[2].Raw)}
+		if rest[2].Raw == "no_store" {
+			noStore = true
+		} else {
+			return nil, &CompileError{Pos: rest[2].Pos, Msg: "redirect: unexpected extra argument(s) after TARGET: " + quote(rest[2].Raw)}
+		}
 	}
-	return []redirectRule{{re: re, sc: sc, status: code, target: target}}, nil
+	if len(rest) > 3 {
+		return nil, &CompileError{Pos: rest[3].Pos, Msg: "redirect: unexpected extra argument(s) after TARGET: " + quote(rest[3].Raw)}
+	}
+	return []redirectRule{{re: re, sc: sc, status: code, target: target, noStore: noStore}}, nil
 }
 
 // compileRedirectMap parses the `redirect CODE map { PFX -> NEWPFX … }` form.

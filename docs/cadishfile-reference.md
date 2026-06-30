@@ -388,7 +388,7 @@ though inline regex/host matchers take a single arg; richer scopes need a name.
 | `resp_header` | a named **response** header's value matches: `resp_header X-Powered-By Express` (exact), `resp_header X-Powered-By Exp*` (`*`-glob), `resp_header X-Powered-By *` or `resp_header X-Powered-By` (presence) | **response-phase**: branch freshness on what the **origin returned**, e.g. SSR vs PHP by `X-Powered-By`. Header **name** match is case-insensitive; the **value** is exact or `*`-glob (same engine as `query_present`); a multi-valued header matches if any value matches. In a `cache_ttl`/`storage` selector it consumes exactly `NAME VALUE` and may be ANDed with a trailing `status`/`@scope` in the same rule (`cache_ttl resp_header X-Powered-By Express status 404 ttl 1m grace 24h`). Same scoping rules as `content_type` (response/DELIVER directives only; a request-phase use is a compile error). |
 | `classify` | a derived [`classify`](#classify) token equals (`{TOK}==v`) or differs from (`{TOK}!=v`) a value | turns a derived enum token into a reusable scope: `@gated classify {age}==gate`. Request-phase (usable anywhere `header` is). |
 | `geo` | the resolved geo class at a granularity is in the arg list: `geo country US ES`, `geo continent EU`, `geo region US-UT US-TX` | request-phase. The granularity (`country`/`continent`/`region`) selects which resolved class is tested (same source as `{geo}`/`{geo.continent}`/`{geo.region}`); the remaining args are an OR set, compared case-insensitively. Needs a [`geo`](#geo) source (and `region_header` for `region`). Feeds `classify` for geo→business mapping (below). |
-| `query_present` | **any** named query param is present: `query_present adult_content t a ff-* pub-*` | request-phase (usable anywhere `header` is). Presence-OR: matches as soon as one named param exists (even with an empty value, `?a=`). A trailing/embedded `*` is a glob over the param *name* (`ff-*` matches `ff-foo` but not `ff`); a bare `query_present *` matches any param. Tests the param *name*, never the value — pair it with [`classify`](#classify) to collapse "any of these present" to a 0/1 flag (the `publi` boolean, below). |
+| `query_present` | **any** named query param is present: `query_present adult_content t a ff-* pub-*` | request-phase (usable anywhere `header` is). Presence-OR: matches as soon as one named param exists (even with an empty value, `?a=`). A trailing/embedded `*` is a glob over the param *name* (`ff-*` matches `ff-foo` but not `ff`); a bare `query_present *` matches any param. Tests the param *name*, never the value — pair it with [`classify`](#classify) to collapse "any of these present" to a 0/1 flag (the `publi` boolean, below). **Non-empty modifier:** append `+` to a name to require a non-empty value — `query_present adult_content+ t+ ff-*+` matches `?t=abc` but NOT `?t=` (empty value) or `?t` (no value). Mixed: `query_present foo+ bar` — `foo+` requires non-empty, `bar` is plain presence (empty value still matches). The `+` is stripped to recover the name/glob; param names never contain a literal `+` in practice (URL-encoded as `%2B`). Mirrors the Varnish `=[^&]+` semantics for marketing/publi param detection. |
 | `query` | a **named** query param's **value** is in the arg list: `query channel beta canary` | request-phase. Tests ONE param name against an OR set of exact values (`query NAME VALUE…`); with no value (`query NAME`) it is a presence test of that one param. A repeated param (`?a=1&a=2`) matches if any value is accepted. Complements `query_present` (presence-OR over several *names*). Used by the Gateway controller for an HTTPRoute `queryParams` Exact match. |
 | `ip` | the **real client IP** is in any IP/CIDR arg: `ip 203.0.113.43/32 10.0.0.0/8 ::1 2001:db8::/32` | request-phase, IPv4 + IPv6, CIDR or bare IP (bare = a host route `/32`/`/128`); args are an OR set. Matches the **trusted-proxy-resolved real client IP** — the *same* resolution as `{geo}` (`geo { trust_proxy … }`), never the immediate peer — so behind a CDN/LB it ACLs the actual client, not the proxy. The IP/CIDR ACL primitive for the [security gate](#security-gate-allow--deny--block) (`allow`/`deny`). **Server-only:** an `ip` matcher is never projected to the edge. |
 | `all` | **every** referenced (optionally `!`-negated) sub-matcher matches (AND): `@m all @path @hdr !@internal` | request-phase composite. References other named matchers and ANDs them into ONE reusable matcher, so a single `route @m -> u` (and a correct terminal `respond !@m 404`) expresses a multi-criteria condition. Sub-refs must be plain matchers (no nesting); a response-phase sub-matcher is a compile error. The Gateway controller emits it for a multi-criteria HTTPRoute match (path AND headers AND method AND query). |
@@ -1128,9 +1128,14 @@ cluster {
     region   gra                             # scopes the cluster; the hop-guard value
     mode     read_through | owner            # default read_through
     fallback strict | degraded               # owner mode, owner-down (default degraded)
-    health   GET /healthz expect 200 interval 1s window 3 threshold 2
+    health   GET /.cadish/readyz expect 200 interval 1s window 3 threshold 2
 }
 ```
+
+> **Health path.** `/.cadish/readyz` is cadish's built-in readiness endpoint (200 when
+> warm, 503 while warming) — host-agnostic, no Cadishfile rule needed. Use it for both the
+> peer `health` probe above and an **external** DNS/L4 health checker that decides whether a
+> node receives client traffic (see the 3-node deployment guide in `deploy/README.md`).
 
 | Directive | Meaning |
 |-----------|---------|
@@ -1154,6 +1159,28 @@ on the ring. A request landing on a non-owner is **reverse-proxied to the owner*
 own L7 director. If the owner is **down**: `fallback strict` serves the request
 locally (accepts a transient duplicate); `fallback degraded` tries the next ring
 node, then local.
+
+**A `pass` goes straight to origin — never via a peer (both modes).** A request whose
+URL is defined `pass` (and the credential bypass that is never stored) is fetched
+directly from origin: owner mode skips the owner seam, and read-through skips the
+peer `PeerOrigin` (since v0.2.2). A "possibly cacheable" request still follows the
+full path to the owner even if its response later proves uncacheable. So you don't
+"go around" the cluster for uncacheable routes — only the routes the cluster can
+actually cache once are sharded.
+
+> **Store-once requires the peer to trust + isolate its peers.** When a non-owner
+> reverse-proxies to the owner, the owner re-derives the cache key from the request
+> (its `Host` and client IP). cadish forwards the original client `Host` and the
+> resolved client IP (`X-Forwarded-For`) on the peer hop **so a proxied request and a
+> direct request hash to the same key** (otherwise the owner would store one object
+> twice — once per host/IP it sees). For the owner to honor that forwarded client IP,
+> the peer subnet **must** be in `trust_proxy` (the same trust that enables the
+> `X-Cadish-Peer` hop guard) **and** isolated to cadish nodes only. This supersedes
+> any older advice to keep the peer subnet out of `trust_proxy`: for a cluster, trust
+> **and** isolate the peer network. (Request **scheme** is not reconstructed across
+> the plain-HTTP peer hop — it is not a cache-key input, but `{proto}`/scheme-based
+> redirects differ for a proxied request; prefer a uniform-scheme entry such as DNS
+> round-robin over one scheme.)
 
 **Loop / storm safety.** A request forwarded to a peer carries `X-Cadish-Peer:
 <region>`; a node that sees it serves locally and **never re-forwards** (no
@@ -1188,10 +1215,14 @@ self-owned key is served locally.
 >
 > The security gate (IP ACLs, `allow`/`deny` rules) runs **before** cluster routing,
 > so those controls still fire for forged peer requests — but they are only effective
-> if the real client IP resolves correctly. Do not list the peer subnet in
-> `trust_proxy` unless it is also a legitimate trusted proxy; doing so would let a
-> peer-subnet client forge `X-Forwarded-For` and bypass `ip` ACLs or dilute rate
-> limits.
+> if the real client IP resolves correctly. A clustered deployment **must** list the
+> peer subnet in `trust_proxy` (the hop guard and the owner's client-IP/cache-key
+> derivation both depend on it) **and** isolate that subnet to cadish nodes only — so
+> there is no untrusted client on it that could forge `X-Forwarded-For`. cadish helps
+> here: when a non-owner forwards a request to the owner it **overwrites** any
+> client-supplied `X-Forwarded-For` with its own authoritative resolution, so a forged
+> XFF cannot survive the peer hop. The "trust **and** isolate" pair is the load-bearing
+> requirement; do not trust the peer subnet without isolating it.
 >
 > Mutual peer authentication (mTLS or a shared-secret header) is a planned
 > improvement but is **not currently implemented**. Until then, network isolation is
@@ -1581,12 +1612,17 @@ redirect @en_target (?i)^(.*)/(couples|parejas)/?$ 301 https://{host}$1/couples
   fire — otherwise evaluation falls through to the next rule (first-match-wins).
 - The target may use the `$N` captures **and** the derived tokens (`{host}`,
   `{classify.NAME}`, `{geo}`, …) together, so one rule can both rewrite a segment and
-  pick a subdomain. `{host}` remains the validated redirect host (open-redirect
-  defense, F12).
+  reflect a signal. `{host}`/`{host.base}`/`{host.sub}` remain the validated redirect
+  host (open-redirect defense, F12) and are the **only** tokens allowed in the Location
+  **authority**; a `{classify.*}`/`{geo*}`/etc. token may appear only in the **path or
+  query** (see the open-redirect note below). To pick a subdomain, use `{host.sub}`/
+  `{host.base}`, not a request-sourced token in host position.
 - The form is disambiguated from the scope-only form by the argument count after the
   leading refs: two trailing args (`CODE TARGET`) is scope-only, three
-  (`PATH_REGEX CODE TARGET`) is this combined form. `cadish check` counts the path
-  regex as one regex eval/request on top of the scope match.
+  (`PATH_REGEX CODE TARGET`) is this combined form. The first trailing arg is read as the
+  `CODE` only when it is a valid 3xx status (301/302/303/307/308); otherwise it is the
+  `PATH_REGEX` — so a numeric path regex (e.g. `12`) is not mistaken for a status code.
+  `cadish check` counts the path regex as one regex eval/request on top of the scope match.
 
 **Translation-map form** — `redirect CODE map { PFX -> NEWPFX … }` — sugar for the
 common "rewrite a leading path prefix, keep the rest" language/i18n case:
@@ -1608,7 +1644,7 @@ Each entry rewrites a leading path prefix and **preserves the remainder**, so
 | Placeholder | Expands to |
 |---|---|
 | `{host}` | request Host (lower-cased, port stripped) |
-| `{host.base}` | the **registrable base domain** of `{host}`, public-suffix aware (`es.nudity.tv` → `nudity.tv`, `www.amateur.tv` → `amateur.tv`, the multi-label `cam4you.tech555.io` → `cam4you.tech555.io`) |
+| `{host.base}` | the **registrable base domain** of `{host}`, public-suffix aware (`es.brand-a.example` → `brand-a.example`, `www.brand-b.example` → `brand-b.example`, the multi-label public-suffix `myapp.tech555.io` → `myapp.tech555.io`) |
 | `{host.sub}` | the leading **subdomain** label(s) below the registrable domain (`es`, `www`, `pt`); `""` for a bare base host |
 | `{path}` | request path |
 | `{query}` | canonical query string (no leading `?`); `""` if none |
@@ -1645,21 +1681,51 @@ deliberate about what you reflect into it:
 - `{http.NAME}` and `{client_ip}` are **attacker-influenceable** (a client controls
   its own headers/forwarded IP). Reflecting them into a Location is attacker-shaped
   navigation; `net/http` already blocks CRLF header-splitting, but you own the
-  redirect-target semantics — prefer `{host}`/`{classify.*}`/`{geo*}` for routing
-  decisions and treat reflected `{http.*}`/`{client_ip}` as untrusted.
-- A raw `{http.*}` token in the **host position** of a redirect `TARGET` (e.g.
-  `redirect … 302 https://{http.x-forwarded-host}/login` or a protocol-relative
-  `//{http.host}/…`) is an **open redirect** — the header is attacker-supplied and,
-  unlike `{host}`, is not validated — so `cadish check`/load **rejects** it. Use the
-  validated `{host}`/`{host.base}`/`{host.sub}` for the authority instead; a `{http.*}`
-  in the **path or query** of the Location stays allowed (it can never become the
-  navigation origin).
+  redirect-target semantics — prefer the validated `{host}`/`{host.base}`/`{host.sub}`
+  family for routing decisions and treat reflected `{http.*}`/`{client_ip}` as untrusted.
+- The redirect `TARGET` **authority** (`scheme://AUTHORITY/…`, including any protocol-
+  relative `//AUTHORITY/…`) accepts **only** the validated host family
+  `{host}`/`{host.base}`/`{host.sub}` (plus literal text and `$N` regex backrefs).
+  **Any** other request-sourced token in host position — `{http.*}`, `{query.*}`,
+  `{client_ip}`, `{geo*}`, `{classify.*}`, `{device}`, `{currency}`, … — is an **open
+  redirect** (unvalidated, attacker-influenceable origin) and `cadish check`/load/`edge
+  build` **rejects** it at compile (e.g.
+  `redirect … 302 https://{http.x-forwarded-host}/login`,
+  `https://{query.next}/login`, or a protocol-relative `//{http.host}/…`). The same
+  tokens in the **path or query** of the Location stay allowed (they can never become
+  the navigation origin), so to pick a target subdomain from a `classify`/header signal,
+  put it in the path or use `{host.sub}`/`{host.base}` — not the authority. A token
+  whose expansion is rooted at `/` (`{uri}`, `{path}`) **ends** the authority, so
+  `https://{host.base}{uri}` is the validated host with the path supplied by `{uri}`.
 
 `{client_ip}` is the **trust-proxy-resolved** client: behind a `trust_proxy`-declared
 LB/CDN it is the real client walked out of `X-Forwarded-For` (the same resolution as
 `{geo}` and the `ip` ACL), not the proxy's socket address. With no `trust_proxy`
 configured — or an `X-Forwarded-For` from an untrusted peer — it is the immediate
 socket peer (a spoofed header is ignored).
+
+##### `no_store` modifier
+
+Append `no_store` as the last token on any non-map redirect line to attach
+`Cache-Control: no-store, no-cache, must-revalidate, private` to the 3xx response:
+
+```
+@lang cookie lang es
+redirect @lang 302 https://es.example.com{uri} no_store
+```
+
+Use this when the redirect is **personalized** — driven by a cookie, classified
+token, or `Accept-Language` header — so no shared cache or browser caches a
+per-user redirect and serves it to another user. A deterministic (URL-only) redirect
+that is the same for every visitor does not need `no_store`; omitting it keeps the
+response cacheable by the downstream client (which is the default for a 301).
+
+The modifier is effective in the regex form, scoped form, and scoped path-regex
+form. The translation-map form (`redirect CODE map { … }`) does not support it
+(map entries produce deterministic URL-shaped rewrites that are safe to cache).
+
+Both the cadish server and the edge runtime (Cadish Edge) attach the header
+byte-identically when `no_store` is present.
 
 *Language-redirect example* (subdomain + path translation in one 301):
 
@@ -1696,8 +1762,8 @@ generic rules:
 
 ```
 # Trusts every brand host; one rule sends a bare/sub host to its own www host:
-es.nudity.tv, www.nudity.tv, nudity.tv, es.amateur.tv, www.amateur.tv, amateur.tv {
-    @needs_www host nudity.tv es.nudity.tv amateur.tv es.amateur.tv
+es.brand-a.example, www.brand-a.example, brand-a.example, es.brand-b.example, www.brand-b.example, brand-b.example {
+    @needs_www host brand-a.example es.brand-a.example brand-b.example es.brand-b.example
     redirect @needs_www ^/(.*)$ 302 https://www.{host.base}/$1   # -> www.<brand>/…
     # …or branch the target subdomain by language, still brand-agnostic:
     @spanish classify {lang}==es
@@ -1706,9 +1772,9 @@ es.nudity.tv, www.nudity.tv, nudity.tv, es.amateur.tv, www.amateur.tv, amateur.t
 ```
 
 `{host.base}` strips the leading subdomain down to the registrable domain
-(`es.nudity.tv` → `nudity.tv`), and `{host.sub}` is what was stripped (`es`); both
-derive from the **validated** redirect host. A multi-label public suffix is handled
-correctly (`cam4you.tech555.io` → base `cam4you.tech555.io`, not `tech555.io`). Scope
+(`es.brand-a.example` → `brand-a.example`), and `{host.sub}` is what was stripped
+(`es`); both derive from the **validated** redirect host. A multi-label public suffix is
+handled correctly (`myapp.tech555.io` → base `myapp.tech555.io`, not `tech555.io`). Scope
 the rule (here `@needs_www host …`) to the hosts that should move so a request already
 on the target host does not redirect to itself.
 
@@ -2731,6 +2797,8 @@ as `redirect` targets. The two request-scoped placeholders are:
 | `{http.NAME}` | the request header `NAME` (canonicalized); an **absent** header → empty string |
 | `{classify.NAME}` | the derived [`classify`](#classify) token `NAME`'s value |
 | `{geo}` / `{geo.continent}` / `{geo.region}` | the resolved geo classes (when a `geo` source is configured) |
+| `{device}` | the resolved device class (`desktop`/`mobile`/`tablet`/`bot`) — the same bucket the `cache_key {device}` token uses; requires a [`device_detect`](#device_detect) block (or uses the built-in ruleset when `{device}` already keys the cache). **Resolves to empty string if the cache key does not also use `{device}`** (the classifier runs only when the key varies on it — add `cache_key … {device}` to enable it). |
+| `{query.NAME}` | the first decoded value of query param `NAME` (e.g. `{query.genre}` → `comedy`); empty when the param is absent |
 | `{proto}` / `{scheme}` | `https` when cadish **terminated TLS** for the inbound connection, else `http` (the `X-Forwarded-Proto` value) |
 
 The value is expanded **per request** (the cache stores nothing about it). A plain
@@ -2819,6 +2887,30 @@ It also works at the **edge**: the Cadish Edge worker computes the *same*
 so the Go server and the JS edge runtime emit the **identical** value for the same
 request (a cross-runtime conformance fixture asserts this). The directive compiles
 to a semantics-free op marker — no key value is baked into the AST or the Edge IR.
+
+##### `+cache_age` — expose the object age in seconds (debug)
+
+A delivery-only debug special, parsed exactly like `+cache_status`, that emits the
+**age of the cached object in whole seconds** into a response header — the natural
+complement to `+cache_status` (which says *whether* the key hit, this says *how old*
+the cached object is):
+
+```
+header +cache_status X-Cache            # HIT / MISS / HIT-STALE
+header +cache_age    X-CF-Cache-Age     # e.g. 45 (on a HIT)
+```
+
+- **`+cache_age NAME`** emits an **integer** (e.g. `"45"`) representing the number of
+  whole seconds since the object was stored into the cache — the equivalent of the HTTP
+  `Age` response header, limited to cadish's own cache layer.
+- It is **emitted only on a cache HIT** (fresh or stale). On a MISS or a bypassed
+  (`pass`) request the header is absent — there is no stored age to report.
+- It is **delivery-only** (response-side) like `+cache_status`; it can be scoped with a
+  leading `@matcher`. The value is never baked into the IR — it is computed from the
+  object's stored timestamp at serve time.
+- It also works at the **edge**: the Cadish Edge worker materializes the age from the
+  cache-tier `meta.storedAt` timestamp, matching the Go server's freshness-index age
+  computation byte-identically (proven by the conformance suite).
 
 #### `strip_cookies`
 Drop the response `Set-Cookie` on matching responses — the faithful equivalent of

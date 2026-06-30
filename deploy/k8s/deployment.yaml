@@ -57,7 +57,7 @@ spec:
       #         mountPath: /var/lib/cadish
       containers:
         - name: cadish
-          image: ghcr.io/cadi-sh/cadish:0.2.0
+          image: ghcr.io/cadi-sh/cadish:0.2.2
           args:
             - run
             - -config

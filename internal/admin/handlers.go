@@ -65,6 +65,11 @@ func stripReportPaths(r *check.Report, cfgPath string) *check.Report {
 		out := make([]check.Diagnostic, len(ds))
 		for i, d := range ds {
 			d.Position = stripPos(d.Position)
+			// The message can ALSO embed the absolute on-disk path — e.g. a failed
+			// `import`/`ca_file` surfaces `open /srv/secret/frag.cadi: no such file`. Strip
+			// the config directory from it too, so a token holder never learns the host's
+			// directory layout (the same hardening the position already gets).
+			d.Message = stripPos(d.Message)
 			out[i] = d
 		}
 		return out

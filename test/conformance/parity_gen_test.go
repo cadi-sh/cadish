@@ -466,6 +466,16 @@ func genConfig(rng *rand.Rand) (string, genHint) {
 		}
 		return strings.Join(toks, " ")
 	}
+	// Request-phase header (BEFORE cache_key → forwarded to origin) reflecting a class
+	// token, to fuzz the request-phase class-token neutralization (maskedValueContext /
+	// maskedValueRequest, F-A1/ISO): when the SELECTED recipe does not key on the class,
+	// both engines must blank the forwarded value identically. Emitted before the cache_key
+	// block so it lands in reqHeaderRules (pastKey false).
+	if chance(rng, 0.35) {
+		classTok := pick(rng, []string{"{device}", "{geo}", "{geo.continent}", "{geo.region}"})
+		fmt.Fprintf(&b, "    header X-Req-Class %s\n", classTok)
+		h.dir("header")
+	}
 	scoped := false
 	if mn, ok := pickReqMatcher(); ok && chance(rng, 0.3) {
 		fmt.Fprintf(&b, "    cache_key %s %s\n", mn, buildKey())

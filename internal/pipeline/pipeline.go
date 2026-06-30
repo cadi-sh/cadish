@@ -138,19 +138,13 @@ func (p *Pipeline) EvalRequest(req *Request) RequestDecision {
 		}
 	}
 
-	// request-phase header edits.
-	dec.ReqHeaderOps = applyHeaderRules(p.reqHeaderRules, ctx, CacheStatusUnknown, false, p.classifiers)
-
-	// origin-request path/query rewrite. This is computed AFTER the cache key below
-	// is conceptually fixed — it MUST NOT influence the key (see RewriteDecision):
-	// the key is built from the unmodified client request, the rewrite only changes
-	// the bytes dialed upstream.
-	dec.Rewrite = p.evalRewrite(ctx)
-
 	// cache key. ctx is threaded so a {classify} key token resolves its matchers
 	// through the same memoized context as the rest of the request phase. The recipe
 	// is chosen first-match-wins from the scoped cache_key rules (one unscoped rule,
-	// or none, is the common case and costs nothing extra).
+	// or none, is the common case and costs nothing extra). Selected FIRST (before the
+	// request-phase headers) so the header neutralization masks against the class tokens
+	// THIS request's key actually varies on — the SELECTED recipe, not a union over all
+	// recipes (ISO-1).
 	toks := p.selectKeyTokens(ctx)
 	// Capture the SELECTED recipe on the request (Finding 1): this is the authoritative,
 	// singular selection — computed on the PRE-derives_from-strip request — that every
@@ -161,8 +155,57 @@ func (p *Pipeline) EvalRequest(req *Request) RequestDecision {
 		req.selKey = toks
 		req.selKeySet = true
 	}
+
+	// request-phase header edits. These are forwarded to origin, so an unkeyed class
+	// token (raw {device}/{geo*} OR a class-derived {classify.NAME}) is neutralized to
+	// prevent a cross-class cache leak (F-A1): the header VALUES resolve against a MASKED
+	// context whose class fields absent from the SELECTED recipe are blanked. The mask is
+	// passed as a cheap VALUE; the masked context is built LAZILY inside applyHeaderRules
+	// only when a templated request-phase op actually fires — so ctx (and its stack-backed
+	// memo) never escapes to the heap on the common path (perf: F-R5). Scope matching uses
+	// the real ctx.
+	reqMask := maskFromTokens(toks)
+	dec.ReqHeaderOps = applyHeaderRules(p.reqHeaderRules, ctx, req, up, p.numMatchers, CacheStatusUnknown, false, p.classifiers, &reqMask)
+
+	// origin-request path/query rewrite. This is computed AFTER the cache key below
+	// is conceptually fixed — it MUST NOT influence the key (see RewriteDecision):
+	// the key is built from the unmodified client request, the rewrite only changes
+	// the bytes dialed upstream.
+	dec.Rewrite = p.evalRewrite(ctx)
+
 	dec.CacheKey = buildKey(toks, req, p.stickyCookie, ctx)
 	return dec
+}
+
+// allKeyed reports whether the selected recipe keys on every class dimension, so a
+// request-phase header can forward any class token unchanged (nothing to blank).
+func (m classKeyMask) allKeyed() bool { return m.device && m.geo && m.geoContinent && m.geoRegion }
+
+// maskedClone returns a NEW value-resolution context whose class fields absent from the
+// selected recipe (per mask) are blanked on a COPY of req, so a request-phase header never
+// forwards an unkeyed class to origin (raw token or class-derived {classify.NAME}) —
+// F-A1/ISO-1/ISO-2. It takes req/upstream/memoLen as VALUES rather than the source
+// *matchContext: dereferencing the source ctx (`*ctx.req`) and storing the copy in this
+// heap clone would force the source ctx (and its stack-backed memo) onto the heap, which
+// the EvalRequest hot path must avoid (perf: F-R5). It NEVER returns the source ctx; callers
+// invoke it lazily, only when a templated request-phase op fires AND a class is unkeyed.
+// respHeader is nil (request phase). The clone gets a FRESH memo so a classify re-evaluation
+// against the blanked request never pollutes the source memo.
+func maskedClone(req *Request, upstream string, memoLen int, m classKeyMask) *matchContext {
+	mreq := *req
+	if !m.device {
+		mreq.Device = ""
+	}
+	if !m.geo {
+		mreq.Geo = ""
+	}
+	if !m.geoContinent {
+		mreq.GeoContinent = ""
+	}
+	if !m.geoRegion {
+		mreq.GeoRegion = ""
+	}
+	return &matchContext{req: &mreq, upstream: upstream, memo: make([]int8, memoLen)}
 }
 
 // resolvedKeyTokens returns the cache-key recipe SELECTED for ctx.req: the authoritative
@@ -367,10 +410,25 @@ func (p *Pipeline) EvalResponse(req *Request, status int, respHeader http.Header
 		//       never shared-cached. THIS is the fail-closed property (same trust model as the
 		//       custom VCL: a per-user route that erroneously emits X-Cache-Ttl is an operator
 		//       bug, exactly as in Varnish).
-		if req != nil && perResponseSignal && p.cacheCredentialedMatches(ctx) {
+		credMatches := req != nil && p.cacheCredentialedMatches(ctx)
+		if credMatches && perResponseSignal {
 			// Positive in-scope signal (dec.Cacheable) is the gate; store and strip Set-Cookie +
 			// the weak controls on store+deliver. cache_unsafe is never consulted here (Guard B).
 			dec.CredentialedStore = true
+		} else if credMatches {
+			// In a cache_credentialed scope with NO per-response signal: a STATIC `ttl N` (whether
+			// the in-scope rule or a co-existing `cache_ttl default ttl N`) made dec.Cacheable true,
+			// but a static TTL is NOT authorization to share a credentialed response. The per-
+			// response signal is the SOLE storage gate (the fail-closed invariant documented above),
+			// so REFUSE UNCONDITIONALLY here — even with no Set-Cookie / no Vary / no uncacheable
+			// Cache-Control. Without this, a credentialed `GET /v3/readmodel/cache/x` whose origin
+			// returns a personalized 200 with no X-Cache-Ttl would fall onto `default ttl` and be
+			// stored under the SHARED key, leaking one user's private body to the next (the confirmed
+			// cross-user leak). This closes it fail-closed.
+			dec.Cacheable = false
+			dec.TTL = 0
+			dec.Grace = 0
+			dec.MaxStale = 0
 		} else {
 			setCookieBlocks := hasSetCookie(respHeader) && !p.stripCookiesMatches(ctx)
 			shareable := p.safelyShareable(respHeader, keyHeaders)
@@ -1011,9 +1069,12 @@ func (p *Pipeline) varyCovered(value string, keyHeaders map[string]bool) bool {
 // special.
 func (p *Pipeline) EvalDeliver(req *Request, respHeader http.Header, cacheStatus CacheStatus) DeliverDecision {
 	var stack [memoStack]int8
-	ctx := &matchContext{req: req, upstream: p.resolveUpstream(req), memo: newMemo(stack[:], p.numMatchers), respHeader: respHeader}
+	up := p.resolveUpstream(req)
+	ctx := &matchContext{req: req, upstream: up, memo: newMemo(stack[:], p.numMatchers), respHeader: respHeader}
 	var dec DeliverDecision
-	dec.RespHeaderOps = applyHeaderRules(p.respHeaderRules, ctx, cacheStatus, true, p.classifiers)
+	// Response-phase headers are applied per-request at delivery (never stored as part of
+	// a shared cache entry), so reflecting an unkeyed class is safe — nil reqMask (no mask).
+	dec.RespHeaderOps = applyHeaderRules(p.respHeaderRules, ctx, req, up, p.numMatchers, cacheStatus, true, p.classifiers, nil)
 	for _, r := range p.respHeaderRules {
 		if !ctx.scopeMatches(r.scope) {
 			continue
@@ -1029,6 +1090,13 @@ func (p *Pipeline) EvalDeliver(req *Request, respHeader http.Header, cacheStatus
 				// CacheStatusHeader).
 				dec.CacheKeyHeader = op.Name
 				dec.CacheKeyRaw = op.Value == "raw"
+			}
+			if op.Op == OpCacheAge {
+				// The object age is derived from the freshness index storedAt timestamp,
+				// not from this phase's match context. Surface the target header name on
+				// the decision so the server and edge worker materialize the integer age
+				// (last matching directive wins, like CacheKeyHeader).
+				dec.CacheAgeHeader = op.Name
 			}
 		}
 	}
@@ -1072,7 +1140,21 @@ func (p *Pipeline) EvalDeliver(req *Request, respHeader http.Header, cacheStatus
 // cleared), so the server applies every op uniformly and never sees a template.
 // The TemplateEnv is built lazily — at most once per call, only when a templated
 // op actually fires — so a config of plain static headers does zero extra work.
-func applyHeaderRules(rules []headerRule, ctx *matchContext, cacheStatus CacheStatus, resolveStatus bool, classifiers map[string]*classifier) []HeaderOp {
+// reqMask, when non-nil, marks a REQUEST-phase call (headers forwarded to origin): a
+// templated value resolves against a MASKED context whose class fields absent from the
+// selected recipe are blanked, so neither a raw {device}/{geo*} token NOR a {classify.NAME}
+// that buckets on an unkeyed class dimension forwards a class the cache key does not segment
+// on (cross-class cache leak, F-A1/ISO-1/ISO-2). The masked context is built LAZILY (only
+// when the first templated op fires and a class is actually unkeyed) so ctx stays
+// stack-resident on the common path. SCOPE matching always uses the real ctx, so a header
+// scoped on geo still fires; only its value is neutralized. A nil reqMask (response phase)
+// resolves values against ctx directly — safe, since a response header is applied per-request
+// at delivery and never poisons a shared cache entry.
+// req/upstream/memoLen mirror ctx's fields but are passed as EXPLICIT values so the masked
+// clone is built without dereferencing ctx — escape analysis then keeps the caller's
+// stack-backed ctx (and its memo) off the heap (F-R5). ctx is used ONLY for scope matching
+// (a method call that does not leak it) and as the fast-path value context.
+func applyHeaderRules(rules []headerRule, ctx *matchContext, req *Request, upstream string, memoLen int, cacheStatus CacheStatus, resolveStatus bool, classifiers map[string]*classifier, reqMask *classKeyMask) []HeaderOp {
 	var ops []HeaderOp
 	// env is a STACK local built lazily on the first templated op that fires. It is
 	// addressed only to pass &env to expandTemplate (which does not retain it), so a
@@ -1083,6 +1165,11 @@ func applyHeaderRules(rules []headerRule, ctx *matchContext, cacheStatus CacheSt
 	// helper returning a pointer would force the allocation unconditionally.
 	var env TemplateEnv
 	built := false
+	// valCtx is the context VALUES (env + {classify.NAME}) resolve against. It starts as
+	// the real ctx and, for a request-phase call with an unkeyed class, is replaced LAZILY
+	// with a masked clone the first time a templated op fires — keeping ctx stack-resident
+	// when no templated request-phase op needs masking (perf: F-R5).
+	valCtx := ctx
 	for _, r := range rules {
 		if !ctx.scopeMatches(r.scope) {
 			continue
@@ -1101,15 +1188,30 @@ func applyHeaderRules(rules []headerRule, ctx *matchContext, cacheStatus CacheSt
 				// server from the key it holds — never emitted as an op from here.
 				continue
 			}
+			if op.Op == OpCacheAge {
+				// The object age is derived from the freshness index storedAt timestamp
+				// (not in this phase's match context). It is surfaced on the DeliverDecision
+				// (CacheAgeHeader) and materialized by the server on HIT — not an op.
+				continue
+			}
 			if op.ValueTpl {
 				if !built {
-					fillHeaderTemplateEnv(&env, ctx)
+					// Request-phase + an unkeyed class → build the masked value-context now
+					// (lazily, so the common path never heap-allocates it). maskedClone never
+					// returns ctx, so ctx itself stays on the stack.
+					if reqMask != nil && !reqMask.allKeyed() {
+						// Clone from the explicit value params (not ctx fields) so ctx — and its
+						// stack-backed memo — stays off the heap (perf: F-R5).
+						valCtx = maskedClone(req, upstream, memoLen, *reqMask)
+					}
+					fillHeaderTemplateEnv(&env, valCtx)
 					built = true
 				}
-				// The classify resolver is built INLINE and passed by value (not stored
-				// on env), so ctx is copied through the call and never retained — env
-				// stays stack-allocatable and ctx never escapes (zero-cost-when-unused).
-				op.Value = expandTemplate(op.Value, &env, classifyResolver{ctx: ctx, classifiers: classifiers})
+				// The classify resolver is built INLINE and passed by value (not stored on
+				// env), so the context is copied through the call and never retained — env
+				// stays stack-allocatable. valCtx (masked for request-phase) makes a
+				// class-derived {classify.NAME} resolve against the blanked class fields too.
+				op.Value = expandTemplate(op.Value, &env, classifyResolver{ctx: valCtx, classifiers: classifiers})
 				op.ValueTpl = false
 			}
 			ops = append(ops, op)
@@ -1130,11 +1232,13 @@ func fillHeaderTemplateEnv(env *TemplateEnv, ctx *matchContext) {
 	env.Host = ctx.req.normHost()
 	env.Path = ctx.req.Path
 	env.Query = canonicalQuery(ctx.req)
+	env.QueryParams = ctx.req.Query
 	env.Header = ctx.req.Header
 	env.ClientIP = ctx.req.ClientIP
 	env.Geo = ctx.req.Geo
 	env.GeoContinent = ctx.req.GeoContinent
 	env.GeoRegion = ctx.req.GeoRegion
+	env.Device = ctx.req.Device
 	if ctx.req.TLS {
 		env.Scheme = "https"
 	} else {

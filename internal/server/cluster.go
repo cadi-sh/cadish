@@ -4,9 +4,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"time"
 
 	"github.com/cadi-sh/cadish/internal/cluster"
+	"github.com/cadi-sh/cadish/internal/geo"
 )
 
 // clusterRoute is the SINGLE handler seam for cluster ownership routing (#8). It
@@ -32,6 +34,12 @@ import (
 func (h *Handler) clusterRoute(rec *statusRecorder, r *http.Request, site *boundSite, ownerKey string, info *reqInfo, credentialed bool, credCookie string) bool {
 	m := site.Cluster
 
+	// Resolve the original client IP via the SAME trusted-proxy/XFF logic the rest of
+	// the pipeline uses, so a request reverse-proxied to the owner carries it (below).
+	// Computed here rather than reusing preq.RealClientIP because that field is only
+	// populated when a security gate is configured; ownership routing needs it always.
+	clientIP := geo.ClientIP(r.RemoteAddr, r.Header, site.TrustedProxies)
+
 	// A request a peer already forwarded to us: serve it locally, do not re-forward.
 	// This guard prevents owner-routing loops and read-through storms.
 	if m.IsForwardedHop(r.Header) {
@@ -43,12 +51,23 @@ func (h *Handler) clusterRoute(rec *statusRecorder, r *http.Request, site *bound
 		return false
 	}
 
+	// Only owner-route the cacheable, body-less methods (GET/HEAD). Owner routing
+	// exists for cache coherence ("cached once per region"), and only GET/HEAD are
+	// cached — a write gains nothing from the owner. Crucially, proxyToPeer streams
+	// r.Body to the peer with no GetBody replay; if the peer accepts then fails
+	// mid-upload, the body is partially consumed and the local fallback (the unsafe-
+	// method origin path) would forward a TRUNCATED body to origin (F-D3). Writes
+	// therefore take the normal local origin path, where the body is read once.
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+
 	// Owner routing. If we are the healthy owner, serve locally.
 	if owner, ok := m.Owner(ownerKey); ok {
 		if m.IsSelf(owner) {
 			return false
 		}
-		return h.proxyToPeer(rec, r, m, owner, info, credentialed, credCookie)
+		return h.proxyToPeer(rec, r, m, owner, clientIP, info, credentialed, credCookie)
 	}
 
 	// No healthy owner for this key. Apply the fallback policy.
@@ -62,7 +81,7 @@ func (h *Handler) clusterRoute(rec *statusRecorder, r *http.Request, site *bound
 		// locally. We never chain a second proxy hop (the hop guard would stop the
 		// peer re-forwarding regardless).
 		if owner, ok := m.IntendedOwner(ownerKey); ok && !m.IsSelf(owner) {
-			if h.proxyToPeer(rec, r, m, owner, info, credentialed, credCookie) {
+			if h.proxyToPeer(rec, r, m, owner, clientIP, info, credentialed, credCookie) {
 				return true
 			}
 		}
@@ -76,7 +95,7 @@ func (h *Handler) clusterRoute(rec *statusRecorder, r *http.Request, site *bound
 // re-forward. It returns true when the peer answered (any status, streamed
 // through); false on a connection-class failure, so the caller serves locally
 // instead — a peer outage degrades to local service rather than a 502.
-func (h *Handler) proxyToPeer(rec *statusRecorder, r *http.Request, m *cluster.Membership, peerURL string, info *reqInfo, credentialed bool, credCookie string) bool {
+func (h *Handler) proxyToPeer(rec *statusRecorder, r *http.Request, m *cluster.Membership, peerURL string, clientIP netip.Addr, info *reqInfo, credentialed bool, credCookie string) bool {
 	info.cacheStatus = "CLUSTER"
 	info.upstream = "peer:" + peerURL
 
@@ -93,6 +112,31 @@ func (h *Handler) proxyToPeer(rec *statusRecorder, r *http.Request, m *cluster.M
 		for _, v := range vs {
 			preq.Header.Add(k, v)
 		}
+	}
+	// Preserve the ORIGINAL client Host on the peer-bound request. http.NewRequest set
+	// preq.Host from the peer URL (the dial target), but the owner derives its cache key
+	// (and its own site/host_header) from Host: leaving it as the peer URL makes the
+	// owner key a proxied request under the PEER host while a direct client request keys
+	// under the CLIENT host — two entries for one object, so the "cached once per region"
+	// guarantee silently degrades to twice-on-the-owner whenever the cache key includes
+	// host (the default). Forwarding the client Host makes proxied and direct requests
+	// hash to the same key. The dial target is unaffected (it is preq.URL.Host = peer).
+	preq.Host = r.Host
+	// Preserve the ORIGINAL client IP. The owner re-derives the client IP from the
+	// inbound socket + X-Forwarded-For; without an XFF entry it would see the PEER's IP
+	// (the dial source), which (a) diverges the cache key for IP-based tokens ({geo},
+	// {sticky} by client_ip) — a second store-multiple bug like the Host one — and
+	// (b) feeds the wrong IP to ACL / rate-limit / geo decisions on the owner. We set
+	// XFF to the already-resolved client IP; the owner, which MUST trust the peer subnet
+	// (`trust_proxy` — the same trust that lets it honor the X-Cadish-Peer hop guard),
+	// then derives the identical client IP. A single resolved entry is exact because the
+	// non-owner already collapsed any upstream proxy chain into this address, and the
+	// one-hop guard guarantees no second cadish hop. (Scheme/X-Forwarded-Proto is NOT
+	// reconstructed: the cache pipeline derives scheme from the real connection, not a
+	// header, so a proxied request is seen as http — documented as a deploy constraint;
+	// it is not a cache-key input, so store-once is unaffected.)
+	if clientIP.IsValid() {
+		preq.Header.Set("X-Forwarded-For", clientIP.String())
 	}
 	// cache_credentialed (D101): r.Header carries the NORMALIZED (cookie_allow-filtered)
 	// Cookie — the local node keeps it normalized so its own EvalResponse evaluates the

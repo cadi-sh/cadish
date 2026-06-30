@@ -83,9 +83,14 @@ type OnError struct {
 // (301/302/307/308) and a fully-resolved Location built from the request (host +
 // path) via template substitution (regex capture groups and {host}/{path}/{query}/
 // {uri} placeholders). The server writes Status with a Location header.
+//
+// NoStore, when true, means the directive carried a trailing `no_store` modifier:
+// the server attaches Cache-Control: no-store, no-cache, must-revalidate, private
+// so no intermediary or browser caches the (typically personalized) redirect.
 type Redirect struct {
 	Status   int
 	Location string
+	NoStore  bool
 }
 
 // PurgeDecision describes a matched `purge` request. The guard condition (e.g. a
@@ -224,6 +229,12 @@ type DeliverDecision struct {
 	// default 12-hex hash for CacheKeyHeader. Meaningful only when CacheKeyHeader is
 	// set.
 	CacheKeyRaw bool
+	// CacheAgeHeader is the header name a `header +cache_age` directive targets
+	// (e.g. "X-Cache-Age"), or "" if none. Like CacheKeyHeader the value (object age
+	// in whole seconds) is NOT in this decision — it is derived from the freshness
+	// index storedAt timestamp — so the server and edge worker materialize it
+	// separately on HIT/HIT-STALE, and OMIT it on MISS/bypass.
+	CacheAgeHeader string
 	// Transforms are ordered literal body substitutions (`replace OLD NEW`) whose
 	// scope matched this response. The server applies them POST-cache, on delivery,
 	// to a size-bounded body — the cache always stores the canonical origin body,

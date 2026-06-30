@@ -1,5 +1,5 @@
 {
-  "irVersion": 6,
+  "irVersion": 9,
   "site": {
     "hosts": [
       "m.example.com"
@@ -124,6 +124,7 @@
   "deliver": {
     "cacheKeyHeader": "X-Cache-Key"
   },
+  "usesGeo": false,
   "edge": {
     "default": "local",
     "kvMaxBytes": 1048576

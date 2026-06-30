@@ -1,0 +1,88 @@
+{
+  "irVersion": 9,
+  "site": {
+    "hosts": [
+      "dev.example.com"
+    ],
+    "redirectHosts": [
+      "dev.example.com"
+    ],
+    "canonicalHost": "dev.example.com"
+  },
+  "upstream": {},
+  "matchers": {},
+  "device": {
+    "rules": [
+      {
+        "class": "mobile",
+        "substrings": [
+          "iphone",
+          "android"
+        ]
+      },
+      {
+        "class": "bot",
+        "substrings": [
+          "bot",
+          "bot"
+        ]
+      }
+    ],
+    "default": "desktop"
+  },
+  "recv": {},
+  "key": {
+    "tokens": [
+      {
+        "kind": "host"
+      },
+      {
+        "kind": "path"
+      }
+    ],
+    "recipes": [
+      {
+        "selector": {
+          "always": true
+        },
+        "tokens": [
+          {
+            "kind": "host"
+          },
+          {
+            "kind": "path"
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1m0s"
+      }
+    ],
+    "headerResp": [
+      {
+        "scope": {
+          "always": true
+        },
+        "ops": [
+          {
+            "op": "set",
+            "name": "X-Device-Class",
+            "value": "{device}",
+            "valueIsTmpl": true
+          }
+        ]
+      }
+    ]
+  },
+  "deliver": {},
+  "usesGeo": false,
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  }
+}

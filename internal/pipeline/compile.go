@@ -395,14 +395,97 @@ func (p *Pipeline) Addresses() []string { return p.addresses }
 func (p *Pipeline) Tenant() string { return p.tenant }
 
 // UsesDeviceToken reports whether the compiled cache key includes the {device}
-// normalizer, so the server can skip the UA-classification pre-pass entirely
-// when no key varies on it.
+// normalizer. It is the cache-key-only predicate; the server/edge gate on the
+// broader UsesDeviceClassification (which also covers a {device} header/redirect
+// reflection) so the classifier still runs when {device} is reflected but unkeyed.
 func (p *Pipeline) UsesDeviceToken() bool {
 	for i := range p.keyRules {
 		for _, t := range p.keyRules[i].toks {
 			if t.kind == tokDevice {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// UsesDeviceClassification reports whether the site needs the UA device classifier
+// run at all — either the cache key varies on {device} (UsesDeviceToken) OR a
+// {device} token is reflected in a DELIVER-phase surface: a RESPONSE header value
+// (applied per-request at delivery, so safe to vary an unkeyed object) or a redirect
+// target (a short-circuit). The server gates its UA pre-pass (handler.go) and the edge
+// projector gates shipping the device classifier (edgeview.go) on THIS predicate, so a
+// `header X-Device {device}` placed AFTER cache_key resolves instead of silently
+// expanding to "".
+//
+// REQUEST-phase headers (before cache_key, forwarded to origin) are DELIBERATELY
+// excluded (F-A1): resolving an unkeyed {device}/{geo} forwarded to origin would make
+// the origin vary content the cache key does not segment on → a cross-device/region
+// cache leak. Such an unkeyed-forwarded token renders empty (fail-safe, the pre-D1
+// behaviour) and `cadish check` warns loudly (detectForwardedClassTokenUnkeyed) so it
+// is not silent. A request-phase {device} that IS keyed resolves anyway via
+// UsesDeviceToken.
+func (p *Pipeline) UsesDeviceClassification() bool {
+	return p.UsesDeviceToken() || p.deliverTemplateReferencesToken("{device}")
+}
+
+// classKeyMask records which request-derived CLASS tokens the cache key varies on. A
+// REQUEST-phase header value (forwarded to origin) may only reflect a class token that
+// is keyed; an UNKEYED one is neutralized to "" before forwarding (F-A1), so the origin
+// can never vary content on a dimension the cache key does not segment — which would
+// otherwise store one class's response under a class-independent key and serve it to
+// other classes (cross-class cache leak). DELIVER-phase reflection (response headers
+// applied per-request at delivery, redirect short-circuits) is unaffected — it never
+// poisons a shared cache entry — so it always resolves.
+type classKeyMask struct {
+	device, geo, geoContinent, geoRegion bool
+}
+
+// maskFromTokens reports which request-derived class tokens the given cache-key recipe
+// (the one SELECTED for this request) varies on. The request-phase header neutralization
+// masks against THIS — the selected recipe — not a union over all recipes, so a scoped
+// cache_key where one recipe keys on a class and the catch-all does not does not leak the
+// unkeyed class for a request that selected the catch-all (ISO-1).
+func maskFromTokens(toks []keyToken) classKeyMask {
+	var m classKeyMask
+	for _, t := range toks {
+		switch t.kind {
+		case tokDevice:
+			m.device = true
+		case tokGeo:
+			m.geo = true
+		case tokGeoContinent:
+			m.geoContinent = true
+		case tokGeoRegion:
+			m.geoRegion = true
+		}
+	}
+	return m
+}
+
+// deliverTemplateReferencesToken reports whether a DELIVER-phase template — a RESPONSE
+// header value (respHeaderRules) or a redirect target — contains one of the given
+// {token} literals. Request-phase header values (reqHeaderRules, forwarded to origin)
+// are intentionally NOT scanned: see UsesDeviceClassification. Compile-time only.
+func (p *Pipeline) deliverTemplateReferencesToken(needles ...string) bool {
+	hit := func(s string) bool {
+		for _, n := range needles {
+			if strings.Contains(s, n) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, hr := range p.respHeaderRules {
+		for _, op := range hr.ops {
+			if hit(op.Value) {
+				return true
+			}
+		}
+	}
+	for i := range p.redirectRules {
+		if hit(p.redirectRules[i].target) {
+			return true
 		}
 	}
 	return false
@@ -1246,6 +1329,14 @@ func (p *Pipeline) computeUsesGeo() bool {
 				return true
 			}
 		}
+	}
+	// A {geo*} token reflected in a DELIVER-phase surface (response header or redirect
+	// target) needs the pre-pass — otherwise the token silently renders empty (the
+	// {device} gap, F-D1). REQUEST-phase headers are excluded for the same cache-leak
+	// reason as {device} (F-A1): an unkeyed geo forwarded to origin renders empty
+	// (fail-safe) and check warns; see deliverTemplateReferencesToken.
+	if p.deliverTemplateReferencesToken("{geo}", "{geo.continent}", "{geo.region}") {
+		return true
 	}
 	for _, m := range p.matchers {
 		if m.kind == kindGeo {

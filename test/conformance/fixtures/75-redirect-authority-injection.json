@@ -1,0 +1,16 @@
+{
+  "name": "75-redirect-authority-injection",
+  "cadishfile": "brand-a.example {\n    redirect (?i)^(/.*?)?/index\\.php(.*)$ 301 https://{host}$1$2?{query}\n    cache_ttl default ttl 60s\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "brand-a.example", "path": "/index.php@evil.example.com/" },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "brand-a.example", "path": "/foo/index.php/bar", "query": { "x": ["1"] } },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

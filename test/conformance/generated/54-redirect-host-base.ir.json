@@ -1,19 +1,19 @@
 {
-  "irVersion": 6,
+  "irVersion": 9,
   "site": {
     "hosts": [
-      "es.nudity.tv",
-      "www.amateur.tv",
-      "nudity.tv",
+      "es.brand-a.example",
+      "www.brand-b.example",
+      "brand-a.example",
       "cam4you.tech555.io"
     ],
     "redirectHosts": [
+      "brand-a.example",
       "cam4you.tech555.io",
-      "es.nudity.tv",
-      "nudity.tv",
-      "www.amateur.tv"
+      "es.brand-a.example",
+      "www.brand-b.example"
     ],
-    "canonicalHost": "es.nudity.tv"
+    "canonicalHost": "es.brand-a.example"
   },
   "upstream": {},
   "matchers": {},
@@ -60,6 +60,7 @@
     ]
   },
   "deliver": {},
+  "usesGeo": false,
   "edge": {
     "default": "local",
     "kvMaxBytes": 1048576

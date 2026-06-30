@@ -1,0 +1,87 @@
+{
+  "irVersion": 9,
+  "site": {
+    "hosts": [
+      "example.com"
+    ],
+    "redirectHosts": [
+      "example.com"
+    ],
+    "canonicalHost": "example.com"
+  },
+  "upstream": {},
+  "matchers": {
+    "testverify": {
+      "kind": "ip",
+      "serverOnly": true
+    },
+    "ungreedy": {
+      "kind": "path_regex",
+      "regexUntranslatable": true
+    },
+    "verified": {
+      "kind": "cookie",
+      "name": "verified"
+    }
+  },
+  "classifiers": {
+    "age": {
+      "rows": [
+        {
+          "conj": [
+            "testverify",
+            "verified"
+          ],
+          "value": "0"
+        },
+        {
+          "conj": [
+            "ungreedy"
+          ],
+          "value": "1"
+        },
+        {
+          "conj": [
+            "verified"
+          ],
+          "value": "0"
+        }
+      ],
+      "default": "2"
+    }
+  },
+  "recv": {
+    "pass": [
+      {
+        "always": true
+      }
+    ]
+  },
+  "key": {
+    "tokens": null
+  },
+  "response": {
+    "ttl": [
+      {
+        "selKind": "default",
+        "ttl": "1h0m0s"
+      }
+    ]
+  },
+  "deliver": {},
+  "usesGeo": false,
+  "edge": {
+    "default": "local",
+    "kvMaxBytes": 1048576
+  },
+  "delegate": [
+    {
+      "directive": "path_regex",
+      "reason": "matcher @ungreedy uses a RE2 regex construct with no faithful JavaScript RegExp equivalent (e.g. ungreedy `(?U)`, a scoped `(?i:…)` group, or a mid-pattern inline flag); it is failed-closed at the edge, so any directive matching on it must run on the Cadish server behind"
+    },
+    {
+      "directive": "ip",
+      "reason": "matcher @testverify uses the `ip` matcher (a server-side Gateway matcher with no edge JavaScript runtime case); it is failed-closed at the edge, so any directive matching on it must run on the Cadish server behind"
+    }
+  ]
+}

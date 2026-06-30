@@ -110,10 +110,11 @@ Findings are `warning`s (advisory) or `error`s (fail the check). Each carries a
 | `duplicate-matcher` | A matcher name is defined twice; the later one shadows. |
 | `unused-matcher` | A matcher is defined but never referenced (dead). |
 | `arity` | A known directive is missing required arguments (light, non-strict). |
-| `dead-rule` | A selection rule can never be reached (see below). |
-| `unreachable-after-catchall` / `duplicate-selector` | A scoped `cache_key` / `cache_ttl` rule sits after a `default` catch-all (never reached), or repeats a selector. |
+| `dead-rule` | A selection rule can never be reached: a scoped `cache_key` / `cache_ttl` / `storage` rule that sits after a `default` catch-all, or that repeats an earlier selector (see below). |
 | `cache-key-no-default` | A site mixes scoped `cache_key` rules but has no `default` / unscoped catch-all, so some requests would resolve to no key. |
 | `unbounded-key-token` | A `cache_key` keys on a raw, high-cardinality value (`header:NAME`, the whole `query`, `{sticky}`) → cache fragmentation. |
+| `cache-credentialed-origin-trust` / `cache-credentialed-noop` | `cache_credentialed @scope` makes caching origin-authoritative (warns you to verify the origin only marks shareable bodies cacheable); the second fires when the scope has no positive in-scope `cache_ttl` signal, so it can never store (a no-op). |
+| `cookie-forward-uncollapsed` / `derives-from-not-stripped` / `cookie-allow-unkeyed` | `derives_from`/`cookie_allow` hygiene: a cookie forwarded to origin under a collapsed key (asserting `{token}` captures its only cache-relevant effect), a derived cookie not stripped, or a `cookie_allow` cookie that no `cache_key` recipe keys on. |
 | `ip-acl-without-trust-proxy` / `sni-without-https` / `geo-unconfigured` | Config-hygiene warnings: an `ip` ACL with no `trust_proxy`, `sni` on a non-HTTPS upstream, or a `{geo}` token with no `geo` source. |
 | `unused-normalize-token` | A `normalize NAME { … }` bucket is defined but its `{NAME}` token is used in no `cache_key` recipe — the bucket is computed for nothing and the cache silently does not vary on it. Key it (`cache_key … {NAME}`) or remove the block. |
 | `unused-device-detect` | A `device_detect { … }` block is configured but no `cache_key` recipe keys on `{device}` — the device classifier is computed for nothing, so the cache silently does not segment by device class. Key it (`cache_key … {device}`) or remove the block. |

@@ -1,0 +1,16 @@
+{
+  "name": "76-redirect-whitespace-authority",
+  "cadishfile": "brand-a.example {\n    redirect ^/n$ 302 {query.next}\n    cache_ttl default ttl 60s\n}",
+  "cases": [
+    {
+      "request": { "method": "GET", "host": "brand-a.example", "path": "/n", "query": { "next": ["  //evil.example.com/"] } },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    },
+    {
+      "request": { "method": "GET", "host": "brand-a.example", "path": "/n", "query": { "next": ["/account"] } },
+      "origin": { "status": 0 },
+      "cacheStatus": "MISS"
+    }
+  ]
+}

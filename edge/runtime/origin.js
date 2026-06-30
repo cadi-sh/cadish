@@ -66,21 +66,58 @@ export function originURLFor(env, upstreamName) {
   return env.CADISH_ORIGIN || "";
 }
 
-// fetchOrigin builds and sends the origin request. It preserves the method, body,
-// path and query of the inbound request; rewrites the authority to the resolved
-// origin base; applies the request-phase header ops and the edge-resolved geo
-// headers; and sets the hop-guard. fetchImpl defaults to the global fetch (so
-// tests can inject a stub). It throws on a transport error — the caller decides
-// whether to serve stale.
-export async function fetchOrigin(request, { originBase, reqHeaderOps, geo, fetchImpl }) {
+// PASSTHROUGH_ORIGIN is the sentinel origin binding (set via `-origin passthrough` /
+// CADISH_ORIGIN=passthrough) that selects PASSTHROUGH (fetch-through) mode: the worker
+// fetches the ORIGINAL request URL unchanged — preserving the client host AND scheme —
+// instead of rewriting the authority to a backend URL. Passthrough must be opted into
+// EXPLICITLY with this sentinel: an empty binding is an operator error and throws loudly
+// (see fetchOrigin), never a silent degrade — in the separate-cadish-server-behind topology
+// a silent passthrough would fetch the public zone host instead of the intended server.
+export const PASSTHROUGH_ORIGIN = "passthrough";
+
+// isPassthrough reports whether the resolved origin base selects passthrough mode: ONLY the
+// explicit sentinel literal "passthrough". An empty binding is NOT passthrough — it is an
+// error handled (loudly) by fetchOrigin.
+export function isPassthrough(originBase) {
+  return originBase === PASSTHROUGH_ORIGIN;
+}
+
+// fetchOrigin builds and sends the origin request. It preserves the method, body, path and
+// query of the inbound request; applies the request-phase header ops and the edge-resolved
+// geo headers; and sets the hop-guard. fetchImpl defaults to the global fetch (so tests can
+// inject a stub). It throws on a transport error — the caller decides whether to serve stale.
+//
+// Two origin modes, selected by the origin binding:
+//   - REWRITE (default): originBase is a real URL (the separate cadish-server-behind
+//     topology). The authority is rewritten to the origin base's scheme/host/port and the
+//     CANONICAL original Host is forwarded as a header (key↔forward parity).
+//   - PASSTHROUGH (originBase == "passthrough"): the ORIGINAL request URL is fetched
+//     unchanged — host AND scheme preserved (so HTTPS:443 for a client HTTPS request) — and NO
+//     Host header is set (the original host stands). This fronts a multi-host origin in the
+//     SAME Cloudflare zone, relying on CF same-zone loop-prevention to reach the real origin.
+//     Rewriting the host to a `-origin` apex/backend hostname makes a canonicalizing origin
+//     redirect (apex→www, http→https) into an infinite loop, because CF `fetch()` IGNORES a
+//     Host-header override (the URL host wins); preserving the original URL is exactly what the
+//     original hand-written `fetch(request)` worker did.
+export async function fetchOrigin(request, { originBase, reqHeaderOps, geo, fetchImpl, usesGeo }) {
   const doFetch = fetchImpl || fetch;
-  if (!originBase) throw new Error("no origin binding (set CADISH_ORIGIN)");
+  // An empty binding is an operator error — fail loudly rather than silently passing through
+  // to the original host (which in a rewrite topology would be the public zone, not the server).
+  // Passthrough mode must be selected explicitly via the "passthrough" sentinel.
+  if (!originBase) throw new Error("no origin binding (set CADISH_ORIGIN, or -origin passthrough for same-zone fetch-through)");
 
   const inURL = new URL(request.url);
-  const base = new URL(originBase);
-  // Preserve the path + query; take scheme/host/port from the origin binding.
-  const outURL = new URL(inURL.pathname + inURL.search, base);
-  outURL.protocol = base.protocol;
+  const passthrough = isPassthrough(originBase);
+  // PASSTHROUGH: fetch the ORIGINAL url unchanged (host+scheme preserved). REWRITE: take
+  // scheme/host/port from the origin binding, preserving only the path + query.
+  let outURL;
+  if (passthrough) {
+    outURL = inURL;
+  } else {
+    const base = new URL(originBase);
+    outURL = new URL(inURL.pathname + inURL.search, base);
+    outURL.protocol = base.protocol;
+  }
 
   const headers = new Headers(request.headers);
   // Security fix B: unconditionally remove every client-supplied edge-trust
@@ -88,17 +125,28 @@ export async function fetchOrigin(request, { originBase, reqHeaderOps, geo, fetc
   // behind will trust the *edge-resolved* values applied afterwards. Without
   // this strip, a client that supplies X-Cadish-Geo-Region (or any other trust
   // header) in its request would have it forwarded and trusted by the server.
+  // (Applied in BOTH modes — passthrough still talks to a trusting cadish origin.)
   for (const name of EDGE_TRUST_HEADERS) headers.delete(name);
   applyRequestHeaderOps(headers, reqHeaderOps);
-  if (geo) applyGeoHeaders(headers, geo);
+  // Inject the CF geo headers to the cadish server behind ONLY when the deploy uses geo
+  // (F-B): a site that never keys on or reflects geo must not forward an unkeyed geo
+  // signal an origin could vary on under a geo-independent edge key. usesGeo===false
+  // (explicitly projected) suppresses; undefined (direct callers/tests) preserves the
+  // prior always-inject behaviour.
+  if (geo && usesGeo !== false) applyGeoHeaders(headers, geo);
   headers.set(PEER_HEADER, "1");
-  // Forward the CANONICAL host (normalizeHost: lower-case, strip :port + trailing FQDN dot) —
-  // the SAME normalization the edge cache key uses (interpreter.js renderToken host token) and
-  // the Go server's NormalizeHost origin-forward. Forwarding the raw inURL.host instead let
-  // `example.com`, `example.com:1337`, and `example.com.` collapse onto ONE edge cache key while
-  // the origin saw three different Hosts — a Host-reflecting origin then poisons the shared
-  // entry (trailing-dot is injectable straight through). One reader = key and forward agree.
-  headers.set("Host", normalizeHost(inURL.host) || inURL.host);
+  // REWRITE mode only: forward the CANONICAL host (normalizeHost: lower-case, strip :port +
+  // trailing FQDN dot) — the SAME normalization the edge cache key uses (interpreter.js
+  // renderToken host token) and the Go server's NormalizeHost origin-forward. Forwarding the
+  // raw inURL.host instead let `example.com`, `example.com:1337`, and `example.com.` collapse
+  // onto ONE edge cache key while the origin saw three different Hosts — a Host-reflecting
+  // origin then poisons the shared entry (trailing-dot is injectable straight through). One
+  // reader = key and forward agree. In PASSTHROUGH mode we deliberately do NOT set Host: the
+  // original URL host already stands, and CF `fetch()` ignores a Host override anyway — setting
+  // a divergent one would only mislead the server behind (and break the same-zone reach).
+  if (!passthrough) {
+    headers.set("Host", normalizeHost(inURL.host) || inURL.host);
+  }
 
   const init = {
     method: request.method,
@@ -113,5 +161,6 @@ export async function fetchOrigin(request, { originBase, reqHeaderOps, geo, fetc
     // everywhere.
     init.duplex = "half";
   }
+  // In passthrough mode outURL === inURL; toString() yields the original url verbatim.
   return doFetch(outURL.toString(), init);
 }

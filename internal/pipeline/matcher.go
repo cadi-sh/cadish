@@ -104,7 +104,8 @@ type matcher struct {
 	geoGran   geoGranularity      // kindGeo: which resolved geo field to test
 	geoValues map[string]struct{} // kindGeo: OR set of accepted classes (upper-cased)
 
-	queryNames *nameGlobSet // kindQueryPresent: OR set of param names (exact + `*` globs)
+	queryNames         *nameGlobSet // kindQueryPresent: OR set of param names (exact + `*` globs)
+	queryNamesNonEmpty *nameGlobSet // kindQueryPresent: subset of queryNames that require a non-empty value (the `+` modifier)
 
 	queryName   string   // kindQuery: the param name whose value is tested
 	queryValues []string // kindQuery: OR of accepted exact values; empty => presence only
@@ -374,12 +375,37 @@ func compileMatcher(name, typ string, args []string, pos cadishfile.Pos) (*match
 	case kindQueryPresent:
 		// `query_present NAME…` — matches if ANY named query param is present
 		// (presence-OR), with `*` globs (`query_present adult_content t a ff-* pub-*`).
-		// It reads only the request, so it is request-phase and usable anywhere a
-		// matcher is, including a classify `when` row (the `publi` boolean).
+		// A trailing `+` on a name (e.g. `query_present adult_content+ t+ ff-*+`) means
+		// "present AND the value is non-empty" — matching the Varnish `=[^&]+` semantics
+		// where a bare `?t=` (empty value) does NOT fire the publi flag. The `+` is
+		// stripped to recover the name/glob; param names never contain a literal `+` in
+		// practice (it would arrive as %2B). An unflagged name keeps plain presence
+		// semantics (matches even `?t=`). It reads only the request, so it is
+		// request-phase and usable anywhere a matcher is, including a classify `when` row.
 		if len(args) == 0 {
 			return nil, &CompileError{Pos: pos, Msg: "query_present matcher needs at least one param name (e.g. `query_present adult_content t a ff-* pub-*`)"}
 		}
-		m.queryNames = newNameGlobSet(args)
+		cleanArgs := make([]string, 0, len(args))
+		var nonEmptyNames []string
+		for _, a := range args {
+			if strings.HasSuffix(a, "+") {
+				clean := strings.TrimSuffix(a, "+")
+				if clean == "" {
+					// A bare `+` strips to an empty name, which would silently become an
+					// empty-name glob (s.exact[""]) matching nothing useful — reject it so a
+					// typo cannot quietly produce a dead matcher.
+					return nil, &CompileError{Pos: pos, Msg: "query_present: `+` needs a param name (e.g. `query_present adult_content+`)"}
+				}
+				cleanArgs = append(cleanArgs, clean)
+				nonEmptyNames = append(nonEmptyNames, clean)
+			} else {
+				cleanArgs = append(cleanArgs, a)
+			}
+		}
+		m.queryNames = newNameGlobSet(cleanArgs)
+		if len(nonEmptyNames) > 0 {
+			m.queryNamesNonEmpty = newNameGlobSet(nonEmptyNames)
+		}
 	case kindQuery:
 		// `query NAME [VALUE…]` — matches a named query param's value against an OR set
 		// of exact values (`query env prod staging`); with no VALUE it is a presence test
@@ -615,16 +641,28 @@ func (m *matcher) match(c *matchContext) bool {
 		return ok
 	case kindQueryPresent:
 		// Presence-OR over the request's query params: true as soon as one param name
-		// matches a configured name/glob. Presence only — a param set to an empty
-		// value ("?a=") still counts, matching how a normalize `from query` source
-		// reads a present-but-empty param.
+		// matches a configured name/glob. An unflagged name is presence-only — a param
+		// set to an empty value ("?a=") still counts. A `+`-flagged name (compiled into
+		// queryNamesNonEmpty) additionally requires at least one non-empty value: `?t=`
+		// (empty) does NOT match `t+`, but `?t=abc` does — the Varnish `=[^&]+` parity
+		// for the "publi" marketing-param detection (non-empty required).
 		if len(c.req.Query) == 0 {
 			return false
 		}
-		for name := range c.req.Query {
-			if m.queryNames.match(name) {
-				return true
+		for name, vals := range c.req.Query {
+			if !m.queryNames.match(name) {
+				continue
 			}
+			if m.queryNamesNonEmpty != nil && m.queryNamesNonEmpty.match(name) {
+				// non-empty required: at least one value must be non-empty
+				for _, v := range vals {
+					if v != "" {
+						return true
+					}
+				}
+				continue // all values empty — keep scanning other params
+			}
+			return true // presence-only: any value (including empty) counts
 		}
 		return false
 	case kindQuery:

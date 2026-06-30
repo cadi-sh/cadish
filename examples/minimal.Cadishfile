@@ -19,6 +19,10 @@ example.com {
     pass @dynamic
     pass method POST
 
+    # Key on path + query so /p?id=1 and /p?id=2 are distinct entries (the default
+    # key omits the query), but drop tracking params that never change the response.
+    cache_key method host path query_strip utm_* gclid fbclid
+
     # Negative caching: store 404s briefly so a missing path doesn't hammer the
     # origin. Only 200/206 and 404/410 are cached; everything else streams through.
     cache_ttl status 404 ttl 30s
